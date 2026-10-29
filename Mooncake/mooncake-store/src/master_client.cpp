@@ -158,6 +158,11 @@ struct RpcNameTraits<&WrappedMasterService::UnmountSegment> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetSharedMemorySegments> {
+    static constexpr const char* value = "GetSharedMemorySegments";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::Ping> {
     static constexpr const char* value = "Ping";
 };
@@ -702,6 +707,18 @@ tl::expected<void, ErrorCode> MasterClient::MountSegment(
 
     auto result = invoke_rpc<&WrappedMasterService::MountSegment, void>(
         segment, client_id_);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<Segment>, ErrorCode>
+MasterClient::GetSharedMemorySegments(
+    const std::vector<std::string>& segment_names) {
+    ScopedVLogTimer timer(1, "MasterClient::GetSharedMemorySegments");
+    timer.LogRequest("segment_names_num=", segment_names.size());
+
+    auto result = invoke_rpc<&WrappedMasterService::GetSharedMemorySegments,
+                             std::vector<Segment>>(segment_names);
     timer.LogResponseExpected(result);
     return result;
 }

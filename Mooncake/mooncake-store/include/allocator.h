@@ -68,8 +68,20 @@ class AllocatedBuffer {
         uintptr_t buffer_address_;
         std::string protocol_;
         std::string transport_endpoint_;
+        // Base address and size of the segment owning this buffer, in the
+        // owner's address space. A peer that has mapped the same memfd
+        // translates addresses as:
+        //   offset = buffer_address_ - segment_base_
+        //   local  = local_mapped_base + offset
+        uintptr_t segment_base_{0};
+        uint64_t segment_size_{0};
+        // Index identifying the owner's shared-memory segment, requested over
+        // the owner's shm-fd socket. Only set when shared_memory_ is true.
+        bool shared_memory_{false};
+        uint64_t shm_segment_index_{0};
         YLT_REFL(Descriptor, size_, buffer_address_, protocol_,
-                 transport_endpoint_);
+                 transport_endpoint_, segment_base_, segment_size_,
+                 shared_memory_, shm_segment_index_);
     };
 
     void change_to_cxl(std::string client_segment_name);
@@ -113,6 +125,26 @@ class BufferAllocatorBase {
      * allocation may still fail due to race conditions or fragmentation.
      */
     virtual size_t getLargestFreeRegion() const = 0;
+
+    /**
+     * Returns the base address of the segment this allocator manages, in the
+     * owner process' address space. Used together with isSharedMemory() to
+     * let a same-host peer translate buffer addresses after mmap.
+     */
+    virtual uintptr_t getBase() const { return 0; }
+
+    /**
+     * Returns whether this allocator's segment is backed by an anonymous shared
+     * memory object (memfd) that same-host peers may map.
+     */
+    virtual bool isSharedMemory() const { return false; }
+
+    /**
+     * Returns the index identifying this segment within its owning client, used
+     * by peers to request the matching memfd. Only meaningful when
+     * isSharedMemory() is true.
+     */
+    virtual uint64_t getSharedMemoryIndex() const { return 0; }
 };
 
 /**
@@ -142,7 +174,9 @@ class CachelibBufferAllocator
       public std::enable_shared_from_this<CachelibBufferAllocator> {
    public:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
-                            std::string transport_endpoint);
+                            std::string transport_endpoint,
+                            bool shared_memory = false,
+                            uint64_t shm_segment_index = 0);
 
     ~CachelibBufferAllocator() override;
 
@@ -166,6 +200,14 @@ class CachelibBufferAllocator
         return kAllocatorUnknownFreeSpace;
     }
 
+    uintptr_t getBase() const override {
+        return static_cast<uintptr_t>(base_);
+    }
+    bool isSharedMemory() const override { return shared_memory_; }
+    uint64_t getSharedMemoryIndex() const override {
+        return shm_segment_index_;
+    }
+
    private:
     // metadata
     const std::string segment_name_;
@@ -173,6 +215,9 @@ class CachelibBufferAllocator
     const size_t total_size_;
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
+    // Set when the segment is backed by an anonymous (memfd) shared segment.
+    const bool shared_memory_;
+    const uint64_t shm_segment_index_;
 
     // metrics - removed allocated_bytes_ member
     // ylt::metric::gauge_t* allocated_bytes_{nullptr};
@@ -193,7 +238,9 @@ class OffsetBufferAllocator
       public std::enable_shared_from_this<OffsetBufferAllocator> {
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
-                          std::string transport_endpoint);
+                          std::string transport_endpoint,
+                          bool shared_memory = false,
+                          uint64_t shm_segment_index = 0);
 
     ~OffsetBufferAllocator() override;
 
@@ -213,6 +260,14 @@ class OffsetBufferAllocator
      */
     size_t getLargestFreeRegion() const override;
 
+    uintptr_t getBase() const override {
+        return static_cast<uintptr_t>(base_);
+    }
+    bool isSharedMemory() const override { return shared_memory_; }
+    uint64_t getSharedMemoryIndex() const override {
+        return shm_segment_index_;
+    }
+
     // Public method to get offset_allocator
     std::shared_ptr<offset_allocator::OffsetAllocator> getOffsetAllocator()
         const {
@@ -226,6 +281,9 @@ class OffsetBufferAllocator
     const size_t total_size_;
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
+    // Set when the segment is backed by an anonymous (memfd) shared segment.
+    const bool shared_memory_;
+    const uint64_t shm_segment_index_;
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;

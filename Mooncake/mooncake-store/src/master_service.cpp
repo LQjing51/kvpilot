@@ -493,6 +493,19 @@ auto MasterService::GetAllSegments()
     return all_segments;
 }
 
+auto MasterService::GetSharedMemorySegments(
+    const std::vector<std::string>& segment_names)
+    -> tl::expected<std::vector<Segment>, ErrorCode> {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    std::vector<Segment> segments;
+    auto err =
+        segment_access.GetSharedMemorySegments(segment_names, segments);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return segments;
+}
+
 auto MasterService::QuerySegments(const std::string& segment)
     -> tl::expected<std::pair<size_t, size_t>, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();

@@ -639,6 +639,21 @@ class RealClient : public PyClient {
     batch_get_replica_desc(const std::vector<std::string> &keys);
     std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
 
+    /**
+     * @brief Maps the shared-memory segments of the given same-host peers into
+     * this process, so later loads can address peer KV directly.
+     *
+     * Intended to be called once during start-up, after every peer has mounted
+     * its segments. Establishing the mapping eagerly keeps shm_open/mmap and
+     * the CUDA host registration off the per-request path.
+     *
+     * @param peer_endpoints Peer segment names (not shm names); the master
+     *        resolves them to shared-memory segments.
+     * @return Number of segments newly mapped, or -1 on failure.
+     */
+    int preload_shared_memory_segments(
+        const std::vector<std::string> &peer_endpoints);
+
     std::vector<std::string> batch_replica_clear(
         const std::vector<std::string> &keys,
         const std::string &segment_name = "") override;
@@ -695,11 +710,97 @@ class RealClient : public PyClient {
         }
     };
 
+    // Deleter for anonymous (memfd) shared segments owned by this process.
+    // Unregisters the CUDA mapping, unmaps the range, and closes the memfd,
+    // whose memory is freed once every peer has unmapped it too.
+    struct SharedSegmentDeleter {
+        size_t size = 0;
+        int fd = -1;
+        bool cuda_host_registered = false;
+        void operator()(void *ptr) const;
+    };
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
+    std::vector<std::unique_ptr<void, SharedSegmentDeleter>>
+        shared_segment_ptrs_;
+
+    // A peer's shared-memory segment mapped into this process.
+    struct MappedSharedSegment {
+        void *base = nullptr;
+        size_t size = 0;
+        // Segment base in the owner's address space, used to turn an owner
+        // buffer address into an offset.
+        uintptr_t owner_base = 0;
+        bool cuda_host_registered = false;
+    };
+
+    // Identifies a peer segment: the owner's segment name plus the index the
+    // owner assigned it.
+    struct PeerSegmentKey {
+        std::string owner;
+        uint64_t index = 0;
+        bool operator==(const PeerSegmentKey &other) const {
+            return index == other.index && owner == other.owner;
+        }
+    };
+    struct PeerSegmentKeyHash {
+        size_t operator()(const PeerSegmentKey &k) const {
+            return std::hash<std::string>{}(k.owner) ^
+                   (std::hash<uint64_t>{}(k.index) << 1);
+        }
+    };
+
+    // Mapped at most once per peer segment, so shm fd retrieval and the CUDA
+    // registration happen only on the preload path.
+    std::unordered_map<PeerSegmentKey, MappedSharedSegment, PeerSegmentKeyHash>
+        mapped_shared_segments_;
+
+    // memfds of the segments this process owns, keyed by segment index, so
+    // the IPC server can hand them to same-host peers.
+    std::unordered_map<uint64_t, int> owned_shared_segment_fds_;
+
+    /**
+     * @brief Serves shm fd requests from same-host peers on a Unix socket named
+     * after this worker's segment name. Started only when shm segments
+     * are enabled.
+     */
+    int start_shm_fd_server();
+    void stop_shm_fd_server();
+    void shm_fd_server_loop();
+    void handle_shm_fd_request(int client_sock);
+
+    /**
+     * @brief Requests one peer segment's memfd over its owner's socket and maps
+     * it into this process.
+     */
+    tl::expected<void, ErrorCode> map_peer_shared_segment(
+        const Segment &segment);
+
+    /**
+     * @brief Translates a buffer address in a peer's segment into an address
+     * valid in this process. Mapping only happens during preload, so this never
+     * blocks on IPC.
+     * @param desc Buffer descriptor as reported by the master
+     * @return Address usable in this process, or an error.
+     */
+    tl::expected<uintptr_t, ErrorCode> resolve_shared_memory_address(
+        const AllocatedBuffer::Descriptor &desc);
+
+    /**
+     * @brief Rewrites preloaded peer shared-memory replicas in place so their
+     * addresses are valid in this process and their endpoint reads as local.
+     * Replicas we did not preload -- notably those owned by another host -- are
+     * left untouched so the caller can still fetch them over the network.
+     */
+    void rewrite_shared_memory_replicas(
+        std::vector<Replica::Descriptor> &replicas);
+
+    // Unregisters and unmaps every peer segment mapped by this client.
+    void clear_mapped_shared_segments();
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
@@ -707,6 +808,15 @@ class RealClient : public PyClient {
     std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
     int offload_rpc_port_ = 0;
     bool use_hugepage_ = false;
+    // Set from ENABLE_SHM_MOONCAKE_HBM: allocate global segments as POSIX
+    // shared memory so same-host peers can map them.
+    bool use_shm_segments_ = false;
+    // Distinguishes the segments this process owns.
+    uint64_t shared_segment_index_ = 0;
+    // Socket + thread serving shm fds to same-host peers.
+    int shm_fd_server_sock_ = -1;
+    std::jthread shm_fd_server_thread_{};
+    std::atomic<bool> shm_fd_server_running_{false};
 
     struct MappedShm {
         std::string shm_name;

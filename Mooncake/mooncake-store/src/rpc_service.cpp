@@ -1375,6 +1375,21 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
         [] { MasterMetricManager::instance().inc_unmount_segment_failures(); });
 }
 
+tl::expected<std::vector<Segment>, ErrorCode>
+WrappedMasterService::GetSharedMemorySegments(
+    const std::vector<std::string>& segment_names) {
+    // No dedicated metric: this is a start-up/preload path, not a hot RPC.
+    return execute_rpc(
+        "GetSharedMemorySegments",
+        [&] {
+            return master_service_.GetSharedMemorySegments(segment_names);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("segment_names_count=", segment_names.size());
+        },
+        [] {}, [] {});
+}
+
 tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment,
@@ -1737,6 +1752,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::ReMountSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetSharedMemorySegments>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
         &wrapped_master_service);

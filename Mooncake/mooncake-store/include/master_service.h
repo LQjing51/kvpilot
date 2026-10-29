@@ -123,6 +123,15 @@ class MasterService {
     auto GetAllSegments() -> tl::expected<std::vector<std::string>, ErrorCode>;
 
     /**
+     * @brief Fetch the shared-memory backed segments mounted under the given
+     * segment names, so that a same-host peer can shm_open and mmap them.
+     * Segments that are not shared-memory backed are filtered out.
+     * @return The matching segments, possibly empty.
+     */
+    auto GetSharedMemorySegments(const std::vector<std::string>& segment_names)
+        -> tl::expected<std::vector<Segment>, ErrorCode>;
+
+    /**
      * @brief Query a segment's capacity and used size in bytes.
      * Conductor should use these information to schedule new requests.
      * @return ErrorCode::OK if exists

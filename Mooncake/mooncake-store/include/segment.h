@@ -128,6 +128,16 @@ class ScopedSegmentAccess {
     ErrorCode GetAllSegmentNames(std::vector<std::string>& all_segment_names);
 
     /**
+     * @brief Get the shared-memory backed segments mounted under the given
+     * segment names. Segments that are not shared-memory backed, carry an empty
+     * shm name, or are not in the OK state are skipped, so a peer never tries
+     * to mmap a segment it cannot address.
+     */
+    ErrorCode GetSharedMemorySegments(
+        const std::vector<std::string>& segment_names,
+        std::vector<Segment>& segments);
+
+    /**
      * @brief Get the segment by name. If there are multiple segments with the
      * same name, return the first one.
      */

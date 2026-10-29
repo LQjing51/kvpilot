@@ -1,5 +1,9 @@
 #include <netinet/in.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <numa.h>
@@ -11,6 +15,7 @@
 
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
+#include <cstring>  // for strerror
 #include <algorithm>
 #include <cctype>
 #include <limits>
@@ -28,6 +33,9 @@
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
@@ -41,6 +49,12 @@ DEFINE_int32(http_port, 9300,
 
 namespace mooncake {
 namespace {
+// MFD_CLOEXEC lives in <linux/memfd.h>, which is not included here; the raw
+// syscall is invoked directly, matching ShmHelper's approach.
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
     if (result != ACL_ERROR_NONE) {
@@ -52,6 +66,227 @@ bool checkAcl(aclError result, const char *message) {
     return true;
 }
 #endif
+
+// Registers a host range with CUDA so H2D copies from it are issued from pinned
+// memory. Returns true when this call performed the registration and the caller
+// therefore owns the matching unregister; false when CUDA reported the range
+// was already registered (nothing to undo).
+tl::expected<bool, ErrorCode> MaybeCudaHostRegister(const void *buffer,
+                                                    size_t size) {
+#if defined(USE_CUDA)
+    cudaError_t err = cudaHostRegister(const_cast<void *>(buffer), size,
+                                       cudaHostRegisterDefault);
+    if (err == cudaSuccess) {
+        LOG(INFO) << "cuda_host_register_segment_succeeded base=" << buffer
+                  << " size=" << size;
+        return true;
+    }
+    if (err == cudaErrorHostMemoryAlreadyRegistered) {
+        // Clear the sticky error so unrelated CUDA calls are not affected.
+        cudaGetLastError();
+        LOG(WARNING) << "cuda_host_register_segment_already_registered base="
+                     << buffer << " size=" << size;
+        return false;
+    }
+    LOG(ERROR) << "cuda_host_register_segment_failed base=" << buffer
+               << " size=" << size << " error=" << cudaGetErrorName(err) << ": "
+               << cudaGetErrorString(err);
+    cudaGetLastError();
+    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#else
+    (void)buffer;
+    (void)size;
+    // Fail loudly rather than silently run without pinning: the caller asked
+    // for shared-memory HBM, and a non-CUDA build cannot deliver the direct H2D
+    // path it exists for.
+    LOG(ERROR) << "cuda_host_register_unavailable error=not_a_cuda_build"
+               << " hint=rebuild_with_-DUSE_CUDA=ON";
+    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+}
+
+void MaybeCudaHostUnregister(const void *buffer, size_t size) {
+#if defined(USE_CUDA)
+    cudaError_t err = cudaHostUnregister(const_cast<void *>(buffer));
+    if (err != cudaSuccess) {
+        LOG(WARNING) << "cuda_host_unregister_segment_failed base=" << buffer
+                     << " size=" << size
+                     << " error=" << cudaGetErrorName(err) << ": "
+                     << cudaGetErrorString(err);
+        cudaGetLastError();
+    }
+#else
+    (void)buffer;
+    (void)size;
+#endif
+}
+
+// Keeps a name usable as a filesystem/socket path component.
+std::string SanitizeShmComponent(const std::string &input) {
+    std::string out;
+    out.reserve(input.size());
+    for (char c : input) {
+        out.push_back((std::isalnum(static_cast<unsigned char>(c)) || c == '_')
+                          ? c
+                          : '_');
+    }
+    return out;
+}
+
+// Abstract-namespace Unix socket path a worker serves shm fds on. Derived from
+// the worker's segment name (its local_hostname, which already carries a unique
+// per-worker port), so a peer can reach it knowing only the segment name.
+std::string SharedSegmentSocketPath(const std::string &segment_name) {
+    return "mooncake_shmfd_" + SanitizeShmComponent(segment_name);
+}
+
+// Maps `size` bytes of `fd` at an `alignment`-aligned address. A larger
+// anonymous range is reserved first and the unaligned head/tail are trimmed, so
+// MAP_FIXED only ever replaces this reservation rather than an unrelated VMA.
+void *MmapSharedAligned(int fd, size_t size, size_t alignment) {
+    const size_t reserve_size = size + alignment;
+    void *reservation = mmap(nullptr, reserve_size, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reservation == MAP_FAILED) {
+        LOG(ERROR) << "shm_reserve_va_failed size=" << reserve_size
+                   << " error=" << strerror(errno);
+        return nullptr;
+    }
+
+    const uintptr_t reserve_begin = reinterpret_cast<uintptr_t>(reservation);
+    const uintptr_t align_mask = static_cast<uintptr_t>(alignment) - 1;
+    const uintptr_t aligned = (reserve_begin + align_mask) & ~align_mask;
+
+    if (aligned > reserve_begin) {
+        munmap(reinterpret_cast<void *>(reserve_begin),
+               aligned - reserve_begin);
+    }
+    if (aligned + size < reserve_begin + reserve_size) {
+        munmap(reinterpret_cast<void *>(aligned + size),
+               reserve_begin + reserve_size - (aligned + size));
+    }
+
+    // MAP_POPULATE moves the page-fault cost into start-up rather than the
+    // first request that touches the segment.
+    void *mapped = mmap(reinterpret_cast<void *>(aligned), size,
+                        PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_FIXED | MAP_POPULATE, fd, 0);
+    if (mapped == MAP_FAILED) {
+        LOG(ERROR) << "shm_mmap_aligned_failed size=" << size
+                   << " alignment=" << alignment
+                   << " error=" << strerror(errno);
+        munmap(reinterpret_cast<void *>(aligned), size);
+        return nullptr;
+    }
+    return mapped;
+}
+
+// Creates an anonymous shared memory segment backed by memfd and maps it.
+//
+// memfd rather than shm_open(/dev/shm): CUDA refuses to pin file-backed
+// mappings, so a tmpfs-backed segment cannot be cudaHostRegister'ed and the
+// direct H2D path this feature exists for would be unavailable. memfd memory is
+// anonymous -- it pins fine -- while still being shareable by passing the fd to
+// a peer over a Unix socket (SCM_RIGHTS).
+//
+// Returns the mapping and the still-open fd; the caller owns the fd and must
+// keep it open for as long as peers may ask for it.
+tl::expected<std::pair<void *, int>, ErrorCode> AllocateSharedMemorySegment(
+    size_t size) {
+    // MFD_CLOEXEC keeps the fd out of exec'ed children; peers receive it
+    // explicitly over SCM_RIGHTS instead.
+#ifdef __NR_memfd_create
+    int fd = static_cast<int>(
+        syscall(__NR_memfd_create, MOONCAKE_SHM_NAME, MFD_CLOEXEC));
+#else
+    int fd = -1;
+    errno = ENOSYS;
+#endif
+    if (fd < 0) {
+        LOG(ERROR) << "shm_memfd_create_failed size=" << size
+                   << " error=" << strerror(errno);
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
+        LOG(ERROR) << "shm_ftruncate_failed size=" << size
+                   << " error=" << strerror(errno);
+        close(fd);
+        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    void *ptr = MmapSharedAligned(fd, size, facebook::cachelib::Slab::kSize);
+    if (!ptr) {
+        close(fd);
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    LOG(INFO) << "shm_segment_allocated fd=" << fd << " base=" << ptr
+              << " size=" << size;
+    return std::make_pair(ptr, fd);
+}
+
+// Wire format for the peer shm-fd exchange. A peer connects to the owner's
+// abstract-namespace socket, sends a request, and receives the memfd via
+// SCM_RIGHTS. Kept separate from the dummy-client IPC protocol: peers are not
+// registered dummy clients and the two sockets have different lifetimes.
+struct PeerShmFdRequest {
+    uint32_t magic;
+    uint64_t segment_index;
+};
+struct PeerShmFdResponse {
+    int32_t status;  // 0 = success, <0 = error
+    uint64_t size;   // mapped size of the segment
+};
+constexpr uint32_t kPeerShmFdMagic = 0x4d43534du;  // "MCSM"
+
+// Binds an abstract-namespace Unix socket. Abstract sockets leave nothing on
+// disk, so a crashed worker cannot strand a stale socket file.
+int BindAbstractUnixSocket(const std::string &path, int backlog) {
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) {
+        LOG(ERROR) << "shm_fd_socket_create_failed error=" << strerror(errno);
+        return -1;
+    }
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0';
+    strncpy(addr.sun_path + 1, path.c_str(), sizeof(addr.sun_path) - 2);
+    const size_t name_len = std::min(path.length(), sizeof(addr.sun_path) - 2);
+    socklen_t addr_len = sizeof(sa_family_t) + 1 + name_len;
+    if (bind(sock, reinterpret_cast<struct sockaddr *>(&addr), addr_len) < 0) {
+        LOG(ERROR) << "shm_fd_socket_bind_failed path=@" << path
+                   << " error=" << strerror(errno);
+        close(sock);
+        return -1;
+    }
+    if (listen(sock, backlog) < 0) {
+        LOG(ERROR) << "shm_fd_socket_listen_failed path=@" << path
+                   << " error=" << strerror(errno);
+        close(sock);
+        return -1;
+    }
+    return sock;
+}
+
+// Connects to a peer's abstract-namespace shm-fd socket.
+int ConnectAbstractUnixSocket(const std::string &path) {
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) {
+        return -1;
+    }
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0';
+    strncpy(addr.sun_path + 1, path.c_str(), sizeof(addr.sun_path) - 2);
+    const size_t name_len = std::min(path.length(), sizeof(addr.sun_path) - 2);
+    socklen_t addr_len = sizeof(sa_family_t) + 1 + name_len;
+    if (::connect(sock, reinterpret_cast<struct sockaddr *>(&addr), addr_len) <
+        0) {
+        close(sock);
+        return -1;
+    }
+    return sock;
+}
 
 struct PreparedRangedReadRequest {
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
@@ -496,6 +731,12 @@ RealClient::RealClient() {
     mooncake::init_ylt_log_level();
     const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
     use_hugepage_ = (hp != nullptr);
+    // Back global segments with POSIX shared memory so same-host peers can mmap
+    // them and read KV without a cross-process copy.
+    const char *shm_hbm = std::getenv("ENABLE_SHM_MOONCAKE_HBM");
+    use_shm_segments_ =
+        shm_hbm != nullptr && std::string(shm_hbm) != "0" &&
+        std::string(shm_hbm) != "false" && std::string(shm_hbm) != "False";
 }
 
 RealClient::~RealClient() {
@@ -709,8 +950,24 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
             std::string seg_location = kWildcardLocation;
+            int shm_fd = -1;
+            uint64_t shm_segment_index = 0;
 
-            if (!seg_numa_nodes.empty()) {
+            if (use_shm_segments_) {
+                // Shared segments are neither NUMA-bound nor hugepage-backed:
+                // NUMA affinity follows the process' CPU affinity.
+                mapped_size =
+                    align_up(segment_size, facebook::cachelib::Slab::kSize);
+                auto shared_segment = AllocateSharedMemorySegment(mapped_size);
+                if (!shared_segment) {
+                    LOG(ERROR) << "Failed to allocate shared memory segment: "
+                               << toString(shared_segment.error());
+                    return tl::unexpected(shared_segment.error());
+                }
+                ptr = shared_segment.value().first;
+                shm_fd = shared_segment.value().second;
+                shm_segment_index = shared_segment_index_++;
+            } else if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
                 size_t page_sz = should_use_hugepage
                                      ? get_hugepage_size_from_env()
@@ -734,7 +991,23 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 LOG(ERROR) << "Failed to allocate segment memory";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
-            if (this->protocol == "ascend" || this->protocol == "ubshmem") {
+            if (use_shm_segments_) {
+                // Register once per segment, off the per-request path, so H2D
+                // copies out of this segment start from pinned host memory.
+                auto cuda_register_result =
+                    MaybeCudaHostRegister(ptr, mapped_size);
+                if (!cuda_register_result) {
+                    SharedSegmentDeleter{mapped_size, shm_fd, false}(ptr);
+                    return tl::unexpected(cuda_register_result.error());
+                }
+                // The deleter owns the unregister and the fd from here on.
+                shared_segment_ptrs_.emplace_back(
+                    ptr, SharedSegmentDeleter{mapped_size, shm_fd,
+                                              cuda_register_result.value()});
+                // Publish the fd so the shm-fd server can hand it to peers.
+                owned_shared_segment_fds_[shm_segment_index] = shm_fd;
+            } else if (this->protocol == "ascend" ||
+                       this->protocol == "ubshmem") {
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
             } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
@@ -746,15 +1019,29 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 segment_ptrs_.emplace_back(ptr);
             }
             auto mount_result =
-                client_->MountSegment(ptr, mapped_size, protocol, seg_location);
+                client_->MountSegment(ptr, mapped_size, protocol, seg_location,
+                                      use_shm_segments_, shm_segment_index);
             if (!mount_result.has_value()) {
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());
+                // No explicit unregister here: ptr is already owned by one of
+                // the segment vectors, whose deleter performs it on teardown.
                 return tl::unexpected(mount_result.error());
             }
         }
         if (total_glbseg_size == 0) {
             LOG(INFO) << "Global segment size is 0, skip mounting segment";
+        }
+    }
+
+    // Serve this worker's shared-segment memfds to same-host peers. Started
+    // after the segments are mounted so a peer that finds us in the master's
+    // segment list can always be served.
+    if (use_shm_segments_ && !owned_shared_segment_fds_.empty()) {
+        if (start_shm_fd_server() != 0) {
+            LOG(ERROR) << "shm_fd_server_start_failed segment_name="
+                       << this->local_hostname;
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
 
@@ -968,6 +1255,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
 
     stop_ipc_server();
+    stop_shm_fd_server();
     stop_http_server();
 
     if (!client_) {
@@ -988,8 +1276,13 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     client_.reset();
     client_buffer_allocator_.reset();
     port_binder_.reset();
+    // Drop peer mappings before releasing our own segments: peers only unmap,
+    // while the owning segment vector also unlinks the shm objects.
+    clear_mapped_shared_segments();
     hugepage_segment_ptrs_.clear();
     segment_ptrs_.clear();
+    owned_shared_segment_fds_.clear();
+    shared_segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";
     protocol = "";
@@ -4112,6 +4405,356 @@ void RealClient::handle_ipc_shm_fd_request(int client_sock) {
     }
 }
 
+void RealClient::SharedSegmentDeleter::operator()(void *ptr) const {
+    // Unregister before unmapping: munmap on a range still registered with CUDA
+    // leaks the pinned mapping.
+    if (ptr && size > 0 && cuda_host_registered) {
+        MaybeCudaHostUnregister(ptr, size);
+    }
+    if (ptr && size > 0) {
+        munmap(ptr, size);
+    }
+    // Closing the last fd/mapping frees the anonymous memory. Peers hold their
+    // own fd, so their view stays valid until they unmap it.
+    if (fd >= 0) {
+        close(fd);
+    }
+}
+
+int RealClient::start_shm_fd_server() {
+    const std::string path = SharedSegmentSocketPath(this->local_hostname);
+    shm_fd_server_sock_ = BindAbstractUnixSocket(path, 64);
+    if (shm_fd_server_sock_ < 0) {
+        return -1;
+    }
+    shm_fd_server_running_.store(true);
+    shm_fd_server_thread_ = std::jthread([this] { shm_fd_server_loop(); });
+    LOG(INFO) << "shm_fd_server_started path=@" << path
+              << " segments=" << owned_shared_segment_fds_.size();
+    return 0;
+}
+
+void RealClient::stop_shm_fd_server() {
+    if (!shm_fd_server_running_.exchange(false)) {
+        return;
+    }
+    if (shm_fd_server_sock_ >= 0) {
+        // Shutdown unblocks the accept() in the server thread.
+        ::shutdown(shm_fd_server_sock_, SHUT_RDWR);
+        close(shm_fd_server_sock_);
+        shm_fd_server_sock_ = -1;
+    }
+    if (shm_fd_server_thread_.joinable()) {
+        shm_fd_server_thread_.join();
+    }
+}
+
+void RealClient::shm_fd_server_loop() {
+    while (shm_fd_server_running_.load()) {
+        int client_sock = accept(shm_fd_server_sock_, nullptr, nullptr);
+        if (client_sock < 0) {
+            if (!shm_fd_server_running_.load()) {
+                break;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            LOG(ERROR) << "shm_fd_accept_failed error=" << strerror(errno);
+            break;
+        }
+        handle_shm_fd_request(client_sock);
+        close(client_sock);
+    }
+    LOG(INFO) << "shm_fd_server_stopped";
+}
+
+void RealClient::handle_shm_fd_request(int client_sock) {
+    PeerShmFdRequest req{};
+    if (recv(client_sock, &req, sizeof(req), MSG_WAITALL) !=
+        static_cast<ssize_t>(sizeof(req))) {
+        LOG(ERROR) << "shm_fd_request_read_failed";
+        return;
+    }
+    PeerShmFdResponse resp{};
+    resp.status = -1;
+    resp.size = 0;
+
+    if (req.magic != kPeerShmFdMagic) {
+        LOG(ERROR) << "shm_fd_request_bad_magic magic=" << req.magic;
+        ::send(client_sock, &resp, sizeof(resp), 0);
+        return;
+    }
+
+    auto it = owned_shared_segment_fds_.find(req.segment_index);
+    if (it == owned_shared_segment_fds_.end() || it->second < 0) {
+        LOG(ERROR) << "shm_fd_request_unknown_segment index="
+                   << req.segment_index;
+        ::send(client_sock, &resp, sizeof(resp), 0);
+        return;
+    }
+
+    // The peer learns the size from the master's segment record; echo it back
+    // only as a sanity check.
+    struct stat st{};
+    if (fstat(it->second, &st) != 0) {
+        LOG(ERROR) << "shm_fd_fstat_failed index=" << req.segment_index
+                   << " error=" << strerror(errno);
+        ::send(client_sock, &resp, sizeof(resp), 0);
+        return;
+    }
+    resp.status = 0;
+    resp.size = static_cast<uint64_t>(st.st_size);
+    if (ipc_send_fd(client_sock, it->second, &resp, sizeof(resp)) < 0) {
+        LOG(ERROR) << "shm_fd_send_failed index=" << req.segment_index;
+    }
+}
+
+tl::expected<void, ErrorCode> RealClient::map_peer_shared_segment(
+    const Segment &segment) {
+    const PeerSegmentKey key{segment.name, segment.shm_segment_index};
+    if (mapped_shared_segments_.count(key) > 0) {
+        return {};
+    }
+
+    const std::string path = SharedSegmentSocketPath(segment.name);
+    int sock = ConnectAbstractUnixSocket(path);
+    if (sock < 0) {
+        LOG(ERROR) << "peer_shm_connect_failed path=@" << path
+                   << " error=" << strerror(errno);
+        return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+
+    PeerShmFdRequest req{kPeerShmFdMagic, segment.shm_segment_index};
+    if (::send(sock, &req, sizeof(req), 0) !=
+        static_cast<ssize_t>(sizeof(req))) {
+        LOG(ERROR) << "peer_shm_request_send_failed path=@" << path;
+        close(sock);
+        return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+
+    PeerShmFdResponse resp{};
+    int fd = ipc_recv_fd(sock, &resp, sizeof(resp));
+    close(sock);
+    if (fd < 0 || resp.status != 0) {
+        LOG(ERROR) << "peer_shm_fd_recv_failed path=@" << path
+                   << " index=" << segment.shm_segment_index
+                   << " status=" << resp.status;
+        if (fd >= 0) {
+            close(fd);
+        }
+        return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    if (resp.size != segment.size) {
+        LOG(ERROR) << "peer_shm_size_mismatch owner=" << segment.name
+                   << " index=" << segment.shm_segment_index
+                   << " fd_size=" << resp.size
+                   << " master_size=" << segment.size;
+        close(fd);
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    void *mapped = mmap(nullptr, segment.size, PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_POPULATE, fd, 0);
+    // The mapping keeps the memory alive; the fd is no longer needed.
+    close(fd);
+    if (mapped == MAP_FAILED) {
+        LOG(ERROR) << "peer_shm_mmap_failed owner=" << segment.name
+                   << " size=" << segment.size
+                   << " error=" << strerror(errno);
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto register_result = MaybeCudaHostRegister(mapped, segment.size);
+    if (!register_result) {
+        munmap(mapped, segment.size);
+        return tl::unexpected(register_result.error());
+    }
+
+    LOG(INFO) << "peer_shm_segment_mapped owner=" << segment.name
+              << " index=" << segment.shm_segment_index << " base=" << mapped
+              << " owner_base=" << segment.base << " size=" << segment.size;
+    mapped_shared_segments_.emplace(
+        key, MappedSharedSegment{
+                 .base = mapped,
+                 .size = segment.size,
+                 .owner_base = segment.base,
+                 .cuda_host_registered = register_result.value(),
+             });
+    return {};
+}
+
+tl::expected<uintptr_t, ErrorCode> RealClient::resolve_shared_memory_address(
+    const AllocatedBuffer::Descriptor &desc) {
+    // Not shared-memory backed, or already ours: the address is usable as is.
+    if (!desc.shared_memory_) {
+        return desc.buffer_address_;
+    }
+    if (client_ &&
+        client_->IsLocalTransportEndpoint(desc.transport_endpoint_)) {
+        return desc.buffer_address_;
+    }
+    if (desc.segment_size_ == 0 ||
+        desc.buffer_address_ < desc.segment_base_) {
+        LOG(ERROR) << "shm_descriptor_invalid endpoint="
+                   << desc.transport_endpoint_
+                   << " buffer_address=" << desc.buffer_address_
+                   << " segment_base=" << desc.segment_base_
+                   << " segment_size=" << desc.segment_size_;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const uint64_t offset = desc.buffer_address_ - desc.segment_base_;
+    // The whole buffer, not just its first byte, must fall inside the segment.
+    if (offset >= desc.segment_size_ ||
+        desc.size_ > desc.segment_size_ - offset) {
+        LOG(ERROR) << "shm_offset_out_of_range endpoint="
+                   << desc.transport_endpoint_ << " offset=" << offset
+                   << " size=" << desc.size_
+                   << " segment_size=" << desc.segment_size_;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const PeerSegmentKey key{desc.transport_endpoint_,
+                             desc.shm_segment_index_};
+    auto it = mapped_shared_segments_.find(key);
+    if (it == mapped_shared_segments_.end()) {
+        // Mapping only happens during preload; doing IPC here would stall the
+        // request path.
+        LOG(ERROR) << "shm_segment_not_preloaded endpoint="
+                   << desc.transport_endpoint_
+                   << " index=" << desc.shm_segment_index_;
+        return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+
+    const auto &segment = it->second;
+    if (segment.owner_base != desc.segment_base_ ||
+        segment.size != desc.segment_size_) {
+        // The owner remounted this segment over a different range; the cached
+        // mapping can no longer be trusted for address translation. Drop it so
+        // a later preload can rebuild the mapping instead of failing forever.
+        LOG(ERROR) << "shm_segment_layout_mismatch endpoint="
+                   << desc.transport_endpoint_
+                   << " index=" << desc.shm_segment_index_
+                   << " cached_owner_base=" << segment.owner_base
+                   << " descriptor_owner_base=" << desc.segment_base_
+                   << " cached_size=" << segment.size
+                   << " descriptor_size=" << desc.segment_size_;
+        if (segment.cuda_host_registered) {
+            MaybeCudaHostUnregister(segment.base, segment.size);
+        }
+        if (segment.base && segment.size > 0) {
+            munmap(segment.base, segment.size);
+        }
+        mapped_shared_segments_.erase(it);
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return reinterpret_cast<uintptr_t>(segment.base) + offset;
+}
+
+void RealClient::rewrite_shared_memory_replicas(
+    std::vector<Replica::Descriptor> &replicas) {
+    for (auto &replica : replicas) {
+        if (!replica.is_memory_replica() ||
+            replica.status != ReplicaStatus::COMPLETE) {
+            continue;
+        }
+        auto &buffer = replica.get_memory_descriptor().buffer_descriptor;
+        if (!buffer.shared_memory_) {
+            continue;
+        }
+        if (client_ &&
+            client_->IsLocalTransportEndpoint(buffer.transport_endpoint_)) {
+            continue;
+        }
+        // Only segments we preloaded are addressable here. Anything else --
+        // most importantly a replica on another host, which is shm-backed there
+        // but must still be fetched over the network -- is left alone so the
+        // caller can transfer it the normal way.
+        const PeerSegmentKey key{buffer.transport_endpoint_,
+                                 buffer.shm_segment_index_};
+        if (mapped_shared_segments_.find(key) ==
+            mapped_shared_segments_.end()) {
+            continue;
+        }
+
+        auto mapped_addr = resolve_shared_memory_address(buffer);
+        if (!mapped_addr) {
+            // Preloaded but unusable (e.g. the owner remounted over a different
+            // range). Leave the replica alone rather than hand back an address
+            // that is not valid in this process.
+            LOG(WARNING) << "shm_replica_rewrite_skipped endpoint="
+                         << buffer.transport_endpoint_
+                         << " index=" << buffer.shm_segment_index_;
+            continue;
+        }
+        // Present the peer buffer as local so callers can take their existing
+        // local fast path; the backing memory still belongs to the peer. The
+        // endpoint must match get_hostname(), which is what callers compare
+        // against. shared_memory_/shm_segment_index_ are left in place so
+        // callers can still tell a translated peer address from a natively
+        // local one.
+        buffer.buffer_address_ = mapped_addr.value();
+        buffer.transport_endpoint_ = this->local_hostname;
+    }
+}
+
+void RealClient::clear_mapped_shared_segments() {
+    for (auto &[key, segment] : mapped_shared_segments_) {
+        if (segment.cuda_host_registered) {
+            MaybeCudaHostUnregister(segment.base, segment.size);
+        }
+        if (segment.base && segment.size > 0) {
+            munmap(segment.base, segment.size);
+        }
+        // Unmapping our view is enough; the owner keeps its own fd and mapping.
+    }
+    mapped_shared_segments_.clear();
+}
+
+int RealClient::preload_shared_memory_segments(
+    const std::vector<std::string> &peer_endpoints) {
+    if (!client_) {
+        LOG(ERROR) << "preload_shared_memory_segments: client not initialized";
+        return -1;
+    }
+    if (peer_endpoints.empty()) {
+        return 0;
+    }
+
+    auto segments = client_->GetSharedMemorySegments(peer_endpoints);
+    if (!segments) {
+        LOG(ERROR) << "get_shared_memory_segments_failed error="
+                   << toString(segments.error());
+        return -1;
+    }
+
+    int mapped_segments = 0;
+    for (const auto &segment : segments.value()) {
+        // Skip our own segments and anything not actually shm-backed.
+        if (segment.name == this->local_hostname || !segment.shared_memory) {
+            continue;
+        }
+        const PeerSegmentKey key{segment.name, segment.shm_segment_index};
+        if (mapped_shared_segments_.count(key) > 0) {
+            continue;
+        }
+
+        auto result = map_peer_shared_segment(segment);
+        if (!result) {
+            LOG(ERROR) << "preload_shared_memory_segment_failed owner="
+                       << segment.name
+                       << " index=" << segment.shm_segment_index
+                       << " error=" << toString(result.error());
+            return -1;
+        }
+        ++mapped_segments;
+    }
+
+    LOG(INFO) << "shared_memory_preload_done peers=" << peer_endpoints.size()
+              << " mapped_segments=" << mapped_segments;
+    return mapped_segments;
+}
+
 std::vector<Replica::Descriptor> RealClient::get_replica_desc(
     const std::string &key) {
     auto query_result = client_->Query(key);
@@ -4126,10 +4769,14 @@ std::vector<Replica::Descriptor> RealClient::get_replica_desc(
         }
         return replica_list;
     }
-    const std::vector<Replica::Descriptor> &replica_list =
-        query_result.value().replicas;
+    std::vector<Replica::Descriptor> replica_list =
+        std::move(query_result.value().replicas);
     if (replica_list.empty()) {
         LOG(ERROR) << "Empty replica list for key: " << key;
+        return replica_list;
+    }
+    if (!mapped_shared_segments_.empty()) {
+        rewrite_shared_memory_replicas(replica_list);
     }
     return replica_list;
 }
@@ -4147,7 +4794,12 @@ RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
 
     for (size_t i = 0; i < query_results.size(); ++i) {
         if (query_results[i]) {
-            replica_map[keys[i]] = query_results[i].value().replicas;
+            std::vector<Replica::Descriptor> replicas =
+                std::move(query_results[i].value().replicas);
+            if (!mapped_shared_segments_.empty()) {
+                rewrite_shared_memory_replicas(replicas);
+            }
+            replica_map[keys[i]] = std::move(replicas);
         } else {
             LOG(ERROR) << "batch_get_replica failed for key: " << keys[i]
                        << " with error: " << toString(query_results[i].error());

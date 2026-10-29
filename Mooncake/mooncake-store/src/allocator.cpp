@@ -32,8 +32,16 @@ AllocatedBuffer::~AllocatedBuffer() {
 AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
     auto alloc = allocator_.lock();
     std::string endpoint;
+    uintptr_t segment_base = 0;
+    uint64_t segment_size = 0;
+    bool shared_memory = false;
+    uint64_t shm_segment_index = 0;
     if (alloc) {
         endpoint = alloc->getTransportEndpoint();
+        segment_base = alloc->getBase();
+        segment_size = static_cast<uint64_t>(alloc->capacity());
+        shared_memory = alloc->isSharedMemory();
+        shm_segment_index = alloc->getSharedMemoryIndex();
     } else {
         LOG(ERROR) << "allocator=expired_or_null in get_descriptor";
     }
@@ -43,7 +51,13 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
     }
 
     return {static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol, endpoint};
+            reinterpret_cast<uintptr_t>(buffer_ptr_),
+            this->protocol,
+            endpoint,
+            segment_base,
+            segment_size,
+            shared_memory,
+            shm_segment_index};
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
@@ -73,12 +87,16 @@ std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
 // Removed allocated_bytes parameter and member initialization
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
                                                  size_t base, size_t size,
-                                                 std::string transport_endpoint)
+                                                 std::string transport_endpoint,
+                                                 bool shared_memory,
+                                                 uint64_t shm_segment_index)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0),
-      transport_endpoint_(std::move(transport_endpoint)) {
+      transport_endpoint_(std::move(transport_endpoint)),
+      shared_memory_(shared_memory),
+      shm_segment_index_(shm_segment_index) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
             << " size=" << size;
@@ -165,12 +183,16 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
 // OffsetBufferAllocator implementation
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
                                              size_t base, size_t size,
-                                             std::string transport_endpoint)
+                                             std::string transport_endpoint,
+                                             bool shared_memory,
+                                             uint64_t shm_segment_index)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0),
-      transport_endpoint_(std::move(transport_endpoint)) {
+      transport_endpoint_(std::move(transport_endpoint)),
+      shared_memory_(shared_memory),
+      shm_segment_index_(shm_segment_index) {
     VLOG(1) << "initializing_offset_buffer_allocator segment_name="
             << segment_name << " base_address=" << reinterpret_cast<void*>(base)
             << " size=" << size;

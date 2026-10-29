@@ -346,9 +346,18 @@ struct Segment {
     // TE p2p endpoint (ip:port) for transport-only addressing
     std::string te_endpoint{};
     std::string protocol;
+    // True when this segment is backed by an anonymous shared memory object
+    // (memfd), so same-host peers may map it into their own address space
+    // after receiving its fd over the owner's IPC socket.
+    bool shared_memory{false};
+    // Identifies the segment within its owner: a peer sends this index to the
+    // owner's shm-fd socket to receive the matching memfd. Only meaningful when
+    // shared_memory is true.
+    uint64_t shm_segment_index{0};
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, shared_memory,
+         shm_segment_index);
 
 /**
  * @brief Allocation strategy type for segment allocation

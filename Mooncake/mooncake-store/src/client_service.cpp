@@ -712,6 +712,12 @@ Client::QueryByRegex(const std::string& str) {
     return result;
 }
 
+tl::expected<std::vector<Segment>, ErrorCode>
+Client::GetSharedMemorySegments(
+    const std::vector<std::string>& segment_names) {
+    return master_client_.GetSharedMemorySegments(segment_names);
+}
+
 tl::expected<QueryResult, ErrorCode> Client::Query(
     const std::string& object_key) {
     std::chrono::steady_clock::time_point start_time =
@@ -2083,7 +2089,8 @@ std::vector<int> Client::GetNicNumaNodes() const {
 
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol,
-    const std::string& location) {
+    const std::string& location, bool shared_memory,
+    uint64_t shm_segment_index) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);
     if (!check_result) {
         return tl::unexpected(check_result.error());
@@ -2121,6 +2128,10 @@ tl::expected<void, ErrorCode> Client::MountSegment(
         segment.name = local_hostname_;
         segment.base = reinterpret_cast<uintptr_t>(buffer);
         segment.size = size;
+        // Publish shared-memory backing so same-host peers can request the
+        // backing memfd over this client's shm-fd socket.
+        segment.shared_memory = shared_memory;
+        segment.shm_segment_index = shm_segment_index;
         segment.protocol = protocol;
         // For P2P handshake mode, publish the actual transport endpoint that
         // was negotiated by the transfer engine. Otherwise, keep the logical

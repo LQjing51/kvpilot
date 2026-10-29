@@ -94,11 +94,13 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         switch (segment_manager_->memory_allocator_) {
             case BufferAllocatorType::CACHELIB:
                 allocator = std::make_shared<CachelibBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint);
+                    segment.name, buffer, size, segment.te_endpoint,
+                    segment.shared_memory, segment.shm_segment_index);
                 break;
             case BufferAllocatorType::OFFSET:
                 allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint);
+                    segment.name, buffer, size, segment.te_endpoint,
+                    segment.shared_memory, segment.shm_segment_index);
                 break;
             default:
                 LOG(ERROR) << "segment_name=" << segment.name
@@ -315,6 +317,30 @@ ErrorCode ScopedSegmentAccess::GetAllSegmentNames(
     all_segment_names.clear();
     for (auto& segment : segment_manager_->mounted_segments_) {
         all_segment_names.push_back(segment.second.segment.name);
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::GetSharedMemorySegments(
+    const std::vector<std::string>& segment_names,
+    std::vector<Segment>& segments) {
+    segments.clear();
+    // Only expose ready segments that are actually shared-memory backed, so a
+    // peer never tries to shm_open() a plain anonymous or hugepage segment.
+    for (const auto& name : segment_names) {
+        for (const auto& segment_pair : segment_manager_->mounted_segments_) {
+            const auto& mounted = segment_pair.second;
+            if (mounted.status != SegmentStatus::OK) {
+                continue;
+            }
+            if (mounted.segment.name != name) {
+                continue;
+            }
+            if (!mounted.segment.shared_memory) {
+                continue;
+            }
+            segments.push_back(mounted.segment);
+        }
     }
     return ErrorCode::OK;
 }

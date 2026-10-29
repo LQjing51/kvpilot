@@ -124,6 +124,15 @@ class Client {
     tl::expected<QueryResult, ErrorCode> Query(const std::string& object_key);
 
     /**
+     * @brief Fetch shared-memory backed segments mounted under the given
+     * segment names, so a same-host peer can shm_open and mmap them.
+     * @param segment_names Peer segment names to look up
+     * @return The matching segments, possibly empty
+     */
+    tl::expected<std::vector<Segment>, ErrorCode> GetSharedMemorySegments(
+        const std::vector<std::string>& segment_names);
+
+    /**
      * @brief Queries replica lists for object keys that match a regex pattern.
      * @param str The regular expression string to match against object keys.
      * @return An expected object containing a map from object keys to their
@@ -280,11 +289,15 @@ class Client {
      * @brief Registers a memory segment to master for allocation
      * @param buffer Memory buffer to register
      * @param size Size of the buffer in bytes
+     * @param shared_memory Whether the buffer is an anonymous (memfd) shared
+     *        segment that same-host peers may map
+     * @param shm_segment_index Index peers use to request the backing memfd
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> MountSegment(
         const void* buffer, size_t size, const std::string& protocol = "tcp",
-        const std::string& location = kWildcardLocation);
+        const std::string& location = kWildcardLocation,
+        bool shared_memory = false, uint64_t shm_segment_index = 0);
 
     /**
      * @brief Unregisters a memory segment from master
@@ -472,6 +485,18 @@ class Client {
 
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
+    }
+
+    /**
+     * @brief Whether the given transport endpoint refers to this client.
+     * Mirrors IsReplicaOnLocalMemory: under P2P handshake the endpoint is the
+     * negotiated ip:port, otherwise it is the logical hostname.
+     */
+    [[nodiscard]] bool IsLocalTransportEndpoint(const std::string& endpoint) {
+        if (metadata_connstring_ == P2PHANDSHAKE) {
+            return endpoint == GetTransportEndpoint();
+        }
+        return endpoint == local_hostname_;
     }
 
     // Return sorted NUMA node IDs that have at least one RDMA NIC.

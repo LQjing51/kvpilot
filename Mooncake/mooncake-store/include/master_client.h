@@ -297,6 +297,16 @@ class MasterClient {
         const Segment& segment);
 
     /**
+     * @brief Fetch shared-memory backed segments mounted under the given
+     * segment names, so a same-host peer can shm_open and mmap them. Segments
+     * that are not shared-memory backed are filtered out by the master.
+     * @param segment_names Peer segment names to look up
+     * @return The matching segments, possibly empty
+     */
+    [[nodiscard]] tl::expected<std::vector<Segment>, ErrorCode>
+    GetSharedMemorySegments(const std::vector<std::string>& segment_names);
+
+    /**
      * @brief Re-mount segments, invoked when the client is the first time to
      * connect to the master or the client Ping TTL is expired and need
      * to remount. This function is idempotent. Client should retry if the

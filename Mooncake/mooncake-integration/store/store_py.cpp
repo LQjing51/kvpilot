@@ -1455,10 +1455,22 @@ PYBIND11_MODULE(store, m) {
                        &AllocatedBuffer::Descriptor::buffer_address_)
         .def_readwrite("transport_endpoint",
                        &AllocatedBuffer::Descriptor::transport_endpoint_)
+        .def_readwrite("segment_base",
+                       &AllocatedBuffer::Descriptor::segment_base_)
+        .def_readwrite("segment_size",
+                       &AllocatedBuffer::Descriptor::segment_size_)
+        .def_readwrite("shared_memory",
+                       &AllocatedBuffer::Descriptor::shared_memory_)
+        .def_readwrite("shm_segment_index",
+                       &AllocatedBuffer::Descriptor::shm_segment_index_)
         .def("__repr__", [](const AllocatedBuffer::Descriptor &desc) {
             return "<Descriptor size=" + std::to_string(desc.size_) +
                    " buffer_address=" + std::to_string(desc.buffer_address_) +
-                   " transport_endpoint=" + desc.transport_endpoint_ + ">";
+                   " transport_endpoint=" + desc.transport_endpoint_ +
+                   " segment_base=" + std::to_string(desc.segment_base_) +
+                   " segment_size=" + std::to_string(desc.segment_size_) +
+                   " shared_memory=" +
+                   (desc.shared_memory_ ? "true" : "false") + ">";
         });
 
     py::enum_<TaskType>(m, "TaskType")
@@ -2271,6 +2283,27 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->batch_get_replica_desc(keys);
             },
             py::arg("keys"))
+        .def(
+            "preload_shared_memory_segments",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &peer_endpoints) {
+                // Shared-memory segments only exist on the real client; the
+                // dummy client has no segments of its own to map.
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real_client) {
+                    LOG(ERROR) << "preload_shared_memory_segments is only "
+                                  "supported by the real client";
+                    return -1;
+                }
+                py::gil_scoped_release release;
+                return real_client->preload_shared_memory_segments(
+                    peer_endpoints);
+            },
+            py::arg("peer_endpoints"),
+            "Map the shared memory segments of same-host peers into this "
+            "process so their KV can be read without a cross-process copy. "
+            "Returns the number of segments newly mapped, or -1 on failure.")
         .def(
             "batch_replica_clear",
             [](MooncakeStorePyWrapper &self,

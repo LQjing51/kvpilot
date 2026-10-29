@@ -124,6 +124,9 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> UnmountSegment(const UUID& segment_id,
                                                  const UUID& client_id);
 
+    tl::expected<std::vector<Segment>, ErrorCode> GetSharedMemorySegments(
+        const std::vector<std::string>& segment_names);
+
     tl::expected<std::string, ErrorCode> GetFsdir();
 
     tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig();
