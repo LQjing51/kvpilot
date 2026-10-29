@@ -1,0 +1,29 @@
+# Build context for deploy/taiji-cluster/Dockerfile.
+#
+# The Dockerfile COPYs only from dynamo-dev/, so build from there:
+#   cd dynamo-dev && docker build -f deploy/taiji-cluster/Dockerfile -t <tag> .
+#
+# This file matters only if you instead build from the kvpilot/ root (a wider
+# context). It keeps the 6 GB of datasets out — they live on CFS at runtime and
+# never belong in an image.
+
+datasets/
+vllm-dev/
+lmcache-dev/
+Mooncake/
+plot_context_time.py
+*.pdf
+
+**/.git
+**/.github
+**/__pycache__
+**/*.pyc
+**/target/
+**/build/
+**/.venv/
+**/node_modules/
+
+**/dynamo-log/
+**/*.log
+**/*.jsonl
+**/*.parquet

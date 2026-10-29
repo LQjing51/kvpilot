@@ -1,0 +1,8 @@
+.DS_Store
+__pycache__/
+*.pyc
+.ruff_cache/
+
+# Raw downloads, too large for GitHub; see docs/datasets.md for sources.
+datasets/agent-traces/swe-smith-trajectories/swe_smith_all.jsonl
+datasets/agent-traces/tracelab/syfi_coding_trace.jsonl.gz
