@@ -1,0 +1,6 @@
+[submodule "Mooncake/extern/pybind11"]
+	path = Mooncake/extern/pybind11
+	url = https://github.com/pybind/pybind11.git
+[submodule "Mooncake/extern/yalantinglibs"]
+	path = Mooncake/extern/yalantinglibs
+	url = https://github.com/alibaba/yalantinglibs.git
