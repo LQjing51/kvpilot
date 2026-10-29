@@ -1,0 +1,81 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+run:
+  timeout: 10m
+  allow-parallel-runners: true
+
+issues:
+  # don't skip warning about doc comments
+  # don't exclude the default set of lint
+  exclude-use-default: false
+  # restore some of the defaults
+  # (fill in the rest as needed)
+  exclude-rules:
+    - path: "api/*"
+      linters:
+        - lll
+    - path: "internal/*"
+      linters:
+        - dupl
+        - lll
+    - path: "pkg/dynamo/*"
+      linters:
+        - lll
+        - nakedret
+    # Intentional internal usage of deprecated namespace-restricted mode fields/packages.
+    # The feature is soft-deprecated (still functional) so internal references are expected.
+    - linters:
+        - staticcheck
+      text: "SA1019:.*deprecated.*namespace"
+    # Intentional compatibility usage of deprecated checkpoint fields.
+    # Compatibility flows and conversion code still need to read/write these
+    # fields until a future API version can remove them.
+    - linters:
+        - staticcheck
+      text: "SA1019:.*(CheckpointMode|omit mode|DynamoCheckpointIdentity|required by v1alpha1|omit for DGD-managed checkpoints|legacy spec.identity|checkpoint launch uses)"
+    # controller-runtime v0.24 deprecates these compatibility APIs, but moving
+    # the operator to the replacement generic admission and events APIs is a
+    # larger behavior-preserving refactor than this Kubernetes dependency bump.
+    # TODO: Remove these suppressions by migrating the deprecated APIs tracked in
+    # https://github.com/ai-dynamo/dynamo/issues/10795.
+    - linters:
+        - staticcheck
+      text: "SA1019:.*(scheme.Builder|CustomValidator|WithCustomValidator|GetEventRecorderFor).*deprecated"
+    - path: "internal/webhook/validation/.*_handler.go"
+      linters:
+        - staticcheck
+      text: "SA1019: admission\\."
+linters:
+  disable-all: true
+  enable:
+    - dupl
+    - errcheck
+    - goconst
+    - gocyclo
+    - gofmt
+    - goimports
+    - gosimple
+    - govet
+    - ineffassign
+    - lll
+    - misspell
+    - nakedret
+    - prealloc
+    - staticcheck
+    - typecheck
+    - unconvert
+    - unparam
+    - unused
