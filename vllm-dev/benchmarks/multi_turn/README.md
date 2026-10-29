@@ -31,8 +31,13 @@ Then run the benchmarking script
 export MODEL_PATH=/models/meta-llama/Meta-Llama-3.1-8B-Instruct/
 
 python benchmark_serving_multi_turn.py --model $MODEL_PATH --served-model-name Llama \
---input-file generate_multi_turn.json --num-clients 2 --max-active-conversations 6
+--input-file generate_multi_turn.json --max-inflight-req 2
 ```
+
+`--max-inflight-req` caps requests in flight; `--max-inflight-session` caps how
+many conversations are live at once (0 = unlimited). Setting the latter close to
+the former keeps served requests concentrated on a few warm prefixes instead of
+spread over many sessions that only ever sent their first turn.
 
 You can edit the file `generate_multi_turn.json` to change the conversation parameters (number of turns, etc.).
 

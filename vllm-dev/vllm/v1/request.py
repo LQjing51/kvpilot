@@ -172,6 +172,25 @@ class Request:
 
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
+        # KV hit rate of this request's first scheduled prefill, copied out of
+        # prefill_stats while it is still populated. prefill_stats is consumed
+        # (set to None) when the request's output is emitted, which precedes
+        # the block free on the disaggregated path, so eviction policy cannot
+        # read it there.
+        self.kvpilot_kv_hit_rate: float = 0.0
+
+        # Load-stall accounting for this request's prefill, all zero unless
+        # $KVPILOT_LOAD_STALL is set. The token counts are fixed at the first
+        # prefill; the timing accumulates because chunked prefill spans several
+        # forwards, each contributing its own share of stall.
+        self.kvpilot_new_tokens: int = 0
+        self.kvpilot_hit_tokens: int = 0
+        self.kvpilot_dram_tokens: int = 0
+        self.kvpilot_scheduled_ns: int = 0
+        self.kvpilot_stall_ns: int = 0
+        self.kvpilot_num_waits: int = 0
+        self.kvpilot_num_steps: int = 0
+
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents

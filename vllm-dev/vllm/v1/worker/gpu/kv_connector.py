@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer import (
     kv_transfer_state,
 )
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
+from vllm.v1.core import kvpilot_load_stall
 from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
@@ -68,11 +69,24 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
 
         # TODO: sort out KV Connectors' use of forward_context
+        # Timed as a stall: with layerwise loading this submits the fetches and
+        # then blocks on the first layer. Reset first so the accumulator covers
+        # exactly this forward. See kvpilot_load_stall.py.
+        kvpilot_load_stall.begin_step()
+        timer = kvpilot_load_stall.time_wait()
         if is_forward_context_available():
-            self.kv_connector.start_load_kv(get_forward_context())
+            if timer is None:
+                self.kv_connector.start_load_kv(get_forward_context())
+            else:
+                with timer:
+                    self.kv_connector.start_load_kv(get_forward_context())
         else:
             with set_forward_context(None, self.vllm_config):
-                self.kv_connector.start_load_kv(get_forward_context())
+                if timer is None:
+                    self.kv_connector.start_load_kv(get_forward_context())
+                else:
+                    with timer:
+                        self.kv_connector.start_load_kv(get_forward_context())
 
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True
@@ -91,6 +105,10 @@ class ActiveKVConnector(KVConnector):
         output.kv_cache_events = self.kv_connector.get_kv_connector_kv_cache_events()
         output.kv_connector_worker_meta = (
             self.kv_connector.build_connector_worker_meta()
+        )
+        # Read after the forward, so every per-layer wait is included.
+        output.kvpilot_stall_ns, output.kvpilot_num_waits = (
+            kvpilot_load_stall.take_step()
         )
         self.kv_connector.clear_connector_metadata()
         return output

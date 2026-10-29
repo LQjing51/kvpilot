@@ -210,6 +210,13 @@ class KVConnectorOutput:
     # for a given connector after discovery. Default value entails no change.
     expected_finished_count: int = 0
 
+    # Nanoseconds this forward spent blocked waiting for KV to load, and how
+    # many blocking calls made it up. A step total, not per request: one
+    # forward is shared by the whole batch. The scheduler divides it among the
+    # requests that were actually loading. See kvpilot_load_stall.py.
+    kvpilot_stall_ns: int = 0
+    kvpilot_num_waits: int = 0
+
     def is_empty(self):
         return (
             not self.finished_sending
@@ -218,6 +225,7 @@ class KVConnectorOutput:
             and not self.kv_cache_events
             and not self.invalid_block_ids
             and not self.kv_connector_worker_meta
+            and not self.kvpilot_stall_ns
         )
 
 

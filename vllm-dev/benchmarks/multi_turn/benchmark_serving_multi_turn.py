@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
-import multiprocessing as mp
 import os
 import random
 import time
-from collections import Counter, deque
+import uuid
 from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
@@ -33,15 +33,24 @@ from bench_utils import TEXT_SEPARATOR, Color, logger
 from transformers import AutoTokenizer  # type: ignore
 
 NUM_TOKENS_FROM_DATASET = 0
-TERM_SIGNAL = None
+# How long a client with no work waits for the feeder before concluding the
+# task queue is drained. Only pays out once per client, at the very end.
+# How often the progress line prints. The old one fired per finished
+# conversation off a blocking queue read; with the queues gone it needs a clock.
+PROGRESS_INTERVAL_SEC = 10.0
 
+# Where the arrival schedule is written. Next to the trace it was derived from,
+# so a run's timetable can be matched to its input.
+DEFAULT_SCHEDULE_NAME = "multiturn_schedule.jsonl"
 
-class ConversationSampling(str, Enum):
-    ROUND_ROBIN = "round_robin"
-    RANDOM = "random"
-
-    def __str__(self):
-        return self.value
+# Maps each ShareGPT conv_id to the physical line number of every one of its
+# user messages in the input JSON file (1-based, matching editor line numbers),
+# in conversation order: `_conv_id_to_user_lines[conv_id][turn_idx]`. Populated
+# in `main()` by scanning the source file; consumed by `send_turn` to embed the
+# line of the exact prompt being sent into the request_id's leading 8 chars, so
+# server-side logs map straight back to one request rather than to a whole
+# conversation. Worker subprocesses inherit this dict via fork (Linux default).
+_conv_id_to_user_lines: dict[str, list[int]] = {}
 
 
 class ClientArgs(NamedTuple):
@@ -49,12 +58,9 @@ class ClientArgs(NamedTuple):
     max_num_requests: int | None
     skip_first_turn: bool
     max_turns: int | None
-    max_active_conversations: int
     verbose: bool
     print_content: bool
     verify_output: bool
-    conversation_sampling: ConversationSampling
-    request_rate: float
     max_retries: int
 
 
@@ -65,12 +71,27 @@ class RequestArgs(NamedTuple):
     limit_min_tokens: int  # Use negative value for no limit
     limit_max_tokens: int  # Use negative value for no limit
     timeout_sec: int
+    forced_output: bool = False
+    # Replay start, as perf_counter_ns(). Every coroutine measures its arrival
+    # and its `[req] ts=` stamp from this one origin.
+    t0_ns: int = 0
 
 
 class BenchmarkArgs(NamedTuple):
     url: str
-    num_clients: int
-    early_stop: bool
+    # Cap on requests in flight at once; 0 = unlimited. Not a client count any
+    # more: one coroutine per conversation, this bounds how many may be sending.
+    max_inflight_req: int
+    # Cap on sessions live at once; 0 = unlimited. A session holds its slot from
+    # first turn to last, tool time included, so this bounds how many distinct
+    # prefixes the server is asked to keep warm rather than how many requests
+    # are in flight.
+    max_inflight_session: int = 0
+    # Sessions per second, as a Poisson process over conversation start times.
+    # 0 = every conversation is ready at t=0 and the in-flight cap sets the pace.
+    session_arrival_rate: float = 0.0
+    # --tool-time spec: "0", a constant like "1s", or "lognormal[:mu,sigma]".
+    tool_time: str = "0"
 
 
 class ServerResponse(NamedTuple):
@@ -218,6 +239,8 @@ async def send_request(
     max_tokens: int | None = None,
     timeout_sec: int = 120,
     conversation_id: str | None = None,
+    request_id: str | None = None,
+    forced_output_tokens: list[int] | None = None,
 ) -> ServerResponse:
     payload = {
         "model": model,
@@ -228,6 +251,12 @@ async def send_request(
 
     if conversation_id is not None:
         payload["conversation_id"] = conversation_id
+
+    if forced_output_tokens:
+        # Pins the generated tokens to the trace so repeated runs are
+        # comparable. Read by vLLM's ForcedOutputTokensLogitsProcessor; dynamo
+        # forwards it through sampling_options (PASSTHROUGH_EXTRA_FIELDS).
+        payload["forced_output_tokens"] = forced_output_tokens
 
     if stream:
         payload["stream"] = True
@@ -240,6 +269,14 @@ async def send_request(
         payload["max_tokens"] = max_tokens
 
     headers = {"Content-Type": "application/json"}
+    if request_id is not None:
+        # Dynamo's frontend only reads `request-id` or `x-dynamo-request-id`
+        # (and only if the value parses as a UUID) — the more conventional
+        # `X-Request-Id` is captured for tracing but never used as the
+        # internal request_id, so we must use one of dynamo's expected names.
+        # See dynamo/lib/runtime/src/logging.rs:TraceParent::from_headers.
+        headers["x-dynamo-request-id"] = request_id
+        headers["X-Request-Id"] = request_id  # also echoed in response for clients
 
     # Calculate the timeout for the request
     if max_tokens is not None:
@@ -396,22 +433,68 @@ async def send_turn(
     min_tokens = None if req_args.limit_min_tokens < 0 else req_args.limit_min_tokens
     max_tokens = None if req_args.limit_max_tokens < 0 else req_args.limit_max_tokens
 
+    forced_output_tokens = None
     if len(conversation_messages) > messages_to_use:
         # The conversation contains an assistant answer for the next user prompt
         if (
             min_tokens == NUM_TOKENS_FROM_DATASET
             or max_tokens == NUM_TOKENS_FROM_DATASET
+            or req_args.forced_output
         ):
             # Compute number of tokens in the answer (from the input conversation)
             assistant_answer = conversation_messages[messages_to_use]
             answer_num_tokens = get_token_count(tokenizer, assistant_answer["content"])
             assert assistant_answer["role"] == "assistant"
 
+        if req_args.forced_output:
+            forced_output_tokens = tokenizer(
+                assistant_answer["content"], add_special_tokens=False
+            ).input_ids
+
         if min_tokens == NUM_TOKENS_FROM_DATASET:
             min_tokens = max(1, answer_num_tokens)
 
         if max_tokens == NUM_TOKENS_FROM_DATASET:
             max_tokens = max(1, answer_num_tokens)
+
+    # Build a deterministic request id so that server-side block-pool logs
+    # (which print the request_id passed via X-Request-Id) can be mapped
+    # back to the exact prompt that produced them.
+    #
+    # Dynamo's frontend only accepts request_id headers that parse as a UUID
+    # (lib/runtime/src/logging.rs filter), so we emit a valid UUIDv4 with the
+    # line number of *this request's* user message in the input JSON encoded
+    # into the leading 8 hex chars (zero-padded). The remaining bits are random
+    # so retries of the same turn still get distinct IDs.
+    #
+    # `index` is the position of the user message inside the conversation, so
+    # counting only user messages gives its turn ordinal.
+    user_turn_idx = sum(
+        1 for _m in conversation_messages[:index] if _m["role"] == "user"
+    )
+    user_lines = _conv_id_to_user_lines.get(conv_id) or []
+    line_no = user_lines[user_turn_idx] if user_turn_idx < len(user_lines) else 0
+    # Physical line number from the input JSON, zero-padded to 8 decimal
+    # chars (line 16 -> "00000016"). Capped at 99999999. Digits 0-9 are
+    # valid hex so the segment is still a valid first UUID group.
+    line_prefix = f"{min(line_no, 99999999):08d}"
+    # Random remainder; uuid4()'s hex already has the v4 version nibble and
+    # RFC4122 variant nibble in the right positions (hex[12]='4', hex[16] in
+    # {8,9,a,b}), so slicing preserves a valid UUIDv4.
+    rand = uuid.uuid4()
+    request_id = (
+        f"{line_prefix}-"
+        f"{rand.hex[8:12]}-"
+        f"{rand.hex[12:16]}-"
+        f"{rand.hex[16:20]}-"
+        f"{rand.hex[20:32]}"
+    )
+
+    # Dispatch time on the shared replay timeline, taken before the request
+    # goes out. Mirrors mooncake_trace_replay's start_time_ms: that trace also
+    # carries its own arrival times, which this dataset does not, so "when the
+    # replay actually sent it" is the only arrival notion available here.
+    ts_ms = (time.perf_counter_ns() - req_args.t0_ns) // 1_000_000
 
     # Send the current conversation to LLM and get a response
     response: ServerResponse = await send_request(
@@ -423,7 +506,15 @@ async def send_turn(
         min_tokens,
         max_tokens,
         req_args.timeout_sec,
-        conversation_id=conv_id,
+        # Deliberately not sent: the server does nothing with it, and Dynamo's
+        # frontend validates the request body strictly, rejecting the whole
+        # request with `Unsupported parameter(s): conversation_id`. vLLM's own
+        # OpenAI layer tolerates it (extra="allow"), so this only ever cost us
+        # nothing. Conversation identity is still tracked client-side via
+        # conv_id and carried to the server inside request_id.
+        conversation_id=None,
+        request_id=request_id,
+        forced_output_tokens=forced_output_tokens,
     )
 
     if response.valid is False:
@@ -487,6 +578,22 @@ async def send_turn(
         client_id=client_id,
     )
 
+    # The two lines analyze_lp_ttft_breakdown.py parses, in the format
+    # mooncake_trace_replay.py established. `idx` must equal the decimal in the
+    # request_id's leading 8 chars — that is how the analyzer joins these rows
+    # to the frontend/prefill logs and the nsys timeline. `hashes` has no
+    # counterpart here (it counts mooncake hash_ids), so it stays 0. Printed
+    # unconditionally: this is data the analyzer needs, not progress chatter.
+    print(
+        f"[req] idx={int(line_prefix)} ts={ts_ms}ms"
+        f" in={input_num_tokens} out={output_num_tokens} hashes=0"
+    )
+    print(
+        f"[ok ] idx={int(line_prefix)} out={output_num_tokens}/{output_num_tokens}"
+        f" ttft={ttft_ms:.1f}ms tpot={tpot_ms:.2f}ms"
+        f" e2e={response.latency_ms:.1f}ms chunks={response.num_chunks}"
+    )
+
     if verbose:
         print(
             f"\n{Color.YELLOW}Response ({output_num_tokens} tokens):{Color.RESET}",
@@ -523,14 +630,103 @@ async def send_turn(
     return rs
 
 
-async def poisson_sleep(request_rate: float, verbose: bool = False) -> None:
-    # Generate a random time interval from the Poisson distribution
-    assert request_rate > 0
+def parse_tool_time(spec: str):
+    """Turn a --tool-time spec into `(label, sampler)`.
 
-    interval = np.random.exponential(1.0 / request_rate)
-    if verbose:
-        logger.info(f"Sleeping for {interval:.3f} seconds...")
-    await asyncio.sleep(interval)
+    The sampler takes a numpy Generator and returns seconds. Three forms:
+
+      0                 no think time at all — maximum pressure
+      <number>[s|ms]    a constant, e.g. `1s`, `250ms`, `5`
+      lognormal[:mu,sigma]   heavy tail, defaults mu=0 sigma=1 (median 1s,
+                             p99 ~10s), the shape agent tool latencies take
+
+    A constant is the honest default when a trace carries no tool timings;
+    lognormal exists because real tool time spans milliseconds (a `cd`) to
+    tens of seconds (a test suite), and that spread is what decides whether a
+    session's blocks are still resident when its next turn arrives.
+    """
+    spec = (spec or "0").strip().lower()
+    if spec in ("0", "", "none", "off"):
+        return "0", (lambda rng: 0.0)
+    if spec.startswith("lognormal"):
+        mu, sigma = 0.0, 1.0
+        if ":" in spec:
+            parts = spec.split(":", 1)[1].split(",")
+            if len(parts) != 2:
+                raise ValueError(
+                    f"--tool-time {spec!r}: expected lognormal:mu,sigma"
+                )
+            mu, sigma = float(parts[0]), float(parts[1])
+        return (
+            f"lognormal(mu={mu},sigma={sigma})",
+            lambda rng: float(rng.lognormal(mu, sigma)),
+        )
+    scale = 1.0
+    value = spec
+    if spec.endswith("ms"):
+        scale, value = 1e-3, spec[:-2]
+    elif spec.endswith("s"):
+        value = spec[:-1]
+    try:
+        seconds = float(value) * scale
+    except ValueError:
+        raise ValueError(
+            f"--tool-time {spec!r}: expected 0, a constant like 1s / 250ms, "
+            "or lognormal[:mu,sigma]"
+        ) from None
+    if seconds < 0:
+        raise ValueError(f"--tool-time {spec!r}: must not be negative")
+    return f"{seconds}s", (lambda rng: seconds)
+
+
+def build_schedule(
+    conv_ids: list[str],
+    conversations: ConversationsMap,
+    arrival_rate: float,
+    tool_time_spec: str,
+    seed: int,
+) -> dict:
+    """Pre-draw every random quantity the replay needs, before it starts.
+
+    Two things are fixed here and nothing else: when each session first
+    arrives, and how long each of its turns spends in its tool. What cannot be
+    pre-computed is when a later turn arrives — that is
+    `A[t+1] = C[t] + Z[t]`, and `C[t]` is the server's actual completion time,
+    known only at run time. Fixing it here instead would turn the replay into a
+    rigid timetable that stops reflecting the server once it slows down.
+
+    Drawing up front is what makes a run reproducible: one seed and one
+    parameter set give the same arrivals and the same tool times regardless of
+    how the coroutines interleave.
+    """
+    label, sampler = parse_tool_time(tool_time_spec)
+    rng = np.random.default_rng(seed)
+    arrivals: dict[str, float] = {}
+    tool_times: dict[str, list[float]] = {}
+    clock = 0.0
+    for conv_id in conv_ids:
+        if arrival_rate > 0:
+            # Exponential gaps: the inter-arrival law of a Poisson process.
+            clock += float(rng.exponential(1.0 / arrival_rate))
+            arrivals[conv_id] = clock
+        else:
+            # No arrival process: every session is ready at t=0 and the
+            # in-flight cap alone decides the pace.
+            arrivals[conv_id] = 0.0
+        # One draw per message, which over-provisions (only user turns are
+        # sent) and costs nothing, so a turn index can be used directly.
+        n = len(conversations.get(conv_id) or [])
+        tool_times[conv_id] = [sampler(rng) for _ in range(n + 1)]
+    return {
+        "params": {
+            "seed": seed,
+            "session_arrival_rate": arrival_rate,
+            "tool_time": label,
+            "num_conversations": len(conv_ids),
+        },
+        "arrivals": arrivals,
+        "tool_times": tool_times,
+    }
 
 
 async def exponential_backoff_sleep(
@@ -539,11 +735,13 @@ async def exponential_backoff_sleep(
     backoff_factor: float = 2.0,
     jitter_fraction: float = 0.10,
     verbose: bool = False,
+    rng=None,
 ) -> None:
     # Sleep with exponential backoff and jitter after a failed request.
     backoff_delay = base_rate * (backoff_factor**attempt_cnt)
+    draw = (rng or np.random).uniform
     jittered_delay = backoff_delay * (
-        1 + np.random.uniform(-jitter_fraction, jitter_fraction)
+        1 + draw(-jitter_fraction, jitter_fraction)
     )
 
     if verbose:
@@ -552,144 +750,119 @@ async def exponential_backoff_sleep(
     await asyncio.sleep(jittered_delay)
 
 
-async def client_main(
+async def conversation_coro(
+    conv_id: str,
+    ordinal: int,
+    messages: MessagesList,
     args: ClientArgs,
     req_args: RequestArgs,
-    client_id: int,
     tokenizer: AutoTokenizer,
-    stop_event: mp.Event,  # type: ignore
-    task_queue: mp.Queue,
-    result_queue: mp.Queue,
-    conv_queue: mp.Queue,
-) -> None:
-    logger.info(
-        f"{Color.CYAN}Started client {client_id}: max_num_requests={args.max_num_requests}, max_active_conversations={args.max_active_conversations}{Color.RESET}"  # noqa: E501
-    )
+    session: aiohttp.ClientSession,
+    sem: "asyncio.Semaphore | None",
+    session_sem: "asyncio.Semaphore | None",
+    budget: "RequestBudget",
+    schedule: dict,
+    metrics: list,
+    debug_stats: "DebugStats",
+) -> tuple[str, MessagesList] | None:
+    """Replay one conversation, in order, until it ends or the budget runs out.
 
-    # Set unique seed per client (each client runs in its own process)
-    # Add 1 to ensure no client uses the same seed as the main process
-    client_seed = args.seed + client_id + 1
-    random.seed(client_seed)
-    np.random.seed(client_seed)
+    The arrival model, per turn:
 
-    # Active conversations
-    active_convs: ConversationsMap = {}
-    conv_id_queue: deque = deque(maxlen=args.max_active_conversations)
+      * turn 1 fires at its pre-drawn Poisson arrival
+      * turn t+1 fires at `C[t] + Z[t]` — the moment turn t completed plus that
+        turn's tool time. `C` is measured, not scheduled, so a slow server
+        pushes the whole session back instead of letting turns pile up.
 
-    # Keep track of how many messages have been used for each conversation
-    turns_count: Counter = Counter()
-    num_successes = 0
-    num_failures = 0
+    Returns the conversation with the server's answers spliced in, or None if
+    it never produced one.
+    """
+    # Its own stream, derived from the run seed and this conversation's
+    # position, so retry jitter stays reproducible however the coroutines
+    # happen to interleave.
+    rng = np.random.default_rng(args.seed + ordinal + 1)
 
-    # Track the timestamp (time.perf_counter())
-    # of the last turn per conversation (only for debug)
-    time_of_last_turn: dict[ConvId, float] = {}
+    arrival = schedule["arrivals"].get(conv_id, 0.0)
+    tool_times = schedule["tool_times"].get(conv_id) or [0.0]
 
-    # Flag that indicates that there are no new tasks (conversations) for the client
-    task_queue_empty = False
+    due = arrival - (time.perf_counter_ns() - req_args.t0_ns) / 1e9
+    if due > 0:
+        # Interruptible: a late-arriving session must not hold the run open
+        # after -n is spent, and it has nothing left to contribute anyway.
+        if await budget.sleep_unless_spent(due):
+            return None
+    elif budget.exhausted:
+        return None
 
-    async with aiohttp.ClientSession() as session:
-        # Print progress
+    turns_count = 0
+    if args.skip_first_turn:
+        # Warmup already sent this conversation's first exchange.
+        turns_count += 2
+    if turns_count >= len(messages):
+        return None
 
-        while task_queue_empty is False:
-            result = None
+    # Held for the whole session, not per turn, so a slot means "this
+    # conversation is live" — including while it sits out its tool time. That
+    # is the point: the cap exists to bound how many distinct prefixes the
+    # server's KV cache is being asked to keep warm at once. Acquired after the
+    # arrival wait so a session queues for a slot only once it is due.
+    if session_sem is None:
+        return await _replay_turns(
+            conv_id, ordinal, messages, args, req_args, tokenizer, session, sem,
+            budget, schedule, metrics, debug_stats, rng, tool_times,
+            turns_count,
+        )
+    async with session_sem:
+        return await _replay_turns(
+            conv_id, ordinal, messages, args, req_args, tokenizer, session, sem,
+            budget, schedule, metrics, debug_stats, rng, tool_times,
+            turns_count,
+        )
 
-            if (
-                args.max_num_requests
-                and num_successes + num_failures == args.max_num_requests
-            ):
-                logger.info(
-                    f"{Color.YELLOW}Client {client_id} reached "
-                    f"request limit{Color.RESET}"
-                )
-                break
 
-            if stop_event.is_set():  # type: ignore
-                logger.info(
-                    f"{Color.YELLOW}Client {client_id} received "
-                    f"a termination signal{Color.RESET}"
-                )
-                break
+async def _replay_turns(
+    conv_id: str,
+    ordinal: int,
+    messages: MessagesList,
+    args: ClientArgs,
+    req_args: RequestArgs,
+    tokenizer: AutoTokenizer,
+    session: aiohttp.ClientSession,
+    sem: "asyncio.Semaphore | None",
+    budget: "RequestBudget",
+    schedule: dict,
+    metrics: list,
+    debug_stats: "DebugStats",
+    rng: "np.random.Generator",
+    tool_times: list,
+    turns_count: int,
+) -> tuple[str, MessagesList] | None:
+    """Send one conversation's turns in order. Split out of conversation_coro
+    only so the session slot can wrap the whole loop with `async with`."""
+    produced = False
+    while True:
+        max_turns = len(messages)
+        if args.max_turns is not None:
+            max_turns = min(args.max_turns, max_turns)
+        if turns_count >= max_turns:
+            break
+        if not budget.take():
+            break
 
-            while (
-                len(active_convs) < args.max_active_conversations
-                and task_queue_empty is False
-            ):
-                # Get a new conversation from the task queue
-                conv_id, messages = task_queue.get()
+        current_turn = turns_count + 1
+        if current_turn >= len(messages):
+            break
 
-                if conv_id is TERM_SIGNAL:
-                    task_queue_empty = True
-                    break
-
-                if args.skip_first_turn:
-                    # Skip the first turn (both user and assistant),
-                    # relevant if warmup was enabled.
-                    # Default turns_count[conv_id] will be zero if conv_id
-                    # was never inserted/updated in turns_count.
-                    turns_count[conv_id] += 2
-
-                if turns_count[conv_id] < len(messages):
-                    # Add new conversation
-                    active_convs[conv_id] = messages
-                    conv_id_queue.append(conv_id)
-
-                    if args.verbose:
-                        logger.info(
-                            f"{Color.GREEN}Client {client_id} will use conversation ID {conv_id} (active conversations {len(active_convs)}){Color.RESET}"  # noqa: E501
-                        )
-
-                elif args.verbose:
-                    # No more messages (conversation finished during the warmup)
-                    logger.info(
-                        f"{Color.YELLOW}Client {client_id} will not use conversation ID {conv_id} (all {len(messages)} messages already sent){Color.RESET}"  # noqa: E501
-                    )
-
-            if len(active_convs) == 0 or task_queue_empty:
-                logger.info(
-                    f"{Color.YELLOW}Client {client_id} has no more work{Color.RESET}"
-                )
-                break
-
-            # Pick an active conversation for the next request
-            if args.conversation_sampling == ConversationSampling.ROUND_ROBIN:
-                conv_id = conv_id_queue.pop()
-            else:
-                # ConversationSampling.RANDOM
-                active_ids = list(active_convs.keys())
-                conv_id = random.choice(active_ids)
-
-            messages = active_convs[conv_id]
-            assert isinstance(messages, list) and len(messages) > 0
-
-            # Update the amount of messages to use
-            turns_count[conv_id] += 1
-            current_turn = turns_count[conv_id]
-
-            assert current_turn < len(messages), (
-                f"Turn number {current_turn} is invalid for conversation ID {conv_id}"
-                f" that has only {len(messages)} messages"
-            )
-
-            if args.verbose:
-                curr_time_sec: float = time.perf_counter()
-                time_since_last_turn: str | float = "N/A"
-                if conv_id in time_of_last_turn:
-                    time_since_last_turn = round(
-                        curr_time_sec - time_of_last_turn[conv_id], 3
-                    )
-                logger.info(
-                    f"Client {client_id} using conversation ID {conv_id} (turn: {current_turn}, time since last turn [sec]: {time_since_last_turn})"  # noqa: E501
-                )
-                time_of_last_turn[conv_id] = curr_time_sec
-
-            success = False
-            for attempt_cnt in range(args.max_retries + 1):
-                try:
-                    exception = False
+        success = False
+        exception = False
+        for attempt_cnt in range(args.max_retries + 1):
+            try:
+                exception = False
+                # None = unlimited: the arrival schedule alone paces the run.
+                async with (sem or contextlib.nullcontext()):
                     result = await send_turn(
                         session,
-                        client_id,
+                        ordinal,
                         conv_id,
                         messages,
                         current_turn,
@@ -698,161 +871,161 @@ async def client_main(
                         args.print_content,
                         args.verify_output,
                     )
-                    if result is not None:
-                        result_queue.put(result)
-                        success = True
-                        break
-                    else:
-                        logger.warning(
-                            f"{Color.YELLOW}Client {client_id} - Request rejected during conversation ID {conv_id} (turn: {current_turn}){Color.RESET}"  # noqa: E501
-                        )
-                except asyncio.exceptions.TimeoutError:
-                    exception = True
-                    logger.error(
-                        "%sClient %d - Timeout during conversation ID %s (turn: %d). "
-                        "Base timeout is %ss (set with --request-timeout-sec), but the "
-                        "effective timeout may be longer based on max_tokens. If this "
-                        "is unexpected, consider increasing the timeout or checking "
-                        "model performance.%s",
-                        Color.RED,
-                        client_id,
-                        conv_id,
-                        current_turn,
-                        req_args.timeout_sec,
-                        Color.RESET,
-                    )
-                except Exception:
-                    exception = True
-                    logger.exception(
-                        f"{Color.RED}Client {client_id} - Exception during conversation ID {conv_id} (turn: {current_turn}){Color.RESET}"  # noqa: E501
-                    )
+                if result is not None:
+                    metrics.append(result)
+                    debug_stats.update(result)
+                    success = True
+                    break
+                logger.warning(
+                    f"{Color.YELLOW}Conversation {conv_id} - request rejected "
+                    f"(turn: {current_turn}){Color.RESET}"
+                )
+            except asyncio.exceptions.TimeoutError:
+                exception = True
+                logger.error(
+                    "%sTimeout on conversation %s (turn: %d). Base timeout is "
+                    "%ss (set with --request-timeout-sec), but the effective "
+                    "timeout may be longer based on max_tokens.%s",
+                    Color.RED,
+                    conv_id,
+                    current_turn,
+                    req_args.timeout_sec,
+                    Color.RESET,
+                )
+            except Exception:
+                exception = True
+                logger.exception(
+                    f"{Color.RED}Exception on conversation {conv_id} "
+                    f"(turn: {current_turn}){Color.RESET}"
+                )
 
-                # Sleep before retry if not last attempt
-                if not success and attempt_cnt < args.max_retries:
-                    await exponential_backoff_sleep(attempt_cnt, verbose=args.verbose)
+            if not success and attempt_cnt < args.max_retries:
+                await exponential_backoff_sleep(
+                    attempt_cnt, verbose=args.verbose, rng=rng
+                )
 
-            if not success:
-                num_failures += 1
-                # Remove the conversation (should not be used again)
-                active_convs.pop(conv_id)
-                if exception:
-                    break  # Exit gracefully instead of raising an error
+        if not success:
+            budget.give_back()
+            # One failed turn ends this conversation: its next prompt would
+            # have to contain an answer the server never gave. Other
+            # conversations are unaffected — that isolation is the point of a
+            # coroutine per conversation.
+            if exception:
+                logger.warning(
+                    f"{Color.YELLOW}Conversation {conv_id} abandoned after an "
+                    f"exception on turn {current_turn}{Color.RESET}"
+                )
+            break
 
-            else:
-                num_successes += 1
+        produced = True
+        # Count the assistant answer too: it is context for the next prompt.
+        turns_count = current_turn + 1
 
-                # Update the turns counter to include the LLM response
-                # The LLM response will be used as context for the next user turn
-                turns_count[conv_id] += 1
+        if turns_count >= max_turns:
+            break
 
-                max_turns = len(messages)
-                if args.max_turns is not None:
-                    # Limit the number of turns in the conversation
-                    max_turns = min(args.max_turns, max_turns)
+        # Z: the tool call this turn implies has to run before the next
+        # prompt exists. Pre-drawn, so the wait is reproducible. The wait is
+        # interruptible: sitting out a tool time only to find the budget spent
+        # would add it to the run's tail for nothing.
+        think = tool_times[min(current_turn, len(tool_times) - 1)]
+        if think > 0 and await budget.sleep_unless_spent(think):
+            break
 
-                if turns_count[conv_id] >= max_turns:
-                    # Conversation has no more turns (no longer active)
-                    # save the updated conversation (with the LLM server's answer)
-                    conv_queue.put((conv_id, active_convs.pop(conv_id)))
-                    if args.verbose:
-                        logger.info(
-                            f"{Color.GREEN}Client {client_id} finished "
-                            f"conversation ID {conv_id}{Color.RESET}"
-                        )
-                else:
-                    # Conversation is not finished, insert it at the back of the queue
-                    conv_id_queue.appendleft(conv_id)
-
-            # Sleep between requests (if lambda is positive)
-            if args.request_rate > 0:
-                await poisson_sleep(args.request_rate, args.verbose)
-
-    # Send indication that the client is done
-    conv_queue.put((TERM_SIGNAL, TERM_SIGNAL))
-
-    logger.info(
-        f"{Color.CYAN}Client {client_id} is done "
-        f"({num_successes=}, {num_failures=}){Color.RESET}"
-    )
+    return (conv_id, messages) if produced else None
 
 
-def worker_function(
-    client_id: int,
-    tokenizer: AutoTokenizer,
-    client_args: ClientArgs,
-    req_args: RequestArgs,
-    stop_event: mp.Event,  # type: ignore
-    task_queue: mp.Queue,
-    result_queue: mp.Queue,
-    conv_queue: mp.Queue,
-) -> None:
-    asyncio.run(
-        client_main(
-            client_args,
-            req_args,
-            client_id,
-            tokenizer,
-            stop_event,
-            task_queue,
-            result_queue,
-            conv_queue,
-        )
-    )
+class RequestBudget:
+    """The shared -n cap. A turn takes a slot before sending and returns it if
+    the send failed, so -n counts requests that actually landed.
+
+    It also carries the run's stop signal. Every conversation in the input file
+    gets a coroutine up front, and with a session arrival rate the last of them
+    is scheduled hours out, so once -n is spent the sessions still waiting for
+    their arrival instant have to be woken and told to give up — otherwise the
+    run sits idle until the whole arrival schedule has played out.
+    """
+
+    def __init__(self, limit: int | None):
+        self._limit = limit
+        self._used = 0
+        self._spent = asyncio.Event()
+        # Sessions that gave up while waiting, reported at the end so a short
+        # `Finished x/y conversations` is not mistaken for a crash.
+        self.dropped_waiting = 0
+
+    def take(self) -> bool:
+        if self._limit is not None and self._used >= self._limit:
+            return False
+        self._used += 1
+        if self._limit is not None and self._used >= self._limit:
+            self._spent.set()
+        return True
+
+    def give_back(self) -> None:
+        self._used = max(0, self._used - 1)
+        if self._limit is not None and self._used < self._limit:
+            # A failed send freed the slot, so sessions still waiting are back
+            # in play; -n keeps counting requests that landed.
+            self._spent.clear()
+
+    async def sleep_unless_spent(self, seconds: float) -> bool:
+        """Sleep, waking early if the budget runs out.
+
+        Returns True if the caller should stop (nothing left to send), False if
+        the sleep simply elapsed.
+        """
+        if self.exhausted:
+            self.dropped_waiting += 1
+            return True
+        try:
+            await asyncio.wait_for(self._spent.wait(), timeout=seconds)
+        except (TimeoutError, asyncio.TimeoutError):
+            return False
+        self.dropped_waiting += 1
+        return True
+
+    @property
+    def used(self) -> int:
+        return self._used
+
+    @property
+    def exhausted(self) -> bool:
+        return self._limit is not None and self._used >= self._limit
 
 
 def get_client_config(
     args: argparse.Namespace, input_conv: ConversationsMap
 ) -> tuple[ClientArgs, RequestArgs]:
-    if args.num_clients < 1:
-        raise ValueError("Number of clients must be a positive number")
+    if args.max_inflight_req < 0:
+        raise ValueError("--max-inflight-req must be >= 0 (0 = unlimited)")
 
-    if len(input_conv) < args.num_clients:
+    if args.max_inflight_req and len(input_conv) < args.max_inflight_req:
         raise ValueError(
-            "Number of conversations must be equal or larger than the number of clients"
+            "Number of conversations must be equal or larger than "
+            "--max-inflight-req"
         )
 
-    max_req_per_client: int | None = None
-    if args.max_num_requests is not None:
-        # Max number of requests per client
-        req_per_client = args.max_num_requests // args.num_clients
-        if req_per_client < 1:
-            raise ValueError("Number of requests should be at least one per client")
-        max_req_per_client = req_per_client
+    if args.max_inflight_session < 0:
+        raise ValueError("--max-inflight-session must be >= 0 (0 = unlimited)")
 
-    max_active_conversations = args.max_active_conversations
-    if max_active_conversations is None:
-        # Each client will have only one active conversation at a time
-        max_active_conversations = args.num_clients
-
-    if max_active_conversations > len(input_conv):
-        raise ValueError(
-            f"Max active conversations {max_active_conversations} "
-            "must be equal or less than the total number of conversations"
-        )
-
-    # Max number of active conversations per client
-    max_active_conv_per_client = max_active_conversations // args.num_clients
-    if max_active_conv_per_client < 1:
-        raise ValueError(
-            f"Max active conversations {max_active_conversations} "
-            "must be equal or greater than the number of clients"
-        )
+    # -n is a fleet-wide cap now, shared through RequestBudget: there are no
+    # per-client shares to divide and no remainder to lose.
+    max_num_requests = args.max_num_requests
+    if max_num_requests is not None and max_num_requests < 1:
+        raise ValueError("Number of requests must be a positive number")
 
     # Skip the first user turn (as part of the warmup)
     skip_first_turn = args.warmup_step
 
-    # Common arguments for all clients
     client_args = ClientArgs(
         seed=args.seed,
-        max_num_requests=max_req_per_client,
+        max_num_requests=max_num_requests,
         skip_first_turn=skip_first_turn,
         max_turns=args.max_turns,
-        max_active_conversations=max_active_conv_per_client,
         verbose=args.verbose,
         print_content=args.print_content,
         verify_output=args.verify_output,
-        conversation_sampling=args.conversation_sampling,
-        request_rate=args.request_rate,
         max_retries=args.max_retries,
     )
 
@@ -880,6 +1053,11 @@ def get_client_config(
         limit_min_tokens=args.limit_min_tokens,
         limit_max_tokens=args.limit_max_tokens,
         timeout_sec=args.request_timeout_sec,
+        forced_output=args.forced_output,
+        # Placeholder: main_mp re-stamps this when the replay actually starts,
+        # so arrivals are measured from the first request and not from argument
+        # parsing (which happens before the tokenizer loads).
+        t0_ns=time.perf_counter_ns(),
     )
 
     return client_args, req_args
@@ -892,178 +1070,140 @@ async def main_mp(
     tokenizer: AutoTokenizer,
     input_conv: ConversationsMap,
 ) -> tuple[ConversationsMap, list[RequestStats]]:
-    # An event that will trigger graceful termination of all the clients
-    stop_event = mp.Event()
+    """Replay every conversation concurrently, one coroutine each.
 
-    # Queue for input conversations (from the input file/dataset)
-    task_queue: mp.Queue = mp.Queue()
+    One process, not one per client: a conversation is a sequence of dependent
+    turns, so what limits throughput is how many requests may be in flight
+    (`--max-inflight-req`), not how many OS processes exist. Coroutines also let
+    a conversation wait out its tool time without blocking any other — the old
+    model slept the whole client, so a think time froze every conversation that
+    client held.
 
-    # Queue for client measurements (TTFT, TPOT, etc. for each request)
-    result_queue: mp.Queue = mp.Queue()
+    `--max-inflight-session` is the other axis: it bounds how many
+    conversations are live at once, so requests concentrate on a few warm
+    prefixes instead of spreading over many sessions that only ever sent turn 1.
+    """
+    conv_ids = list(input_conv)
+    schedule = build_schedule(
+        conv_ids,
+        input_conv,
+        bench_args.session_arrival_rate,
+        bench_args.tool_time,
+        client_args.seed,
+    )
+    logger.info(
+        f"{Color.GREEN}Replaying {len(conv_ids)} conversations: "
+        f"in-flight req cap={bench_args.max_inflight_req or 'unlimited'}, "
+        f"in-flight session cap="
+        f"{bench_args.max_inflight_session or 'unlimited'}, "
+        f"arrival={schedule['params']['session_arrival_rate']} sessions/s, "
+        f"tool_time={schedule['params']['tool_time']}{Color.RESET}"
+    )
 
-    # Queue for output conversations (with the LLM answers, sent by the server)
-    conv_queue: mp.Queue = mp.Queue()
     output_conv: ConversationsMap = {}
     client_metrics: list[RequestStats] = []
+    budget = RequestBudget(client_args.max_num_requests)
+    # 0 = unlimited for both caps. Without a request cap there is no meaningful
+    # multiplier for these two, so fall back to fixed values rather than
+    # letting `0 *` collapse them: a 0-sized debug window would print nothing
+    # and a 0 RPS threshold would report RPS from the very first sample.
+    inflight_cap = bench_args.max_inflight_req
+    debug_stats = DebugStats(
+        logger, min(15 * inflight_cap, 500) if inflight_cap else 500
+    )
+    sem = asyncio.Semaphore(inflight_cap) if inflight_cap > 0 else None
+    rps_min_samples = 5 * inflight_cap if inflight_cap else 50
+    # 0 = unlimited: every conversation's coroutine starts as soon as its
+    # arrival instant passes, which is the historical behaviour.
+    session_sem = (
+        asyncio.Semaphore(bench_args.max_inflight_session)
+        if bench_args.max_inflight_session > 0
+        else None
+    )
 
-    # Start all clients
     start_time = time.perf_counter_ns()
-    logger.info(f"{Color.GREEN}Starting {bench_args.num_clients} clients{Color.RESET}")
+    req_args = req_args._replace(t0_ns=start_time)
+    total_convs = len(conv_ids)
+    done = 0
 
-    clients = []
-    for client_id in range(bench_args.num_clients):
-        client = mp.Process(
-            name=f"client_{client_id}",
-            target=worker_function,
-            args=(
-                client_id,
-                tokenizer,
-                client_args,
-                req_args,
-                stop_event,
-                task_queue,
-                result_queue,
-                conv_queue,
-            ),
-        )
-        clients.append(client)
-        client.start()
-
-    # Submit all the input conversations as tasks for the clients
-    for conv_id, messages in input_conv.items():
-        task_queue.put((conv_id, messages))
-
-    # Add termination signals for clients
-    for _ in range(bench_args.num_clients):
-        task_queue.put((TERM_SIGNAL, TERM_SIGNAL))
-
-    # Collect the updated conversations from all clients
-    num_clients_finished = 0
-    total_convs = len(input_conv)
-
-    debug_stats = DebugStats(logger, min(15 * bench_args.num_clients, 500))
-
-    while num_clients_finished < bench_args.num_clients:
-        # Collect updated conversation
-        conv_id, messages = conv_queue.get()
-
-        # Collect results (measurements)
-        while not result_queue.empty():
-            new_data = result_queue.get()
-            client_metrics.append(new_data)
-            debug_stats.update(new_data)
-
-        if conv_id is TERM_SIGNAL:
-            num_clients_finished += 1
+    async def progress() -> None:
+        """The old progress print hung off a blocking queue read; with the
+        queues gone it needs its own clock, or the run prints nothing at all."""
+        while True:
+            await asyncio.sleep(PROGRESS_INTERVAL_SEC)
+            runtime_sec = nanosec_to_sec(time.perf_counter_ns() - start_time)
+            rps: str | float = (
+                round(len(client_metrics) / runtime_sec, 3) if runtime_sec else "N/A"
+            )
+            if len(client_metrics) < rps_min_samples:
+                rps = "N/A"
+            # Once -n is spent the remaining sessions are being dropped, not
+            # run, so `Finished x/y` stops climbing toward y. Say so, or the
+            # print looks like a stall.
+            spent = " (-n spent, draining)" if budget.exhausted else ""
             logger.info(
-                f"{Color.CYAN}{num_clients_finished} out of "
-                f"{bench_args.num_clients} clients finished{Color.RESET}"
+                f"{Color.CYAN}Finished {done}/{total_convs} conversations, "
+                f"{budget.used} requests, {len(client_metrics)} measurements, "
+                f"runtime {runtime_sec:.1f}s, RPS {rps}{spent}{Color.RESET}"
             )
+            debug_stats.print()
 
-            if bench_args.early_stop and not stop_event.is_set():
-                # Once one client finished, stop all other clients.
-                # there is no reason to continue the benchmark with fewer clients.
-                logger.info(
-                    f"{Color.YELLOW}Sending termination signal to clients{Color.RESET}"
-                )
-                stop_event.set()
-        else:
-            output_conv[conv_id] = messages
-
-            finished_convs = len(output_conv)
-            percent = finished_convs / total_convs
-
-            # Tuned to control the print rate (can be changed if required)
-            print_cycle = max(3, int(bench_args.num_clients / 4))
-
-            if finished_convs % print_cycle == 0:
-                runtime_sec = nanosec_to_sec(time.perf_counter_ns() - start_time)
-                logger.info(
-                    f"{Color.CYAN}Finished {finished_convs} out of {total_convs} conversations ({percent:.0%}), "  # noqa: E501
-                    f"{num_clients_finished} out of {bench_args.num_clients} clients finished, collected {len(client_metrics)} measurements, runtime {runtime_sec:.3f} sec{Color.RESET}"  # noqa: E501
-                )
-
-                rps: str | float = round(len(client_metrics) / runtime_sec, 3)
-                if len(client_metrics) < (5 * bench_args.num_clients):
-                    # Do not estimate the RPS if the number of samples is very low
-                    # (threshold can be tuned if needed)
-                    rps = "N/A"
-
-                runtime_left_sec: str | float = round(
-                    (runtime_sec / finished_convs) * (total_convs - finished_convs), 3
-                )
-                if percent < 0.05:
-                    # If less than 5% of the conversations were not finished,
-                    # the estimation will probably be very inaccurate
-                    # (threshold can be tuned if needed).
-                    runtime_left_sec = "N/A"
-
-                logger.info(
-                    f"{Color.CYAN}Estimated req/sec {rps}, estimated runtime left {runtime_left_sec} sec{Color.RESET}"  # noqa: E501
-                )
-                debug_stats.print()
-
-    logger.info(
-        f"{Color.CYAN}All {bench_args.num_clients} clients finished{Color.RESET}"
+    # aiohttp's default connector allows 100 sockets; a larger in-flight cap
+    # would silently queue inside the client and show up as inflated TTFT.
+    # With the cap unlimited the ceiling is one request per conversation, so
+    # size the pool to that instead of leaving it at 100 -- otherwise "no cap"
+    # would quietly become a 100-request cap enforced by the socket pool.
+    conn_limit = (
+        max(100, inflight_cap * 2) if inflight_cap else max(100, 2 * len(conv_ids))
     )
-
-    # At this point all the clients finished,
-    # collect results (TTFT, TPOT, etc.) from all the clients.
-    # This needs to happen before calling join on the clients
-    # (result_queue should be emptied).
-    while not result_queue.empty():
-        client_metrics.append(result_queue.get())
-
-    logger.info(f"Collected {len(client_metrics)} samples from all the clients")
-
-    # Wait for all clients to finish
-    for client in clients:
-        logger.info(
-            f"{Color.CYAN}Waiting for client {client.name} "
-            f"(is alive: {client.is_alive()}){Color.RESET}"
-        )
-
-        client.join(timeout=req_args.timeout_sec + 1)
-
-        if client.is_alive():
-            logger.warning(
-                f"{Color.YELLOW}Client {client.name} will be terminated{Color.RESET}"
+    connector = aiohttp.TCPConnector(limit=conn_limit)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        progress_task = asyncio.create_task(progress())
+        tasks = [
+            asyncio.create_task(
+                conversation_coro(
+                    conv_id,
+                    ordinal,
+                    input_conv[conv_id],
+                    client_args,
+                    req_args,
+                    tokenizer,
+                    session,
+                    sem,
+                    session_sem,
+                    budget,
+                    schedule,
+                    client_metrics,
+                    debug_stats,
+                )
             )
-            client.terminate()
+            for ordinal, conv_id in enumerate(conv_ids)
+        ]
+        try:
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                if result is not None:
+                    conv_id, messages = result
+                    output_conv[conv_id] = messages
+                done += 1
+        finally:
+            progress_task.cancel()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-        exitcode = client.exitcode
-        if exitcode != 0:
-            logger.error(
-                f"{Color.RED}Client {client.name} exited "
-                f"with exit code {exitcode}{Color.RESET}"
-            )
-
-    logger.info(
-        f"All {bench_args.num_clients} clients exited (successfully "
-        f"finished {len(output_conv)} out of {total_convs} conversations)"
+    runtime_sec = nanosec_to_sec(time.perf_counter_ns() - start_time)
+    dropped = (
+        f", {budget.dropped_waiting} sessions dropped unsent (-n reached)"
+        if budget.dropped_waiting
+        else ""
     )
-
-    # Queues should be closed, required to avoid hang at interpreter shutdown
-    unfinished_tasks = 0
-    while not task_queue.empty():
-        task_queue.get()
-        unfinished_tasks += 1
-
-    if unfinished_tasks > 0:
-        # Can happen if not all tasks (conversations) have finished.
-        # May happen if --max-num-requests was used,
-        # or if an error occurred in one of the clients.
-        logger.debug(f"Discarding {unfinished_tasks} unfinished tasks")
-
-    task_queue.close()
-    task_queue.join_thread()
-
-    result_queue.close()
-    result_queue.join_thread()
-
-    conv_queue.close()
-    conv_queue.join_thread()
-
+    logger.info(
+        f"{Color.GREEN}All conversations finished: {budget.used} requests, "
+        f"{len(client_metrics)} measurements, runtime {runtime_sec:.3f} sec, "
+        f"requests per second: {len(client_metrics) / runtime_sec:.3f}"
+        f"{dropped}{Color.RESET}"
+    )
     return output_conv, client_metrics
 
 
@@ -1209,7 +1349,7 @@ def process_statistics(
         print(TEXT_SEPARATOR)
 
     if excel_output:
-        prefix = f"statistics_{test_params['num_clients']}_clients"
+        prefix = f"statistics_{test_params['max_inflight_req']}_inflight_req"
         filename = get_filename_with_timestamp(prefix, "xlsx")
 
         with pd.ExcelWriter(filename, engine="xlsxwriter") as writer:
@@ -1273,6 +1413,79 @@ async def get_server_info(url: str) -> None:
                 logger.info(f"{Color.RED}Failed to get models{Color.RESET}")
 
 
+def dump_schedule(
+    conv_ids: list[str],
+    conversations: ConversationsMap,
+    arrival_rate: float,
+    tool_time_spec: str,
+    seed: int,
+    path: str,
+) -> None:
+    """Record what the arrival model drew, before the replay uses it.
+
+    Only the first turn of each conversation has a knowable time: every later
+    turn fires at `completion(previous) + Z`, and completion is the server's to
+    decide. So this holds the arrival instants and the drawn tool times — the
+    inputs to the run — not a full timetable, which cannot exist here.
+    """
+    schedule = build_schedule(
+        conv_ids, conversations, arrival_rate, tool_time_spec, seed
+    )
+    rows = []
+    for ordinal, conv_id in enumerate(conv_ids):
+        messages = conversations.get(conv_id) or []
+        tool_times = schedule["tool_times"].get(conv_id) or []
+        # Only user turns are sent; the assistant answers come back from the
+        # server, so they are not requests.
+        user_turns = sum(1 for m in messages if m.get("role") == "user")
+        rows.append(
+            {
+                "ordinal": ordinal,
+                "conversation_id": conv_id,
+                "arrival_sec": round(schedule["arrivals"][conv_id], 6),
+                "num_messages": len(messages),
+                "num_user_turns": user_turns,
+                "tool_seconds": [round(z, 6) for z in tool_times[:user_turns]],
+                "tool_seconds_total": round(sum(tool_times[:user_turns]), 6),
+            }
+        )
+    rows.sort(key=lambda r: r["arrival_sec"])
+    with open(path, "w") as fh:
+        fh.write(json.dumps({"params": schedule["params"]}) + "\n")
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+
+    arrivals = [r["arrival_sec"] for r in rows]
+    total_turns = sum(r["num_user_turns"] for r in rows)
+    all_z = [z for r in rows for z in r["tool_seconds"]]
+    gaps = [b - a for a, b in zip(arrivals, arrivals[1:])]
+    logger.info(f"{Color.GREEN}-> {path}{Color.RESET}")
+    logger.info(
+        f"  {len(rows):,} conversations, {total_turns:,} user turns "
+        f"(= requests), params {json.dumps(schedule['params'])}"
+    )
+    logger.info(
+        f"  arrivals span {arrivals[-1] - arrivals[0]:,.1f}s"
+        f"  ({(arrivals[-1] - arrivals[0]) / 60:,.1f}min)"
+        if len(arrivals) > 1
+        else "  single conversation"
+    )
+    if gaps:
+        ordered = sorted(gaps)
+        logger.info(
+            f"  arrival gap p50={ordered[len(ordered) // 2]:.4f}s "
+            f"p90={ordered[int(0.9 * (len(ordered) - 1))]:.4f}s"
+        )
+    if all_z:
+        ordered = sorted(all_z)
+        logger.info(
+            f"  tool time p50={ordered[len(ordered) // 2]:.4f}s "
+            f"p90={ordered[int(0.9 * (len(ordered) - 1))]:.4f}s "
+            f"p99={ordered[int(0.99 * (len(ordered) - 1))]:.4f}s "
+            f"mean={sum(all_z) / len(all_z):.4f}s"
+        )
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(
         prog="Benchmark serving with multi-turn conversations",
@@ -1324,25 +1537,35 @@ async def main() -> None:
     )
 
     parser.add_argument(
-        "-p",
-        "--num-clients",
+        "--max-inflight-req",
         type=int,
         default=1,
-        help="Number of clients that will send requests in parallel",
+        help="Cap on requests in flight at once (0 = unlimited). Not a client "
+        "count: every conversation gets its own coroutine and this bounds how "
+        "many may be sending. Use it to keep a high --session-arrival-rate from "
+        "swamping the server; set it to 0 (or leave it high) to let the arrival "
+        "rate set the pace.",
     )
     parser.add_argument(
-        "-k",
-        "--max-active-conversations",
+        "--max-inflight-session",
         type=int,
-        default=None,
-        help="Max number of active conversations at a time (for all clients)",
+        default=0,
+        help="Cap on sessions active at once (0 = unlimited). A session holds a "
+        "slot from its first turn until its last, so this bounds how many "
+        "distinct conversations the server's KV cache must hold. Without it a "
+        "high --session-arrival-rate admits far more sessions than "
+        "--max-inflight-req can serve, and most sit having sent only their "
+        "first turn: requests spread thin over many cold prefixes instead of "
+        "revisiting a few warm ones. Setting it close to --max-inflight-req "
+        "makes served requests and live sessions match, so later turns (which "
+        "have KV to load) dominate.",
     )
     parser.add_argument(
         "-n",
         "--max-num-requests",
         type=int,
         default=None,
-        help="Max number of requests to send (total for all clients)",
+        help="Max number of requests to send across the whole run",
     )
 
     parser.add_argument(
@@ -1362,14 +1585,6 @@ async def main() -> None:
         "(a positive number, e.g: 2, 4, 6, etc.), disabled by default",
     )
     parser.add_argument(
-        "--no-early-stop",
-        default=False,
-        action="store_true",
-        help="By default, the benchmark will stop if at least one client exits."
-        " Use this flag to disable this behavior",
-    )
-
-    parser.add_argument(
         "--limit-max-tokens",
         type=int,
         default=NUM_TOKENS_FROM_DATASET,
@@ -1387,13 +1602,35 @@ async def main() -> None:
         "Overrides output token count from the input dataset. "
         "Use a negative value to disable this limit.",
     )
+    parser.add_argument(
+        "--forced-output",
+        action="store_true",
+        help="Force each response to be the trace's own assistant answer, "
+        "token for token, so repeated runs are comparable. Requires the server "
+        "to expose ForcedOutputTokensLogitsProcessor.",
+    )
 
     parser.add_argument(
-        "--request-rate",
+        "--session-arrival-rate",
         type=float,
         default=0,
-        help="Expected request rate (Poisson process) per client in requests/sec."
-        "Set to 0 for no delay between requests.",
+        help="New conversations per second, drawn as a Poisson process over "
+        "their start times. This is an open-loop arrival rate: a conversation "
+        "fires at its scheduled instant regardless of how the server is doing, "
+        "so raising it past what the server can absorb is what builds a queue "
+        "and oversubscribes the KV cache. 0 = every conversation is ready at "
+        "once and --max-inflight-req alone paces the run.",
+    )
+    parser.add_argument(
+        "--tool-time",
+        type=str,
+        default="0",
+        help="How long the tool call between two turns takes, i.e. Z in "
+        "arrival(turn t+1) = completion(turn t) + Z. Accepts `0` (no wait, "
+        "maximum pressure), a constant such as `1s` / `250ms`, or "
+        "`lognormal[:mu,sigma]` (default mu=0 sigma=1: median 1s, heavy tail "
+        "to ~10s) which is the shape real agent tool latencies take. Drawn "
+        "once per turn before the replay starts, so a seed reproduces it.",
     )
     parser.add_argument(
         "--max-retries",
@@ -1404,17 +1641,6 @@ async def main() -> None:
         "Set to higher values to retry failed requests and maintain "
         "fair workload distribution. "
         "Can also be set via MULTITURN_BENCH_MAX_RETRIES environment variable.",
-    )
-    parser.add_argument(
-        "--conversation-sampling",
-        type=ConversationSampling,
-        choices=list(ConversationSampling),
-        default=ConversationSampling.ROUND_ROBIN,
-        help=(
-            "Strategy for selecting which conversation to use for the next request. "
-            "Options: 'round_robin' (cycle through conversations), "
-            "'random' (pick randomly)."
-        ),
     )
     parser.add_argument(
         "--verify-output",
@@ -1449,6 +1675,16 @@ async def main() -> None:
         type=str,
         default=None,
         help="Export per-request stats (ttft_ms, tpot_ms, etc.) to a JSON file",
+    )
+    parser.add_argument(
+        "--schedule-out",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Where to write the arrival schedule (default: "
+        f"{DEFAULT_SCHEDULE_NAME} next to the input trace). Records each "
+        "conversation's arrival instant and drawn tool times, with the "
+        "parameters that produced them on the first line.",
     )
     parser.add_argument(
         "-v",
@@ -1486,7 +1722,10 @@ async def main() -> None:
     logger.info(f"{Color.GREEN}Input parameters:{Color.RESET}")
     logger.info(f"url={args.url}")
     logger.info(f"model={args.model}")
-    logger.info(f"num_clients={args.num_clients}")
+    logger.info(f"max_inflight_req={args.max_inflight_req}")
+    logger.info(
+        f"max_inflight_session={args.max_inflight_session or 'unlimited'}"
+    )
 
     if args.verify_output:
         logger.info(f"{Color.PURPLE}Verify is enabled{Color.RESET}")
@@ -1537,6 +1776,27 @@ async def main() -> None:
         # The conversations are stored as a list of dicts
         logger.info(f"Found {len(input_data)} items in the input file")
 
+        # Map each conv_id to the line number of each of its user messages
+        # (1-based, matching editor line numbers). The file is pretty-printed
+        # with one `"id": "..."` and one `"role": "..."` per line, so a linear
+        # scan is enough: every `"role": "user"` seen after a given `"id"`
+        # belongs to that conversation, in order.
+        # Used by send_turn to embed the prompt's line into the request_id.
+        import re
+
+        id_line_re = re.compile(r'"id"\s*:\s*"([^"\\]*)"')
+        user_role_re = re.compile(r'"role"\s*:\s*"user"')
+        with open(args.input_file) as _f:
+            _current: list[int] | None = None
+            for _lineno, _line in enumerate(_f, start=1):
+                _m = id_line_re.search(_line)
+                if _m:
+                    _current = []
+                    _conv_id_to_user_lines[_m.group(1)] = _current
+                    continue
+                if _current is not None and user_role_re.search(_line):
+                    _current.append(_lineno)
+
         # Convert the list to a ConversationsMap
         conversations = conversations_list_to_dict(input_data)
 
@@ -1574,24 +1834,41 @@ async def main() -> None:
     client_args, req_args = get_client_config(args, conversations)
 
     bench_args = BenchmarkArgs(
-        url=args.url, num_clients=args.num_clients, early_stop=not args.no_early_stop
+        url=args.url,
+        max_inflight_req=args.max_inflight_req,
+        max_inflight_session=args.max_inflight_session,
+        session_arrival_rate=args.session_arrival_rate,
+        tool_time=args.tool_time,
+    )
+
+    dump_schedule(
+        list(conversations),
+        conversations,
+        args.session_arrival_rate,
+        args.tool_time,
+        args.seed,
+        args.schedule_out
+        or os.path.join(
+            os.path.dirname(os.path.abspath(args.input_file)),
+            DEFAULT_SCHEDULE_NAME,
+        ),
     )
 
     warmup_runtime_sec: float | None = None
 
     # Warm-up step
     if args.warmup_step:
-        # Only send a single user prompt from every conversation.
-        # max_active_conversations must be 1,
-        # otherwise the clients may exit after sending a single request
-        # (because the task queue is empty).
+        # Only the first user prompt of every conversation.
         warmup_client_args = client_args._replace(
-            skip_first_turn=False, max_turns=1, max_active_conversations=1
+            skip_first_turn=False, max_turns=1
         )
 
-        # Early stop should be disabled,
-        # all clients should finish their work before exiting
-        warmup_bench_args = bench_args._replace(early_stop=False)
+        # Warmup exists to populate the cache, not to model a workload: fire
+        # every conversation at once (no arrival process) and skip the tool
+        # time, since there is no second turn to wait for.
+        warmup_bench_args = bench_args._replace(
+            session_arrival_rate=0.0, tool_time="0"
+        )
 
         logger.info("%sWarmup start%s", Color.PURPLE, Color.RESET)
         warmup_start_ns = time.perf_counter_ns()
@@ -1647,9 +1924,11 @@ async def main() -> None:
     # Benchmark parameters
     params = {
         "model": args.model,
-        "num_clients": args.num_clients,
+        "max_inflight_req": args.max_inflight_req,
+        "max_inflight_session": args.max_inflight_session,
         "num_conversations": len(conversations),
-        "active_conversations": args.max_active_conversations,
+        "session_arrival_rate": args.session_arrival_rate,
+        "tool_time": args.tool_time,
         "seed": args.seed,
     }
 

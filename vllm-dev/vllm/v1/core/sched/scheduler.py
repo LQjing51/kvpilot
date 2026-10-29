@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.v1.core import kvpilot_load_stall
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -241,6 +242,14 @@ class Scheduler(SchedulerInterface):
             scheduler_block_size=self.block_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
+        )
+        # Observability only; None unless $GET_HBM_POOL_DISTRIBUTION is set.
+        self.hbm_pool_sampler = self.kv_cache_manager.block_pool.hbm_pool_sampler
+        # Per-prefill load-stall accounting; None unless $KVPILOT_LOAD_STALL is
+        # set. Lives on the scheduler because only it knows each request's
+        # token provenance and its scheduled-to-done window.
+        self.kvpilot_stall_logger = (
+            kvpilot_load_stall.StallLogger() if kvpilot_load_stall.enabled() else None
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -661,6 +670,32 @@ class Scheduler(SchedulerInterface):
                             num_local_cached_tokens=num_new_local_computed_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
+                        # Eviction policy needs this at block-free time, which
+                        # on the disaggregated path runs after prefill_stats has
+                        # been consumed. Copy it out under the same guard so it
+                        # likewise describes only the first prefill.
+                        request.kvpilot_kv_hit_rate = (
+                            min(
+                                request.prefill_stats.num_cached_tokens,
+                                request.num_prompt_tokens,
+                            )
+                            / max(request.num_prompt_tokens, 1)
+                        )
+
+                    if self.kvpilot_stall_logger is not None:
+                        # The token provenance of this prefill, captured under
+                        # the same first-prefill guard. Local hits are already
+                        # in HBM and cost no load; only the connector's tokens
+                        # come from DRAM and can therefore stall the forward.
+                        request.kvpilot_hit_tokens = num_new_local_computed_tokens
+                        request.kvpilot_dram_tokens = num_external_computed_tokens
+                        request.kvpilot_new_tokens = (
+                            request.num_prompt_tokens - num_computed_tokens
+                        )
+                        # Wall-clock start of the end-to-end window: scheduled
+                        # until computation done. Same monotonic clock the
+                        # stall is measured on, so the ratio is meaningful.
+                        request.kvpilot_scheduled_ns = time.monotonic_ns()
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
@@ -964,6 +999,12 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        # Observability only, and no-op unless $GET_HBM_POOL_DISTRIBUTION is
+        # set. Taken here because the pool is in a settled state between steps,
+        # unlike inside free(), which fires in bursts as requests finish.
+        if self.hbm_pool_sampler is not None:
+            self.hbm_pool_sampler.maybe_sample()
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1390,6 +1431,14 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        kvpilot_stall_shares: dict[str, int] = {}
+        kvpilot_step_waits = (
+            kv_connector_output.kvpilot_num_waits if kv_connector_output else 0
+        )
+        if self.kvpilot_stall_logger is not None:
+            kvpilot_stall_shares = self._kvpilot_attribute_stall(
+                num_scheduled_tokens, kv_connector_output
+            )
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
@@ -1407,6 +1456,14 @@ class Scheduler(SchedulerInterface):
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
+
+            if self.kvpilot_stall_logger is not None:
+                self._kvpilot_record_step(
+                    request,
+                    kvpilot_stall_shares.get(req_id, 0),
+                    kvpilot_step_waits,
+                )
+
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
@@ -1939,6 +1996,80 @@ class Scheduler(SchedulerInterface):
             len(self.waiting) + len(self.skipped_waiting) + len(self.running)
         )
         return len(self.requests) > num_in_queues
+
+    def kvpilot_apply_label(self, request_id: str, dram_safe: bool) -> int:
+        """Apply a decode-side dram-safe verdict to a finished request's blocks."""
+        return self.kv_cache_manager.kvpilot_apply_label(request_id, dram_safe)
+
+    def _kvpilot_attribute_stall(
+        self,
+        num_scheduled_tokens: dict[str, int],
+        kv_connector_output: KVConnectorOutput | None,
+    ) -> dict[str, int]:
+        """Divide this step's measured stall among the requests that loaded.
+
+        The worker reports one number per forward because a forward is shared.
+        Weighting by DRAM tokens is what makes the split defensible: a request
+        with nothing to load did not cause the wait and gets none of it, while a
+        request that pulled twice as much KV is charged twice as much.
+        """
+        if kv_connector_output is None or not kv_connector_output.kvpilot_stall_ns:
+            return {}
+        weights = {}
+        for req_id in num_scheduled_tokens:
+            request = self.requests.get(req_id)
+            # Charge only requests still inside a tracked prefill. Both guards
+            # matter: a decode step in the same batch loads nothing, and a
+            # request whose record was already emitted would absorb a share and
+            # then drop it, quietly diluting everyone else's.
+            if (
+                request is not None
+                and request.kvpilot_scheduled_ns
+                and request.kvpilot_dram_tokens > 0
+            ):
+                weights[req_id] = request.kvpilot_dram_tokens
+        return kvpilot_load_stall.attribute(
+            kv_connector_output.kvpilot_stall_ns, weights
+        )
+
+    def _kvpilot_record_step(
+        self, request: Request, stall_ns: int, num_waits: int
+    ) -> None:
+        """Fold one step into a request's prefill totals, emitting when done.
+
+        Chunked prefill means several forwards per prefill, so both the stall
+        and the step count accumulate; the record is written on the step that
+        finishes the prompt.
+        """
+        if not request.kvpilot_scheduled_ns:
+            # Not a tracked first prefill (decode step, or a re-prefill after
+            # preemption, whose record was already emitted).
+            return
+        request.kvpilot_stall_ns += stall_ns
+        request.kvpilot_num_steps += 1
+        if stall_ns:
+            # The forward's blocking calls, counted for any request charged for
+            # them. Not divided: each wait blocked this request's computation
+            # too, so a share of one would describe nothing.
+            request.kvpilot_num_waits += num_waits
+        if request.num_computed_tokens < request.num_prompt_tokens:
+            # Still chunking through the prompt.
+            return
+        assert self.kvpilot_stall_logger is not None
+        self.kvpilot_stall_logger.log(
+            request_id=request.request_id,
+            num_prompt_tokens=request.num_prompt_tokens,
+            num_new_tokens=request.kvpilot_new_tokens,
+            num_hit_tokens=request.kvpilot_hit_tokens,
+            num_dram_tokens=request.kvpilot_dram_tokens,
+            e2e_ns=time.monotonic_ns() - request.kvpilot_scheduled_ns,
+            stall_ns=request.kvpilot_stall_ns,
+            num_waits=request.kvpilot_num_waits,
+            num_steps=request.kvpilot_num_steps,
+        )
+        # Emit once. A later preemption re-prefills the same request, and that
+        # is a different event with its own load behaviour, not more of this one.
+        request.kvpilot_scheduled_ns = 0
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

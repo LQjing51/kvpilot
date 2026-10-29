@@ -925,6 +925,9 @@ class AsyncLLM(EngineClient):
             reset_running_requests, reset_connector
         )
 
+    async def kvpilot_apply_label(self, request_id: str, dram_safe: bool) -> int:
+        return await self.engine_core.kvpilot_apply_label_async(request_id, dram_safe)
+
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 

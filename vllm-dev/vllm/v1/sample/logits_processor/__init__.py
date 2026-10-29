@@ -341,6 +341,15 @@ class AdapterLogitsProcessor(LogitsProcessor):
         return logits
 
 
+# Imported late (after AdapterLogitsProcessor is defined above) to avoid a
+# circular import: forced_tokens.py needs AdapterLogitsProcessor.
+from vllm.v1.sample.logits_processor.forced_tokens import (  # noqa: E402
+    ForcedOutputTokensLogitsProcessor,
+)
+
+BUILTIN_LOGITS_PROCESSORS.append(ForcedOutputTokensLogitsProcessor)
+
+
 __all__ = [
     "LogitsProcessor",
     "LogitBiasLogitsProcessor",
@@ -354,4 +363,5 @@ __all__ = [
     "STR_POOLING_REJECTS_LOGITSPROCS",
     "LOGITSPROCS_GROUP",
     "AdapterLogitsProcessor",
+    "ForcedOutputTokensLogitsProcessor",
 ]

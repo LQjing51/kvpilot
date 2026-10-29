@@ -228,7 +228,7 @@ class SingleTypeKVCacheManager(ABC):
 
         # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:
-            self.block_pool.touch(new_computed_blocks)
+            self.block_pool.touch(new_computed_blocks, request_id=request_id)
         else:
             assert not any(new_computed_blocks), (
                 "Computed blocks should be empty when prefix caching is disabled"
@@ -246,7 +246,8 @@ class SingleTypeKVCacheManager(ABC):
         if num_external_computed_tokens > 0:
             # Allocate new blocks for external computed tokens.
             allocated_blocks = self.block_pool.get_new_blocks(
-                cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+                cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks),
+                request_id=request_id,
             )
             req_blocks.extend(allocated_blocks)
             if type(self.kv_cache_spec) in (
@@ -279,7 +280,9 @@ class SingleTypeKVCacheManager(ABC):
         if num_new_blocks <= 0:
             return []
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            new_blocks = self.block_pool.get_new_blocks(
+                num_new_blocks, request_id=request_id
+            )
             req_blocks.extend(new_blocks)
             if type(self.kv_cache_spec) in (
                 FullAttentionSpec,
@@ -360,12 +363,14 @@ class SingleTypeKVCacheManager(ABC):
         """
         return None
 
-    def free(self, request_id: str) -> None:
+    def free(self, request_id: str, num_tokens: int = 0,
+             kv_hit_rate: float = 0.0) -> None:
         """
         Free the blocks for the request.
 
         Args:
             request_id: The request ID.
+            num_tokens: Total token count of the request (prompt + output).
         """
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
@@ -374,7 +379,10 @@ class SingleTypeKVCacheManager(ABC):
         # freed first.
         ordered_blocks = reversed(req_blocks)
 
-        self.block_pool.free_blocks(ordered_blocks)
+        self.block_pool.free_blocks(ordered_blocks,
+                                    kvpilot_req_num_tokens=num_tokens,
+                                    kvpilot_req_kv_hit_rate=kv_hit_rate,
+                                    request_id=request_id)
         self.num_cached_block.pop(request_id, None)
 
     @abstractmethod
@@ -497,8 +505,10 @@ class SingleTypeKVCacheManager(ABC):
         # `prepend=True` makes uncached scratch blocks the next allocation
         # candidates, while cached blocks stay behind them as best-effort
         # prefix-cache entries.
-        self.block_pool.free_blocks(removed_cached_blocks)
-        self.block_pool.free_blocks(removed_uncached_blocks, prepend=True)
+        self.block_pool.free_blocks(removed_cached_blocks, request_id=request_id)
+        self.block_pool.free_blocks(
+            removed_uncached_blocks, prepend=True, request_id=request_id
+        )
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
@@ -748,7 +758,8 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
 
         return mask
 
-    def free(self, request_id: str) -> None:
+    def free(self, request_id: str, num_tokens: int = 0,
+             kv_hit_rate: float = 0.0) -> None:
         # similar to remove_skipped_blocks(), prepend the uncached blocks
         # and append the cached blocks to the free queue
         req_blocks = self.req_to_blocks.pop(request_id, [])
@@ -760,8 +771,19 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                     uncached_blocks.append(block)
                 else:
                     cached_blocks.append(block)
-            self.block_pool.free_blocks(cached_blocks)
-            self.block_pool.free_blocks(uncached_blocks, prepend=True)
+            self.block_pool.free_blocks(
+                cached_blocks,
+                kvpilot_req_num_tokens=num_tokens,
+                kvpilot_req_kv_hit_rate=kv_hit_rate,
+                request_id=request_id,
+            )
+            self.block_pool.free_blocks(
+                uncached_blocks,
+                prepend=True,
+                kvpilot_req_num_tokens=num_tokens,
+                kvpilot_req_kv_hit_rate=kv_hit_rate,
+                request_id=request_id,
+            )
         self.num_cached_block.pop(request_id, None)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
@@ -1042,7 +1064,9 @@ class MambaManager(SingleTypeKVCacheManager):
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
+                    self.block_pool.free_blocks(
+                        [blocks[last_state_block_idx]], request_id=request_id
+                    )
                     blocks[last_state_block_idx] = self._null_block
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -1189,16 +1213,19 @@ class MambaManager(SingleTypeKVCacheManager):
                     assert num_new_blocks <= 1
                 else:
                     assert num_new_blocks <= self.num_speculative_blocks + 1
-                new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                new_blocks = self.block_pool.get_new_blocks(
+                    num_new_blocks, request_id=request_id
+                )
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 return req_blocks[prev_block_len:]
 
-    def free(self, request_id: str) -> None:
+    def free(self, request_id: str, num_tokens: int = 0,
+             kv_hit_rate: float = 0.0) -> None:
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
-        super().free(request_id)
+        super().free(request_id, num_tokens, kv_hit_rate)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """

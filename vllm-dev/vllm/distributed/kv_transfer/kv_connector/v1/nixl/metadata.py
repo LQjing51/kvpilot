@@ -208,4 +208,17 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             host=kv_transfer_params["remote_host"],
             port=kv_transfer_params["remote_port"],
         )
+        logger.info(
+            "NIXL recv metadata queued: request_id=%s remote_engine_id=%s "
+            "remote_request_id=%s remote=%s:%s remote_tp_size=%s "
+            "local_block_counts=%s remote_block_counts=%s",
+            request_id,
+            req.remote.engine_id,
+            req.remote.request_id,
+            req.remote.host,
+            req.remote.port,
+            req.tp_size,
+            [len(group) for group in local_block_ids],
+            [len(group) for group in req.remote.block_ids],
+        )
         self.reqs_to_recv[request_id] = req

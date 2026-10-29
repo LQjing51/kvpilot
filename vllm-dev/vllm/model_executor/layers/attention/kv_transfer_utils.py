@@ -10,6 +10,7 @@ from vllm.distributed.kv_transfer import (
     is_v1_kv_transfer_group,
 )
 from vllm.utils.torch_utils import _resolve_layer_name
+from vllm.v1.core import kvpilot_load_stall
 
 
 def maybe_transfer_kv_layer(func: Callable) -> Callable:
@@ -47,8 +48,15 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
         if attn_metadata is None or not connector.has_connector_metadata():
             return func(*args, **kwargs)
 
-        # Wait for KV layer on entry
-        connector.wait_for_layer_load(layer_name)
+        # Wait for KV layer on entry. Under layerwise loading this blocks until
+        # this layer's KV is resident, so its duration is prefill computation
+        # stalled on loading -- the quantity KVPilot exists to drive to zero.
+        timer = kvpilot_load_stall.time_wait()
+        if timer is None:
+            connector.wait_for_layer_load(layer_name)
+        else:
+            with timer:
+                connector.wait_for_layer_load(layer_name)
 
         # Execute the function
         result = func(*args, **kwargs)

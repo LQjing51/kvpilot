@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from pkgutil import extend_path  # isort:skip
+__path__ = extend_path(__path__, __name__)
+
 import importlib.machinery
 import os
 import sys

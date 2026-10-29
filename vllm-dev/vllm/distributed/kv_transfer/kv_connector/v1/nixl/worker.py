@@ -383,6 +383,9 @@ class NixlConnectorWorker:
         # [req_id -> list[handle]]
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
+        # Per-request NIXL transfer telemetry accumulator:
+        # [xfer_ms, post_ms, total_bytes, desc_count, handle_count]
+        self._recving_xfer_stats = defaultdict(lambda: [0.0, 0.0, 0, 0, 0])
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
         # Set of requests that have been part of a batch, regardless of status.
@@ -500,6 +503,20 @@ class NixlConnectorWorker:
         p_remote_ranks = self.transfer_topo.handshake_target_ranks(remote_tp_size)
         remote_rank_to_agent_name = {}
         path = make_zmq_path("tcp", host, port)
+        logger.info(
+            "NIXL handshake start: local_engine_id=%s local_tp_rank=%s "
+            "remote=%s:%s remote_tp_size=%s expected_remote_engine_id=%s "
+            "target_remote_ranks=%s use_host_buffer=%s device_id=%s",
+            self.engine_id,
+            self.tp_rank,
+            host,
+            port,
+            remote_tp_size,
+            expected_engine_id,
+            p_remote_ranks,
+            self.use_host_buffer,
+            self.device_id,
+        )
 
         with zmq_ctx(zmq.REQ, path) as sock:
             for remote_rank in p_remote_ranks:
@@ -516,6 +533,13 @@ class NixlConnectorWorker:
                 sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds
                 sock.send(msg)
                 handshake_bytes = sock.recv()
+                logger.info(
+                    "NIXL handshake received payload: path=%s remote_tp_rank=%s "
+                    "payload_bytes=%s",
+                    path,
+                    remote_rank,
+                    len(handshake_bytes),
+                )
 
                 # Decode handshake payload to get compatibility hash
                 handshake_decoder = msgspec.msgpack.Decoder(NixlHandshakePayload)
@@ -531,6 +555,14 @@ class NixlConnectorWorker:
                 logger.debug(
                     "NIXL handshake: get metadata took: %s",
                     got_metadata_time - start_time,
+                )
+                logger.info(
+                    "NIXL handshake payload decoded: remote_tp_rank=%s "
+                    "compat_hash=%s local_hash=%s agent_metadata_bytes=%s",
+                    remote_rank,
+                    handshake_payload.compatibility_hash,
+                    self.compat_hash,
+                    len(handshake_payload.agent_metadata_bytes),
                 )
 
                 # Check compatibility hash BEFORE decoding agent metadata
@@ -568,6 +600,25 @@ class NixlConnectorWorker:
                     raise RuntimeError(
                         f"Failed to decode NixlAgentMetadata. Error: {e}"
                     ) from e
+
+                logger.info(
+                    "NIXL agent metadata decoded: expected_engine_id=%s "
+                    "received_engine_id=%s remote_tp_rank=%s remote_tp_size=%s "
+                    "device_id=%s num_blocks=%s block_size=%s layout=%s "
+                    "block_lens_count=%s base_addr_count=%s "
+                    "agent_metadata_bytes=%s",
+                    expected_engine_id,
+                    metadata.engine_id,
+                    remote_rank,
+                    remote_tp_size,
+                    metadata.device_id,
+                    metadata.num_blocks,
+                    metadata.block_size,
+                    metadata.kv_cache_layout,
+                    len(metadata.block_lens),
+                    len(metadata.kv_caches_base_addr),
+                    len(metadata.agent_metadata),
+                )
 
                 # Ensure engine id matches.
                 if metadata.engine_id != expected_engine_id:
@@ -1005,6 +1056,25 @@ class NixlConnectorWorker:
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
+        logger.info(
+            "NIXL local agent metadata prepared: engine_id=%s tp_rank=%s "
+            "device_id=%s num_blocks=%s logical_num_blocks=%s block_size=%s "
+            "layout=%s num_regions=%s num_descs=%s base_addr_count=%s "
+            "block_lens_count=%s agent_metadata_bytes=%s compat_hash=%s",
+            self.engine_id,
+            self.tp_rank,
+            self.device_id,
+            self.num_blocks,
+            self._logical_num_blocks,
+            self.block_size,
+            agent_metadata.kv_cache_layout,
+            self.num_regions,
+            self.num_descs,
+            len(agent_metadata.kv_caches_base_addr),
+            len(agent_metadata.block_lens),
+            len(agent_metadata.agent_metadata),
+            self.compat_hash,
+        )
         encoder = msgspec.msgpack.Encoder()
         self.xfer_handshake_metadata = NixlHandshakePayload(
             compatibility_hash=self.compat_hash,
@@ -1306,8 +1376,43 @@ class NixlConnectorWorker:
             group_spec_types=self._group_spec_types,
         )
 
+        logger.info(
+            "NIXL add_remote_agent native call: local_engine_id=%s "
+            "local_tp_rank=%s remote_engine_id=%s remote_tp_rank=%s "
+            "remote_tp_size=%s remote_num_blocks=%s remote_block_size=%s "
+            "remote_layout=%s remote_device_id=%s remote_agent_metadata_bytes=%s "
+            "remote_base_addr_count=%s remote_block_lens_count=%s "
+            "local_num_blocks=%s local_block_size=%s local_num_regions=%s "
+            "local_num_descs=%s",
+            self.engine_id,
+            self.tp_rank,
+            engine_id,
+            remote_tp_rank,
+            remote_tp_size,
+            nixl_agent_meta.num_blocks,
+            nixl_agent_meta.block_size,
+            nixl_agent_meta.kv_cache_layout,
+            nixl_agent_meta.device_id,
+            len(nixl_agent_meta.agent_metadata),
+            len(nixl_agent_meta.kv_caches_base_addr),
+            len(nixl_agent_meta.block_lens),
+            self.num_blocks,
+            self.block_size,
+            getattr(self, "num_regions", None),
+            getattr(self, "num_descs", None),
+        )
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
+        )
+        logger.info(
+            "NIXL add_remote_agent native call succeeded: local_engine_id=%s "
+            "local_tp_rank=%s remote_engine_id=%s remote_tp_rank=%s "
+            "remote_agent_name=%s",
+            self.engine_id,
+            self.tp_rank,
+            engine_id,
+            remote_tp_rank,
+            remote_agent_name,
         )
 
         # Create dst descs and xfer side handles. TP workers have same #blocks
@@ -1883,6 +1988,12 @@ class NixlConnectorWorker:
                         # Get telemetry from NIXL
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
                         self.xfer_stats.record_transfer(res)
+                        req_stats = self._recving_xfer_stats[req_id]
+                        req_stats[0] += res.xferDuration / 1e3
+                        req_stats[1] += res.postDuration / 1e3
+                        req_stats[2] += res.totalBytes
+                        req_stats[3] += res.descCount
+                        req_stats[4] += 1
                         self.nixl_wrapper.release_xfer_handle(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
@@ -1906,6 +2017,20 @@ class NixlConnectorWorker:
 
             if not in_progress:
                 # Only report request as completed when all transfers are done.
+                req_stats = self._recving_xfer_stats.pop(
+                    req_id, [0.0, 0.0, 0, 0, 0]
+                )
+                if req_stats[4]:
+                    logger.info(
+                        "NIXL p2d transfer done: request_id=%s xfer_ms=%.3f "
+                        "post_ms=%.3f bytes=%d descs=%d handles=%d",
+                        req_id,
+                        req_stats[0],
+                        req_stats[1],
+                        req_stats[2],
+                        req_stats[3],
+                        req_stats[4],
+                    )
                 done_req_ids.add(req_id)
                 del transfers[req_id]
             else:

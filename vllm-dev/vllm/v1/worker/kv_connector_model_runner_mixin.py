@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.core import kvpilot_load_stall
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (
     KVConnectorOutput,
@@ -92,7 +93,18 @@ class KVConnectorModelRunnerMixin:
         # These transfers are designed to be async and the requests
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
-        kv_connector.start_load_kv(get_forward_context())
+        #
+        # Timed alongside the per-layer waits: with layerwise loading this
+        # submits the fetches and then blocks on the first layer, so it is a
+        # genuine pre-forward stall and belongs in the same total. Reset first,
+        # so the accumulator covers exactly this forward.
+        kvpilot_load_stall.begin_step()
+        timer = kvpilot_load_stall.time_wait()
+        if timer is None:
+            kv_connector.start_load_kv(get_forward_context())
+        else:
+            with timer:
+                kv_connector.start_load_kv(get_forward_context())
         try:
             yield output
         finally:
@@ -107,6 +119,13 @@ class KVConnectorModelRunnerMixin:
             output.kv_connector_stats = kv_connector.get_kv_connector_stats()
             output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
             output.kv_connector_worker_meta = kv_connector.build_connector_worker_meta()
+
+            # Read after the forward has returned, so every per-layer wait is
+            # included. A forward is shared by the whole batch, so this is a
+            # step total; the scheduler splits it per request.
+            output.kvpilot_stall_ns, output.kvpilot_num_waits = (
+                kvpilot_load_stall.take_step()
+            )
 
             if not defer_finalize:
                 kv_connector.clear_connector_metadata()

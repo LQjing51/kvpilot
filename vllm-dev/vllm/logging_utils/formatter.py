@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+from datetime import datetime
 from pathlib import Path
 
 from vllm import envs
@@ -16,6 +17,16 @@ class NewLineFormatter(logging.Formatter):
         self.use_relpath = envs.VLLM_LOGGING_LEVEL == "DEBUG"
         if self.use_relpath:
             self.root_dir = Path(__file__).resolve().parent.parent.parent
+
+    def formatTime(self, record, datefmt=None):
+        # The default `logging.Formatter.formatTime` uses `time.strftime`,
+        # which does not understand `%f` (microseconds). Fall through to
+        # `datetime.strftime` when the active datefmt requests sub-second
+        # precision so that `%f` is rendered as 6-digit microseconds.
+        fmt = datefmt or self.datefmt
+        if fmt and "%f" in fmt:
+            return datetime.fromtimestamp(record.created).strftime(fmt)
+        return super().formatTime(record, datefmt)
 
     def format(self, record):
         def shrink_path(relpath: Path) -> str:

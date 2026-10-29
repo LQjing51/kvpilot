@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import json
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -10,7 +12,8 @@ from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, env_on
+from vllm.v1.core.kvpilot_online import OnlineDramSafe
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_kind,
@@ -162,6 +165,46 @@ class KVCacheManager:
             )
             for group in kv_cache_config.kv_cache_groups
         )
+        self.kvpilot_trace_metadata: dict[int, dict[str, object]] = {}
+        self.kvpilot_offline = env_on("KVPILOT_OFFLINE_DRAM_SAFE")
+        self.kvpilot_online = (
+            OnlineDramSafe(self.block_pool.free_block_queue)
+            if env_on("KVPILOT_ONLINE_DRAM_SAFE")
+            else None
+        )
+        if self.kvpilot_offline:
+            metadata_path = os.getenv("KVPILOT_TRACE_METADATA_PATH")
+            if not metadata_path:
+                raise RuntimeError(
+                    "KVPILOT_TRACE_METADATA_PATH is required when "
+                    "KVPILOT_OFFLINE_DRAM_SAFE is set"
+                )
+            with open(metadata_path) as f:
+                num_trace_requests = 0
+                for request_idx, line in enumerate(f):
+                    if not line.strip():
+                        continue
+                    num_trace_requests += 1
+                    record = json.loads(line)
+                    metadata = record.get("kvpilot")
+                    if isinstance(metadata, dict):
+                        self.kvpilot_trace_metadata[request_idx] = metadata
+            if len(self.kvpilot_trace_metadata) != num_trace_requests:
+                # Unlabelled requests silently fall back to keeping every block
+                # in HBM, which changes what the run measures. Fail loudly
+                # rather than report a degraded experiment as a valid one.
+                raise RuntimeError(
+                    "KVPilot metadata is incomplete: labelled "
+                    f"{len(self.kvpilot_trace_metadata)} of "
+                    f"{num_trace_requests} requests in {metadata_path}. "
+                    "Regenerate it with build_kvpilot_trace_metadata.py so "
+                    "every trace request carries a 'kvpilot' entry."
+                )
+            logger.info(
+                "Loaded KVPilot metadata for %d requests from %s",
+                len(self.kvpilot_trace_metadata),
+                metadata_path,
+            )
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
@@ -443,7 +486,55 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        self.coordinator.free(request.request_id)
+        # NOTE:
+        # Read from the request's own field rather than prefill_stats: the
+        # latter is consumed via `take_prefill_stats()` when the final output is
+        # emitted, which happens before this free on the async KV-transfer path
+        # (Scheduler._update_from_kv_xfer_finished) — i.e. always, in P/D
+        # disaggregation. The field is captured where prefill_stats is set, so
+        # it survives that hand-off.
+        kv_hit_rate = request.kvpilot_kv_hit_rate
+
+        if self.kvpilot_offline:
+            try:
+                request_idx = int(request.request_id.split("-", 1)[0])
+            except ValueError:
+                request_idx = -1
+            metadata = self.kvpilot_trace_metadata.get(request_idx, {})
+            next_safe = metadata.get("kvpilot_next_dram_safe_by_block")
+            has_block_metadata = isinstance(next_safe, list)
+            for blocks in self.coordinator.get_blocks(request.request_id):
+                for block_idx, block in enumerate(blocks):
+                    if block.block_hash is None:
+                        continue
+                    if has_block_metadata:
+                        if block_idx < len(next_safe):
+                            block.kvpilot_next_dram_safe = (
+                                next_safe[block_idx] is True
+                            )
+                        else:
+                            # The final trace hash is unstable across turns
+                            # and therefore has no future reuse.
+                            block.kvpilot_next_dram_safe = True
+                    else:
+                        # Missing labels are kept in HBM conservatively.
+                        block.kvpilot_next_dram_safe = False
+        # coordinator.free() drops the request's block list, so capture it
+        # first; track() runs after, when the blocks are queued.
+        online_blocks = (
+            self.coordinator.get_blocks(request.request_id)
+            if self.kvpilot_online is not None
+            else None
+        )
+        self.coordinator.free(request.request_id, request.num_tokens, kv_hit_rate)
+        if online_blocks is not None:
+            self.kvpilot_online.track(request.request_id, online_blocks)
+
+    def kvpilot_apply_label(self, request_id: str, dram_safe: bool) -> int:
+        """Apply a decode-side dram-safe verdict to `request_id`'s blocks."""
+        if self.kvpilot_online is None:
+            return 0
+        return self.kvpilot_online.apply(request_id, dram_safe)
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

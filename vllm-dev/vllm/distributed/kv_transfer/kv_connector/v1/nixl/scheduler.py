@@ -267,6 +267,16 @@ class NixlConnectorScheduler:
                 str(len(encoded_data[tp_rank])),
             )
 
+        logger.info(
+            "NIXL handshake metadata ready: engine_id=%s side_channel=%s:%s "
+            "tp_ranks=%s payload_bytes_by_rank=%s",
+            self.engine_id,
+            self.side_channel_host,
+            self.side_channel_port,
+            sorted(encoded_data),
+            {rank: len(payload) for rank, payload in encoded_data.items()},
+        )
+
         # Only start the listener when we have metadata to serve.
         if self._nixl_handshake_listener_t is None:
             ready_event = threading.Event()
@@ -299,7 +309,13 @@ class NixlConnectorScheduler:
 
         # Listen for new requests for metadata.
         path = make_zmq_path("tcp", host, port)
-        logger.debug("Starting listening on path: %s", path)
+        logger.info(
+            "NIXL handshake listener binding: path=%s tp_ranks=%s "
+            "payload_bytes_by_rank=%s",
+            path,
+            sorted(encoded_data),
+            {rank: len(payload) for rank, payload in encoded_data.items()},
+        )
         with zmq_ctx(zmq.ROUTER, path) as sock:
             sock.setsockopt(zmq.RCVTIMEO, 1000)
             ready_event.set()
@@ -318,7 +334,24 @@ class NixlConnectorScheduler:
                 )
                 if msg != GET_META_MSG:
                     logger.warning("Connection listener got unexpected message %s", msg)
-                sock.send_multipart((identity, b"", encoded_data[target_tp_rank]))
+                if target_tp_rank not in encoded_data:
+                    logger.error(
+                        "NIXL handshake listener missing target_tp_rank=%s "
+                        "available_ranks=%s path=%s",
+                        target_tp_rank,
+                        sorted(encoded_data),
+                        path,
+                    )
+                    raise KeyError(target_tp_rank)
+                payload = encoded_data[target_tp_rank]
+                logger.info(
+                    "NIXL handshake listener serving: path=%s target_tp_rank=%s "
+                    "payload_bytes=%s",
+                    path,
+                    target_tp_rank,
+                    len(payload),
+                )
+                sock.send_multipart((identity, b"", payload))
 
     def _mamba_prefill_token_count(self, num_prompt_tokens: int) -> int:
         """D-side only. Returns N-1 for Mamba models since the decoder
@@ -661,7 +694,7 @@ class NixlConnectorScheduler:
 
             remote_num_tokens = request.num_computed_tokens
 
-        return delay_free_blocks, dict(
+        xfer_params = dict(
             do_remote_prefill=is_p_node,
             do_remote_decode=is_d_node,
             remote_block_ids=block_ids,
@@ -672,3 +705,17 @@ class NixlConnectorScheduler:
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
             remote_num_tokens=remote_num_tokens,
         )
+        logger.info(
+            "NIXL request_finished exporting remote prefill params: req_id=%s "
+            "engine_id=%s side_channel=%s:%s tp_size=%s "
+            "do_remote_prefill=%s do_remote_decode=%s block_counts=%s",
+            request.request_id,
+            self.engine_id,
+            self.side_channel_host,
+            self.side_channel_port,
+            self.vllm_config.parallel_config.tensor_parallel_size,
+            is_p_node,
+            is_d_node,
+            [len(group) for group in block_ids],
+        )
+        return delay_free_blocks, xfer_params

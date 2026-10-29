@@ -230,6 +230,9 @@ class EngineCoreClient(ABC):
     ) -> bool:
         raise NotImplementedError
 
+    async def kvpilot_apply_label_async(self, request_id: str, dram_safe: bool) -> int:
+        raise NotImplementedError
+
     async def reset_encoder_cache_async(self) -> None:
         raise NotImplementedError
 
@@ -1136,6 +1139,11 @@ class AsyncMPClient(MPClient):
     ) -> bool:
         return await self.call_utility_async(
             "reset_prefix_cache", reset_running_requests, reset_connector
+        )
+
+    async def kvpilot_apply_label_async(self, request_id: str, dram_safe: bool) -> int:
+        return await self.call_utility_async(
+            "kvpilot_apply_label", request_id, dram_safe
         )
 
     async def reset_encoder_cache_async(self) -> None:

@@ -261,15 +261,18 @@ class KVCacheCoordinator(ABC):
                 retention_interval=self.retention_interval,
             )
 
-    def free(self, request_id: str) -> None:
+    def free(self, request_id: str, num_tokens: int = 0,
+             kv_hit_rate: float = 0.0) -> None:
         """
         Free the blocks for the request.
 
         Args:
             request_id: The request ID.
+            num_tokens: Total token count of the request (prompt + output).
+            kv_hit_rate: KV hit rate of the request being freed.
         """
         for manager in self.single_type_managers:
-            manager.free(request_id)
+            manager.free(request_id, num_tokens, kv_hit_rate)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """

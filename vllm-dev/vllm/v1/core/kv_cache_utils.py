@@ -83,6 +83,12 @@ def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
 
 logger = init_logger(__name__)
 
+
+def env_on(name: str) -> bool:
+    """Whether an env var is set to a truthy value."""
+    return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
+
+
 # The hash seed for the first block of any prefix block sequence.
 #
 # We use a random value to avoid hash collisions or PYTHONHASHSEED environment
@@ -129,6 +135,29 @@ class KVCacheBlock:
     # These two attributes should only be manipulated by FreeKVCacheBlockQueue.
     prev_free_block: "KVCacheBlock | None" = None
     next_free_block: "KVCacheBlock | None" = None
+
+    # The total token count of the request that last released this block.
+    # Used by FreeKVCacheMultiQueue for priority-based eviction.
+    kvpilot_req_num_tokens: int = 0
+
+    # KV hit rate of the request that last released this block.
+    # Used by FreeKVCacheHeap for priority-based eviction.
+    kvpilot_req_kv_hit_rate: float = 0.0
+
+    # Whether the next request expected to reuse this block is DRAM-safe.
+    kvpilot_next_dram_safe: bool = False
+
+    # Which tier this block lives in for FreeKVCacheMultiQueue.
+    # 0 = blank, 1 = short, 2 = long, -1 = not in any queue.
+    kvpilot_queue_id: int = -1
+
+    # Observability only, written under $GET_HBM_POOL_DISTRIBUTION: when this
+    # block last entered or left the free queue, and the trace line of the
+    # request that put it there. Stamped on the same two events LRU orders by
+    # (free and touch), so the age derived from it is the age LRU sees.
+    # No eviction policy reads these; see kvpilot_hbm_snapshot.py.
+    kvpilot_last_access_ns: int = 0
+    kvpilot_last_req_line: int = -1
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
@@ -392,6 +421,309 @@ class FreeKVCacheBlockQueue:
             ret.append(curr_block)
             curr_block = curr_block.next_free_block
         return ret
+
+    def reset(self, blocks: list[KVCacheBlock]) -> None:
+        """Re-initialize the free pool from `blocks` (drop-in for prefix-cache
+        reset). Equivalent to constructing a fresh instance in place."""
+        FreeKVCacheBlockQueue.__init__(self, blocks)
+
+
+class FreeKVCacheHeap:
+    """Min-heap free block pool. Eviction priority is computed by `_priority`
+    (smaller = evicted first): priority scales with the previous request's KV
+    hit rate and the insertion counter.
+
+    `remove` is lazy: it bumps the block's epoch so its stale heap entry becomes
+    a tombstone. popleft skips tombstones; _maybe_compact rebuilds the heap when
+    they pile up.
+    """
+
+    # Compact when the physical heap exceeds _COMPACT_FACTOR * num_free_blocks
+    # + _COMPACT_SLACK, bounding extra memory to ~2x live blocks.
+    _COMPACT_FACTOR = 2
+    _COMPACT_SLACK = 64
+
+    def __init__(self, blocks: list[KVCacheBlock]) -> None:
+        import heapq
+        self._heapq = heapq
+        self.num_free_blocks = 0
+        self._counter = 0
+        # entry: (priority, counter, epoch, block). counter is a unique,
+        # monotonically increasing tie-break so heapq never compares the
+        # (non-orderable) KVCacheBlock when two entries share a priority.
+        self._heap: list[tuple[float, int, int, KVCacheBlock]] = []
+        # block_id -> current epoch; an entry with a stale epoch is a tombstone.
+        self._epoch: dict[int, int] = {}
+        # O(n) build: append unordered, then heapify once.
+        for block in blocks:
+            self._epoch[block.block_id] = 0
+            self._heap.append(
+                (self._priority(block, self._counter), self._counter, 0, block))
+            self._counter += 1
+            self.num_free_blocks += 1
+        self._heapq.heapify(self._heap)
+
+    def get_counter(self) -> int:
+        """Current insertion counter (monotonically increasing)."""
+        return self._counter
+
+    @staticmethod
+    def _priority(block: KVCacheBlock, counter: int) -> float:
+        """Eviction priority (smaller => evicted first).
+
+        Requests with KV hit rate below 50% get priority 0 and are evicted
+        first. Requests at or above 50% are protected by hit_rate * 3000 plus
+        the FIFO/aging counter.
+        """
+        if block.kvpilot_req_kv_hit_rate < 0.5:
+            return 0.0
+        return block.kvpilot_req_kv_hit_rate * 3000.0 + counter
+
+    def popleft(self) -> KVCacheBlock:
+        """Pop the lowest-priority live block, skipping tombstones.
+        Amortised O(log n)."""
+        if self.num_free_blocks == 0:
+            raise ValueError("No free blocks available")
+        while True:
+            prio, cnt, ep, block = self._heapq.heappop(self._heap)
+            if ep == self._epoch.get(block.block_id):
+                self.num_free_blocks -= 1
+                return block
+            # Tombstone -- discard and continue.
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        """Pop n blocks with the smallest priority."""
+        if n > self.num_free_blocks:
+            raise ValueError(
+                f"Cannot pop {n} blocks, only {self.num_free_blocks} available")
+        ret = []
+        for _ in range(n):
+            ret.append(self.popleft())
+        return ret
+
+    def remove(self, block: KVCacheBlock) -> None:
+        """Lazily remove a block: bump its epoch so the existing entry becomes
+        a tombstone (reaped later by popleft/_maybe_compact). O(1)."""
+        cur_ep = self._epoch.get(block.block_id)
+        if cur_ep is None:
+            raise RuntimeError(
+                f"remove() called on block {block.block_id} not in heap")
+        self._epoch[block.block_id] = cur_ep + 1
+        self.num_free_blocks -= 1
+
+    def append(self, block: KVCacheBlock) -> None:
+        """Add a free block to the heap. O(log n)."""
+        ep = self._epoch.setdefault(block.block_id, 0)
+        self._heapq.heappush(
+            self._heap,
+            (self._priority(block, self._counter), self._counter, ep, block),
+        )
+        self._counter += 1
+        self.num_free_blocks += 1
+        self._maybe_compact()
+
+    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Add multiple blocks to the heap."""
+        for block in blocks:
+            self.append(block)
+
+    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Add multiple blocks, prioritizing them for reuse.
+
+        A heap has no positional front, so "prepend" is expressed through the
+        priority function: these blocks are pushed with the *current* counter,
+        making them the oldest (and therefore first-evicted/first-reused)
+        entries. Ordering within `blocks` is preserved.
+        """
+        self.append_n(blocks)
+
+    def get_all_free_blocks(self) -> list[KVCacheBlock]:
+        """Return all *live* blocks currently in the heap."""
+        return [
+            b for (_, _, ep, b) in self._heap
+            if ep == self._epoch.get(b.block_id)
+        ]
+
+    def _maybe_compact(self) -> None:
+        """Rebuild the heap, dropping tombstones, when they pile up."""
+        threshold = (self._COMPACT_FACTOR * self.num_free_blocks
+                     + self._COMPACT_SLACK)
+        if len(self._heap) <= threshold:
+            return
+        alive = [
+            entry for entry in self._heap
+            if entry[2] == self._epoch.get(entry[3].block_id)
+        ]
+        self._heap = alive
+        self._heapq.heapify(self._heap)
+
+    def reset(self, blocks: list[KVCacheBlock]) -> None:
+        """Re-initialize the heap from `blocks` (drop-in for prefix-cache
+        reset). Equivalent to constructing a fresh instance in place."""
+        FreeKVCacheHeap.__init__(self, blocks)
+
+
+# Threshold for classifying short vs long requests in FreeKVCacheLengthQueue.
+SHORT_REQUEST_THRESHOLD = 2048  # tokens
+
+
+class FreeKVCacheMultiQueue:
+    """Three-tier free block pool; tiers are evicted first, second, third.
+
+    Uses three FreeKVCacheBlockQueue instances (doubly-linked lists) to keep
+    O(1) remove and O(1) append. `popleft` drains `_first` before `_second`
+    before `_third`, so a block's tier is its eviction rank. Blocks record
+    their tier in KVCacheBlock.kvpilot_queue_id (0/1/2, or -1 when not queued).
+
+    Subclasses decide what each tier means by overriding `_tier_for`. This
+    class implements the same interface as FreeKVCacheBlockQueue so it can be
+    used as a drop-in replacement for BlockPool.free_block_queue.
+    """
+
+    def __init__(self, blocks: list[KVCacheBlock]) -> None:
+        # Never-used blocks are always evicted first.
+        for b in blocks:
+            b.kvpilot_queue_id = 0
+        self._first = FreeKVCacheBlockQueue(blocks)
+        self._second = FreeKVCacheBlockQueue([])
+        self._third = FreeKVCacheBlockQueue([])
+
+    def _tier_for(self, block: KVCacheBlock) -> int:
+        """Return the tier (0/1/2) this block belongs in."""
+        raise NotImplementedError
+
+    @property
+    def num_free_blocks(self) -> int:
+        return (self._first.num_free_blocks
+                + self._second.num_free_blocks
+                + self._third.num_free_blocks)
+
+    def _pick_queue(self) -> FreeKVCacheBlockQueue:
+        """Return the highest-priority non-empty queue."""
+        if self._first.num_free_blocks > 0:
+            return self._first
+        if self._second.num_free_blocks > 0:
+            return self._second
+        if self._third.num_free_blocks > 0:
+            return self._third
+        raise ValueError("No free blocks available")
+
+    def _queue_for_block(self, block: KVCacheBlock) -> FreeKVCacheBlockQueue:
+        """Return the queue selected by a block's kvpilot_queue_id."""
+        if block.kvpilot_queue_id == 0:
+            return self._first
+        elif block.kvpilot_queue_id == 1:
+            return self._second
+        elif block.kvpilot_queue_id == 2:
+            return self._third
+        raise RuntimeError(
+            f"Block {block.block_id} has invalid kvpilot_queue_id "
+            f"{block.kvpilot_queue_id}")
+
+    def _queue_for_tier(self, tier: int) -> FreeKVCacheBlockQueue:
+        return (self._first, self._second, self._third)[tier]
+
+    def popleft(self) -> KVCacheBlock:
+        """Pop from the highest-priority non-empty queue."""
+        q = self._pick_queue()
+        block = q.popleft()
+        block.kvpilot_queue_id = -1
+        return block
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        """Pop n blocks respecting priority order."""
+        if n > self.num_free_blocks:
+            raise ValueError(
+                f"Cannot pop {n} blocks, only {self.num_free_blocks} available")
+        ret = []
+        for _ in range(n):
+            ret.append(self.popleft())
+        return ret
+
+    def remove(self, block: KVCacheBlock) -> None:
+        """Remove a specific block from its queue. O(1)."""
+        q = self._queue_for_block(block)
+        q.remove(block)
+        block.kvpilot_queue_id = -1
+
+    def append(self, block: KVCacheBlock) -> None:
+        tier = self._tier_for(block)
+        block.kvpilot_queue_id = tier
+        self._queue_for_tier(tier).append(block)
+
+    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Append multiple blocks to their appropriate queues."""
+        for block in blocks:
+            self.append(block)
+
+    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Prepend blocks to their tiers, so they are reused before older ones."""
+        for block in reversed(blocks):
+            tier = self._tier_for(block)
+            block.kvpilot_queue_id = tier
+            self._queue_for_tier(tier).prepend_n([block])
+
+    def get_all_free_blocks(self) -> list[KVCacheBlock]:
+        """Return all blocks across all queues."""
+        return (self._first.get_all_free_blocks()
+                + self._second.get_all_free_blocks()
+                + self._third.get_all_free_blocks())
+
+    def reset(self, blocks: list[KVCacheBlock]) -> None:
+        """Re-initialize the multi-queue from `blocks` (drop-in for prefix-cache
+        reset). Equivalent to constructing a fresh instance in place."""
+        FreeKVCacheMultiQueue.__init__(self, blocks)
+
+
+class FreeKVCacheLengthQueue(FreeKVCacheMultiQueue):
+    """Tiers by the owning request's length: blank, short, long.
+
+    Blocks from longer requests are preserved as long as possible.
+    """
+
+    def _tier_for(self, block: KVCacheBlock) -> int:
+        if block.kvpilot_req_num_tokens == 0:
+            return 0
+        return 1 if block.kvpilot_req_num_tokens < SHORT_REQUEST_THRESHOLD else 2
+
+
+class FreeKVCacheOfflineDramSafeQueue(FreeKVCacheMultiQueue):
+    """Tiers by the dram-safe verdict read from offline trace metadata.
+
+    The verdict rides on the block as `kvpilot_next_dram_safe`, written by
+    KVCacheManager.free() just before the block is queued.
+    """
+
+    def _tier_for(self, block: KVCacheBlock) -> int:
+        if block.block_hash is None:
+            return 0
+        return 1 if block.kvpilot_next_dram_safe else 2
+
+
+class FreeKVCacheOnlineDramSafeQueue(FreeKVCacheMultiQueue):
+    """Tiers by the dram-safe verdict fed back by the decode worker.
+
+    The verdict is not known when the block is queued (decode is still running),
+    so blocks land in the conservative tier and are moved later by `retier`.
+    """
+
+    def _tier_for(self, block: KVCacheBlock) -> int:
+        # Un-hashed blocks are never reused; anything else stays in HBM until a
+        # verdict says otherwise.
+        return 0 if block.block_hash is None else 2
+
+    def retier(self, block: KVCacheBlock, dram_safe: bool) -> bool:
+        """Move a queued block to the tier its verdict calls for.
+
+        Left alone when the block is not queued or already sits in the right tier.
+        """
+        tier = 1 if dram_safe else 2
+        if block.kvpilot_queue_id < 0 or block.kvpilot_queue_id == tier:
+            return False
+        self.remove(block)
+        block.kvpilot_queue_id = tier
+        self._queue_for_tier(tier).append(block)
+        return True
 
 
 def need_extra_keys(request: Request) -> bool:
