@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from pathlib import Path
 from typing import Any, Dict, List, Optional, no_type_check
 import asyncio
+import ctypes
+import hashlib
 import json
 import os
+import socket
+import time
 
 # Third Party
 import torch
@@ -13,7 +18,12 @@ from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import (
+    MemoryFormat,
+    MemoryObj,
+    MemoryObjMetadata,
+    TensorMemoryObj,
+)
 from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -64,6 +74,24 @@ def _sanitize_setup_config(
     return sanitized
 
 
+# Mooncake ``ErrorCode`` names, from mooncake-store/include/types.h.
+# Mooncake does not export the enum to Python, so the codes that
+# ``setup_internal()`` can return are mirrored here to make the failure
+# readable. INVALID_PARAMS and INTERNAL_ERROR are returned directly;
+# the others reach the caller via the propagated errors of
+# RegisterLocalMemory() and MountSegment().
+_MOONCAKE_ERROR_NAMES: Dict[int, str] = {
+    -1: "INTERNAL_ERROR",
+    -10: "BUFFER_OVERFLOW",
+    -101: "SEGMENT_NOT_FOUND",
+    -102: "SEGMENT_ALREADY_EXISTS",
+    -103: "CLIENT_NOT_FOUND",
+    -200: "NO_AVAILABLE_HANDLE",
+    -300: "INVALID_VERSION",
+    -600: "INVALID_PARAMS",
+}
+
+
 def setup_mooncake_store(
     store: Any,
     config: "MooncakeStoreConfig",
@@ -87,6 +115,8 @@ def setup_mooncake_store(
         None.  ``store`` is mutated in place.
 
     Raises:
+        RuntimeError: If ``store.setup()`` returns a non-zero mooncake
+            ``ErrorCode``, meaning the store was not initialized.
         Exception: Any exception raised by ``store.setup()``
             other than :class:`TypeError` is propagated to the
             caller (``TypeError`` is caught and used as the
@@ -95,7 +125,7 @@ def setup_mooncake_store(
     setup_dict = config.setup_config
     try:
         # New API (Mooncake PR #1445): setup(config: dict)
-        store.setup(setup_dict)
+        rc = store.setup(setup_dict)
         logger.info("Using dict-based setup API (new)")
     except TypeError:
         # Legacy API: setup with positional arguments.
@@ -113,7 +143,19 @@ def setup_mooncake_store(
                 except (TypeError, ValueError):
                     v = 0
             args.append(v)
-        store.setup(*args)
+        rc = store.setup(*args)
+
+    # ``setup()`` reports failure by return code, not by raising: it
+    # returns 0 on success and a negative mooncake ``ErrorCode``
+    # otherwise. Leaving it unchecked keeps ``RealClient::client_``
+    # null while LMCache proceeds as if the store were connected,
+    # which only surfaces later as "Client is not initialized".
+    if isinstance(rc, int) and rc != 0:
+        name = _MOONCAKE_ERROR_NAMES.get(rc)
+        raise RuntimeError(
+            "Mooncake store.setup() failed: "
+            f"code={rc}" + (f" ({name})" if name else "")
+        )
 
 
 # Prefix for keys that should be forwarded to mooncake setup.
@@ -148,6 +190,30 @@ _SETUP_DEFAULTS: Dict[str, str] = {
     "protocol": "tcp",
     "device_name": "",
 }
+
+ENABLE_MOONCAKE_CPU_BACKEND_ENV = "ENABLE_MOONCAKE_CPU_BACKEND"
+ENABLE_LOCAL_MOONCAKE_HBM_ENV = "ENABLE_LOCAL_MOONCAKE_HBM"
+ENABLE_SHM_MOONCAKE_HBM_ENV = "ENABLE_SHM_MOONCAKE_HBM"
+MOONCAKE_PRELOAD_EXPECTED_ENGINES_ENV = "MOONCAKE_PRELOAD_EXPECTED_ENGINES"
+TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+MOONCAKE_PRELOAD_DIR = "/tmp/mooncake-shm-preload"
+MOONCAKE_PRELOAD_TIMEOUT_SEC = 600
+
+
+def _truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).lower() in TRUE_ENV_VALUES
+
+
+def _int_value(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 class MooncakeStoreConfig:
@@ -336,6 +402,7 @@ class MooncakestoreConnector(RemoteConnector):
             # Third Party
             from mooncake.store import (
                 MooncakeDistributedStore,
+                ReplicaStatus,
                 ReplicateConfig,
             )
         except ImportError as e:
@@ -344,6 +411,8 @@ class MooncakestoreConnector(RemoteConnector):
                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
                 "to run vLLM with MooncakeConnector."
             ) from e
+
+        self.lmcache_config = lmcache_config
 
         try:
             self.store = MooncakeDistributedStore()
@@ -358,6 +427,7 @@ class MooncakestoreConnector(RemoteConnector):
                 raise ValueError("MOONCAKE_CONFIG_PATH/lmcache_config must be provided")
 
             logger.info("Mooncake Configuration loaded. config: %s", self.config)
+            self._configure_mooncake_feature_flags()
 
             # Check if storage_root_dir exists and set env var
             if self.config.storage_root_dir:
@@ -423,11 +493,13 @@ class MooncakestoreConnector(RemoteConnector):
 
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
+        self.metadata = local_cpu_backend.metadata
         self.registered_buffer_ptr = None
 
         # Initialize ReplicateConfig
         self.replica_config = ReplicateConfig()
         self.replica_config.replica_num = 1
+        self.complete_replica_status = ReplicaStatus.COMPLETE
 
         # Set preferred_segment based on configuration
         if self.config.prefer_local_alloc:
@@ -435,6 +507,7 @@ class MooncakestoreConnector(RemoteConnector):
 
         # Register CPU buffer for zero-copy operations
         self._register_cpu_buffer()
+        self._preload_shared_memory_peers()
 
         logger.info("MooncakeConnector initialized successfully.")
 
@@ -460,6 +533,193 @@ class MooncakestoreConnector(RemoteConnector):
         except Exception as e:
             logger.error(f"Buffer registration error: {e}")
             self.registered_buffer_ptr = None
+
+
+    def _configure_mooncake_feature_flags(self) -> None:
+        self.enable_mooncake_cpu_backend = _truthy(
+            os.getenv(ENABLE_MOONCAKE_CPU_BACKEND_ENV, "0")
+        )
+        self.enable_local_mooncake_hbm = _truthy(
+            os.getenv(ENABLE_LOCAL_MOONCAKE_HBM_ENV, "0")
+        )
+        self.enable_shm_mooncake_hbm = _truthy(os.getenv(ENABLE_SHM_MOONCAKE_HBM_ENV, "0"))
+        if self.enable_local_mooncake_hbm and not self.enable_mooncake_cpu_backend:
+            raise RuntimeError(
+                f"{ENABLE_LOCAL_MOONCAKE_HBM_ENV}=true requires "
+                f"{ENABLE_MOONCAKE_CPU_BACKEND_ENV}=true"
+            )
+        if self.enable_shm_mooncake_hbm and not self.enable_local_mooncake_hbm:
+            raise RuntimeError(
+                f"{ENABLE_SHM_MOONCAKE_HBM_ENV}=true requires "
+                f"{ENABLE_MOONCAKE_CPU_BACKEND_ENV}=true and "
+                f"{ENABLE_LOCAL_MOONCAKE_HBM_ENV}=true"
+            )
+        logger.info(
+            "Mooncake feature flags: %s=%s %s=%s %s=%s",
+            ENABLE_MOONCAKE_CPU_BACKEND_ENV,
+            self.enable_mooncake_cpu_backend,
+            ENABLE_LOCAL_MOONCAKE_HBM_ENV,
+            self.enable_local_mooncake_hbm,
+            ENABLE_SHM_MOONCAKE_HBM_ENV,
+            self.enable_shm_mooncake_hbm,
+        )
+
+    def _preload_extra_config(self) -> dict:
+        if self.lmcache_config is None or self.lmcache_config.extra_config is None:
+            return {}
+        return self.lmcache_config.extra_config
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def _preload_record(self) -> dict:
+        extra = self._preload_extra_config()
+        metadata = self.metadata
+        rank = _int_value(extra.get("mooncake_preload_rank"), metadata.worker_id)
+        tp_size = max(1, _int_value(extra.get("mooncake_preload_tp_size"), 1))
+        pp_size = max(1, _int_value(extra.get("mooncake_preload_pp_size"), 1))
+        return {
+            "endpoint": self.store.get_hostname(),
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "model": str(metadata.model_name),
+            "cache_signature": "|".join(
+                [
+                    str(metadata.model_name),
+                    str(metadata.kv_dtype),
+                    str(metadata.kv_shape),
+                    str(metadata.chunk_size),
+                    str(self.meta_fmt),
+                    str(tp_size),
+                    str(pp_size),
+                ]
+            ),
+            "rank": rank,
+            "tp_rank": _int_value(extra.get("mooncake_preload_tp_rank"), rank % tp_size),
+            "pp_rank": _int_value(
+                extra.get("mooncake_preload_pp_rank"), (rank // tp_size) % pp_size
+            ),
+            "tp_size": tp_size,
+            "pp_size": pp_size,
+            "engine_id": str(extra.get("mooncake_preload_engine_id", "")),
+            "time": time.time(),
+        }
+
+    def _preload_rendezvous_dir(self, record: dict) -> Path:
+        key = "|".join(
+            [
+                str(self.config.master_server_address),
+                record["host"],
+                record["cache_signature"],
+            ]
+        )
+        digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+        return Path(MOONCAKE_PRELOAD_DIR) / digest
+
+    def _publish_preload_record(self, directory: Path, record: dict) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        endpoint_hash = hashlib.sha256(record["endpoint"].encode()).hexdigest()[:8]
+        path = directory / f"{record['pid']}-{endpoint_hash}.json"
+        tmp_path = directory / f".{path.name}.tmp"
+        tmp_path.write_text(json.dumps(record), encoding="utf-8")
+        os.replace(tmp_path, path)
+        return path
+
+    def _load_preload_records(self, directory: Path, local_record: dict) -> list[dict]:
+        records: list[dict] = []
+        for path in directory.glob("*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+                pid = int(record.get("pid", -1))
+                if not self._pid_alive(pid):
+                    path.unlink(missing_ok=True)
+                    continue
+                if record.get("host") != local_record["host"]:
+                    continue
+                if record.get("cache_signature") != local_record["cache_signature"]:
+                    continue
+                records.append(record)
+            except Exception:
+                logger.warning("Ignoring invalid Mooncake preload record: %s", path)
+        return records
+
+    def _preload_shared_memory_peers(self) -> None:
+        extra = self._preload_extra_config()
+        if not self.enable_shm_mooncake_hbm:
+            return
+        if not hasattr(self.store, "preload_shared_memory_segments"):
+            raise RuntimeError("Mooncake preload_shared_memory_segments is unavailable")
+
+        record = self._preload_record()
+        expected_engines = max(
+            1,
+            _int_value(
+                extra.get(
+                    "mooncake_preload_expected_engines",
+                    os.getenv(MOONCAKE_PRELOAD_EXPECTED_ENGINES_ENV),
+                ),
+                1,
+            ),
+        )
+        expected_workers = expected_engines * record["tp_size"] * record["pp_size"]
+        timeout_s = max(
+            1,
+            _int_value(
+                extra.get("mooncake_preload_timeout_sec"),
+                MOONCAKE_PRELOAD_TIMEOUT_SEC,
+            ),
+        )
+        directory = self._preload_rendezvous_dir(record)
+        path = self._publish_preload_record(directory, record)
+        logger.info(
+            "shared_memory_preload_wait endpoint=%s expected_workers=%d dir=%s",
+            record["endpoint"],
+            expected_workers,
+            directory,
+        )
+
+        deadline = time.monotonic() + timeout_s
+        records: list[dict] = []
+        while True:
+            records = self._load_preload_records(directory, record)
+            endpoints = {item.get("endpoint") for item in records}
+            if len(endpoints) >= expected_workers:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Mooncake shared memory preload timed out: "
+                    f"endpoint={record['endpoint']} ready={len(endpoints)} "
+                    f"expected={expected_workers} dir={directory}"
+                )
+            time.sleep(0.2)
+
+        peer_endpoints = sorted(
+            item["endpoint"]
+            for item in records
+            if item.get("endpoint") != record["endpoint"]
+            and item.get("tp_rank") == record["tp_rank"]
+            and item.get("pp_rank") == record["pp_rank"]
+        )
+        mapped = self.store.preload_shared_memory_segments(peer_endpoints)
+        if mapped < 0:
+            raise RuntimeError(
+                "Mooncake shared memory preload failed: "
+                f"endpoint={record['endpoint']} peers={peer_endpoints}"
+            )
+        logger.info(
+            "shared_memory_preload_ready endpoint=%s peers=%d mapped_segments=%d record=%s",
+            record["endpoint"],
+            len(peer_endpoints),
+            mapped,
+            path,
+        )
 
     def _unregister_cpu_buffer(self):
         """Unregister CPU buffer."""
@@ -504,6 +764,38 @@ class MooncakestoreConnector(RemoteConnector):
             # Use optimized mode with local metadata
             return await self._batch_get_into(keys)
 
+    def support_batched_get_non_blocking(self) -> bool:
+        return True
+
+    async def batched_get_non_blocking(
+        self,
+        lookup_id: str,
+        keys: List[CacheEngineKey],
+    ) -> List[MemoryObj]:
+        """Mooncake only supports batched get (single get raises
+        NotImplementedError). The base class default implementation fetches
+        keys one-by-one via self.get(), which is unusable here and breaks the
+        layerwise retrieve path. Reuse batched_get and return the consecutive
+        valid prefix, releasing any objects after the first miss to match the
+        base-class semantics."""
+        if not keys:
+            return []
+        results = await self.batched_get(keys)
+
+        memory_objs: List[MemoryObj] = []
+        found_failure = False
+        for result in results:
+            if found_failure:
+                # Release subsequent memory objects to avoid memory leak
+                if isinstance(result, MemoryObj):
+                    result.ref_count_down()
+            elif isinstance(result, MemoryObj):
+                memory_objs.append(result)
+            else:
+                # First failure encountered (None)
+                found_failure = True
+        return memory_objs
+
     def support_batched_async_contains(self) -> bool:
         return True
 
@@ -519,6 +811,213 @@ class MooncakestoreConnector(RemoteConnector):
                 break
             num_hit_counts += 1
         return num_hit_counts
+
+    def _metadata_for_batch_get_into_key(
+        self, key: CacheEngineKey
+    ) -> tuple[list[torch.Size], list[torch.dtype], MemoryFormat]:
+        layer_id = getattr(key, "layer_id", None)
+        if layer_id is None:
+            return self.meta_shapes, self.meta_dtypes, self.meta_fmt
+
+        remaining_layer_id = int(layer_id)
+        for shape, dtype in zip(self.meta_shapes, self.meta_dtypes, strict=False):
+            if remaining_layer_id >= shape[1]:
+                remaining_layer_id -= shape[1]
+                continue
+
+            if self.meta_fmt == MemoryFormat.KV_MLA_FMT:
+                return [torch.Size([shape[2], shape[3]])], [dtype], self.meta_fmt
+
+            if self.meta_fmt == MemoryFormat.KV_2LTD:
+                if self.local_cpu_backend.config.enable_blending:
+                    return (
+                        [torch.Size([shape[0], shape[2], shape[3]])],
+                        [dtype],
+                        MemoryFormat.KV_2TD,
+                    )
+                return (
+                    [torch.Size([shape[2], shape[0], shape[3]])],
+                    [dtype],
+                    MemoryFormat.KV_T2D,
+                )
+
+            raise ValueError(f"Unsupported layerwise metadata format: {self.meta_fmt}")
+
+        raise ValueError(
+            f"layer_id {layer_id} is out of range for meta_shapes={self.meta_shapes}"
+        )
+
+    @staticmethod
+    def _logical_size_bytes(
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+    ) -> int:
+        return sum(
+            shape.numel() * dtype.itemsize
+            for shape, dtype in zip(shapes, dtypes, strict=True)
+        )
+
+    @staticmethod
+    def _raw_tensor_from_host_ptr(ptr: int, size: int) -> torch.Tensor:
+        buffer_type = ctypes.c_uint8 * size
+        host_buffer = buffer_type.from_address(ptr)
+        tensor = torch.frombuffer(host_buffer, dtype=torch.uint8, count=size)
+        # Keep the ctypes view alive for the lifetime of the tensor wrapper.
+        tensor._lmcache_mooncake_host_buffer = host_buffer  # type: ignore[attr-defined]
+        return tensor
+
+    def _make_local_raw_memory_obj(
+        self,
+        ptr: int,
+        physical_size: int,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        fmt: MemoryFormat,
+    ) -> TensorMemoryObj:
+        logical_size = self._logical_size_bytes(shapes, dtypes)
+        if physical_size < logical_size:
+            raise ValueError(
+                f"Mooncake local range is too small: physical={physical_size}, "
+                f"logical={logical_size}"
+            )
+        raw_tensor = self._raw_tensor_from_host_ptr(ptr, logical_size)
+        return TensorMemoryObj(
+            raw_data=raw_tensor,
+            metadata=MemoryObjMetadata(
+                shapes[0],
+                dtypes[0],
+                ptr,
+                physical_size,
+                1,
+                0,
+                fmt,
+                shapes=shapes,
+                dtypes=dtypes,
+            ),
+            parent_allocator=None,
+        )
+
+    def _try_batch_get_local_raw_views(
+        self, keys: List[CacheEngineKey]
+    ) -> Optional[List[MemoryObj]]:
+        if not self.enable_local_mooncake_hbm or self.save_chunk_meta:
+            return None
+
+        batch_get_replica_desc = getattr(self.store, "batch_get_replica_desc", None)
+        if batch_get_replica_desc is None:
+            if self.enable_local_mooncake_hbm:
+                raise RuntimeError("Mooncake batch_get_replica_desc is unavailable")
+            return None
+
+        key_strs = [key.to_string() for key in keys]
+        try:
+            replica_map = batch_get_replica_desc(key_strs)
+            local_endpoint = self.store.get_hostname()
+        except Exception as exc:
+            logger.debug("Unable to query Mooncake local replicas: %s", exc)
+            if self.enable_shm_mooncake_hbm:
+                raise RuntimeError("Mooncake shared-memory replica query failed") from exc
+            return None
+
+        memory_objs: list[MemoryObj] = []
+        local_segment_addrs = 0
+        cross_segment_addrs = 0
+        for key, key_str in zip(keys, key_strs, strict=True):
+            try:
+                shapes, dtypes, fmt = self._metadata_for_batch_get_into_key(key)
+            except Exception as exc:
+                logger.debug(
+                    "Unable to infer metadata for local Mooncake key %s: %s",
+                    key,
+                    exc,
+                )
+                if self.enable_shm_mooncake_hbm:
+                    raise RuntimeError(
+                        f"Unable to infer Mooncake shared-memory metadata for key {key}"
+                    ) from exc
+                return None
+
+            selected_buffer = None
+            for replica in replica_map.get(key_str, []):
+                if replica.status != self.complete_replica_status:
+                    continue
+                if not replica.is_memory_replica():
+                    continue
+                buffer = replica.get_memory_descriptor().buffer_descriptor
+                if buffer.transport_endpoint == local_endpoint:
+                    selected_buffer = buffer
+                    break
+
+            if selected_buffer is None:
+                if self.enable_shm_mooncake_hbm:
+                    raise RuntimeError(
+                        "Mooncake shared-memory replica was not preloaded or rewritten "
+                        f"for key {key_str}"
+                    )
+                return None
+
+            ptr = int(selected_buffer.buffer_address)
+            physical_size = int(selected_buffer.size)
+            segment_base = int(getattr(selected_buffer, "segment_base", 0) or 0)
+            segment_size = int(getattr(selected_buffer, "segment_size", 0) or 0)
+            shared_memory = bool(getattr(selected_buffer, "shared_memory", False))
+            # A rewritten peer address keeps the owner's segment_base/size but
+            # points into our own mapping, so it falls outside the owner range.
+            is_cross_segment_addr = (
+                shared_memory
+                and segment_base > 0
+                and segment_size > 0
+                and not (segment_base <= ptr < segment_base + segment_size)
+            )
+            if is_cross_segment_addr:
+                cross_segment_addrs += 1
+            else:
+                local_segment_addrs += 1
+            if ptr <= 0 or physical_size <= 0:
+                logger.debug(
+                    "Invalid local Mooncake range for key %s: ptr=%s size=%s",
+                    key,
+                    ptr,
+                    physical_size,
+                )
+                if self.enable_shm_mooncake_hbm:
+                    raise RuntimeError(f"Invalid Mooncake shared-memory range for key {key}")
+                return None
+
+            try:
+                memory_objs.append(
+                    self._make_local_raw_memory_obj(
+                        ptr,
+                        physical_size,
+                        shapes,
+                        dtypes,
+                        fmt,
+                    )
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Unable to build local Mooncake raw view for key %s: %s",
+                    key,
+                    exc,
+                )
+                if self.enable_shm_mooncake_hbm:
+                    raise RuntimeError(
+                        f"Unable to build Mooncake shared-memory raw view for key {key}"
+                    ) from exc
+                return None
+
+        if cross_segment_addrs == 0:
+            address_source = "local_segment"
+        elif local_segment_addrs == 0:
+            address_source = "cross_segment"
+        else:
+            address_source = "mixed"
+        logger.info(
+            "Using local Mooncake raw-view get: keys=%d address_source=%s ",
+            len(keys),
+            address_source,
+        )
+        return memory_objs
 
     async def _batch_get_into(
         self, keys: List[CacheEngineKey]
@@ -536,6 +1035,10 @@ class MooncakestoreConnector(RemoteConnector):
             )
             return [None] * len(keys)
 
+        local_raw_views = self._try_batch_get_local_raw_views(keys)
+        if local_raw_views is not None:
+            return local_raw_views
+
         logger.debug(f"Using batch_get_into for {len(keys)} keys (zero-copy mode)")
 
         # Reserve a buffer for every requested chunk
@@ -546,18 +1049,31 @@ class MooncakestoreConnector(RemoteConnector):
         buffer_ptrs: list[int] = []
         buffer_sizes: list[int] = []
 
-        for i, _ in enumerate(keys):
-            obj = self.local_cpu_backend.allocate(
-                self.meta_shapes, self.meta_dtypes, self.meta_fmt
-            )
-            memory_objs.append(obj)
-            if obj is not None and obj.raw_tensor is not None:
-                valid_idx.append(i)
+        torch.cuda.nvtx.range_push(
+            f"LMCache.mooncake.batch_get_into.alloc.keys_{len(keys)}"
+        )
+        try:
+            for i, key in enumerate(keys):
+                try:
+                    shapes, dtypes, fmt = self._metadata_for_batch_get_into_key(key)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to infer local metadata for key %s: %s", key, exc
+                    )
+                    memory_objs.append(None)
+                    continue
 
-                # Prepare the argument lists for the C++ call
-                key_strs.append(keys[i].to_string())
-                buffer_ptrs.append(obj.data_ptr)
-                buffer_sizes.append(obj.get_size())
+                obj = self.local_cpu_backend.allocate(shapes, dtypes, fmt)
+                memory_objs.append(obj)
+                if obj is not None and obj.raw_tensor is not None:
+                    valid_idx.append(i)
+
+                    # Prepare the argument lists for the C++ call
+                    key_strs.append(keys[i].to_string())
+                    buffer_ptrs.append(obj.data_ptr)
+                    buffer_sizes.append(obj.get_size())
+        finally:
+            torch.cuda.nvtx.range_pop()
 
         if not valid_idx:
             logger.warning("Batch-get aborted: unable to allocate any buffers.")
@@ -566,9 +1082,19 @@ class MooncakestoreConnector(RemoteConnector):
         try:
             # Single RPC call for multiple chunks
             logger.debug(f"Calling batch_get_into with {len(key_strs)} keys")
-            bytes_read_list = await asyncio.to_thread(
-                self.store.batch_get_into, key_strs, buffer_ptrs, buffer_sizes
-            )
+
+            def _batch_get_into_with_nvtx():
+                torch.cuda.nvtx.range_push(
+                    f"LMCache.mooncake.batch_get_into.store.keys_{len(key_strs)}"
+                )
+                try:
+                    return self.store.batch_get_into(
+                        key_strs, buffer_ptrs, buffer_sizes
+                    )
+                finally:
+                    torch.cuda.nvtx.range_pop()
+
+            bytes_read_list = await asyncio.to_thread(_batch_get_into_with_nvtx)
             logger.debug(f"batch_get_into returned: {bytes_read_list}")
 
             # Assemble the final result list

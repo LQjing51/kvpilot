@@ -1204,6 +1204,10 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
+        # Tag NVTX load ranges with the owning request so profile-based TTFT
+        # attribution can charge each range to one request instead of every
+        # request whose window happens to contain it.
+        req_id: str = kwargs.get("req_id", "unspecified")
 
         self._lazy_initialize_buffer(self.kvcaches)
 
@@ -1242,43 +1246,58 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
             # memobj -> gpu_buffer -> kvcaches
             with torch.cuda.stream(self.load_stream):
-                for start, end, memory_obj in zip(
-                    starts, ends, memory_objs_layer, strict=False
-                ):
-                    # Validate memory format
-                    if self.use_mla:
-                        assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT, (
-                            f"Expected memory format {MemoryFormat.KV_MLA_FMT}, "
-                            f"got {memory_obj.metadata.fmt}"
-                        )
-                    else:
-                        assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D, (
-                            f"Expected memory format {MemoryFormat.KV_T2D}, "
-                            f"got {memory_obj.metadata.fmt}"
-                        )
-                    if self.use_gpu:
-                        tmp_gpu_buffer_obj.tensor[start - offset : end - offset].copy_(
-                            memory_obj.tensor, non_blocking=True
-                        )
-                    else:
+                torch.cuda.nvtx.range_push(
+                    f"LMCache.batched_to_gpu.copy_chunks.layer_{layer_id}"
+                    f".req_{req_id}"
+                )
+                try:
+                    for start, end, memory_obj in zip(
+                        starts, ends, memory_objs_layer, strict=False
+                    ):
+                        # Validate memory format
+                        if self.use_mla:
+                            assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT, (
+                                f"Expected memory format {MemoryFormat.KV_MLA_FMT}, "
+                                f"got {memory_obj.metadata.fmt}"
+                            )
+                        else:
+                            assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D, (
+                                f"Expected memory format {MemoryFormat.KV_T2D}, "
+                                f"got {memory_obj.metadata.fmt}"
+                            )
+                        if self.use_gpu:
+                            tmp_gpu_buffer_obj.tensor[start - offset : end - offset].copy_(
+                                memory_obj.tensor, non_blocking=True
+                            )
+                        else:
+                            lmc_ops.single_layer_kv_transfer(
+                                memory_obj.tensor,
+                                self.kvcaches[layer_id],
+                                slot_mapping_full,
+                                lmc_ops.TransferDirection.H2D,
+                                self.gpu_kv_format,
+                                token_major=True,
+                            )
+                finally:
+                    torch.cuda.nvtx.range_pop()
+
+                if self.use_gpu:
+                    torch.cuda.nvtx.range_push(
+                        "LMCache.batched_to_gpu.single_layer_kv_transfer."
+                        f"layer_{layer_id}"
+                        f".req_{req_id}"
+                    )
+                    try:
                         lmc_ops.single_layer_kv_transfer(
-                            memory_obj.tensor,
+                            tmp_gpu_buffer_obj.tensor,
                             self.kvcaches[layer_id],
                             slot_mapping_full,
                             lmc_ops.TransferDirection.H2D,
                             self.gpu_kv_format,
                             token_major=True,
                         )
-
-                if self.use_gpu:
-                    lmc_ops.single_layer_kv_transfer(
-                        tmp_gpu_buffer_obj.tensor,
-                        self.kvcaches[layer_id],
-                        slot_mapping_full,
-                        lmc_ops.TransferDirection.H2D,
-                        self.gpu_kv_format,
-                        token_major=True,
-                    )
+                    finally:
+                        torch.cuda.nvtx.range_pop()
         yield
 
         # synchronize the last layer
@@ -1362,7 +1381,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             )
             assert tmp_gpu_buffer_obj.tensor is not None
 
-        offset = starts[0]
         current_stream = torch.cuda.current_stream()
 
         for layer_id in range(self.num_layers):
@@ -1379,13 +1397,21 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         self.gpu_kv_format,
                         token_major=True,
                     )
+                # NOTE: tmp_gpu_buffer is packed from slot_mapping_full =
+                # cat(slot_mapping[start:end] for each kept chunk), so it is
+                # densely laid out. Index it by a running cumulative offset
+                # instead of (start - starts[0]); the latter breaks when chunks
+                # are skipped (e.g. already present in a remote backend like
+                # mooncake), producing non-contiguous starts and 0-length slices.
+                cumulative = 0
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
                 ):
                     assert memory_obj.tensor is not None
+                    n = end - start
                     if self.use_gpu:
                         memory_obj.tensor.copy_(
-                            tmp_gpu_buffer_obj.tensor[start - offset : end - offset],
+                            tmp_gpu_buffer_obj.tensor[cumulative : cumulative + n],
                             non_blocking=True,
                         )
                     else:
@@ -1400,6 +1426,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     # Set metadata format
                     if self.use_mla:
                         memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+                    cumulative += n
 
             yield
             if sync:

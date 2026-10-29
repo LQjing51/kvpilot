@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Extend the package path before importing any lmcache module
+from pkgutil import extend_path  # isort:skip
+__path__ = extend_path(__path__, __name__)
+
 # Standard
 from typing import Any
 import importlib

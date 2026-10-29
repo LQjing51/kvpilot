@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 import asyncio
 import gc
 import multiprocessing
+import os
 import time
 
 # Third Party
@@ -64,6 +65,20 @@ from lmcache.v1.token_database import (
 )
 
 logger = init_logger(__name__)
+
+
+def _env_flag_enabled(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in ("0", "false", "no", "off", ""):
+        return False
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    return default
+
 
 # Type aliases for processed chunks
 # (cache_key, memory_obj, start_index, end_index)
@@ -1022,8 +1037,23 @@ class LMCacheEngine:
                 else:
                     yield None
 
-                mem_objs_layer = task.result()
-                mem_obj_consumer.send(mem_objs_layer)
+                torch.cuda.nvtx.range_push(
+                    f"LMCache.retrieve_layer.task_result.layer_{layer_id}"
+                    f".req_{req_id}"
+                )
+                try:
+                    mem_objs_layer = task.result()
+                finally:
+                    torch.cuda.nvtx.range_pop()
+
+                torch.cuda.nvtx.range_push(
+                    f"LMCache.retrieve_layer.mem_obj_consumer_send.layer_{layer_id}"
+                    f".req_{req_id}"
+                )
+                try:
+                    mem_obj_consumer.send(mem_objs_layer)
+                finally:
+                    torch.cuda.nvtx.range_pop()
                 to_count_down.extend(mem_objs_layer)
 
             for mem_obj in to_count_down:
@@ -1122,32 +1152,70 @@ class LMCacheEngine:
                 request_configs=request_configs,
             )
 
-            # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
-                for start, end, key in chunk_info_iterator:
-                    assert isinstance(key, CacheEngineKey)
+                first_layer_lookup = _env_flag_enabled(
+                    "LMCACHE_FIRST_LAYER_LOOKUP", default=True
+                )
+                if first_layer_lookup:
+                    # Probe only layer 0 of each chunk in a single batched_contains.
+                    chunk_info_list = []
+                    first_layer_keys = []
+                    for start, end, key in chunk_info_iterator:
+                        assert isinstance(key, CacheEngineKey)
+                        chunk_info_list.append((start, end, key))
+                        first_layer_keys.append(key.get_first_layer())
 
-                    # TODO(Jiayi): Optimize by checking only the existence of the key
-                    # of one layer
-                    key_all_layers = key.split_layers(self.num_layers)
-
+                    # block_mapping: backend_name -> prefix of hit layer-0 keys
                     hit_chunks, block_mapping = self.storage_manager.batched_contains(
-                        key_all_layers,  # type: ignore
+                        first_layer_keys,  # type: ignore
                         search_range,
                         pin,
                     )
-                    # Only all layers are hit and hit in one location,
-                    # we consider this key as a hit
-                    if hit_chunks == self.num_layers and len(block_mapping) == 1:
-                        if pin:
-                            assert lookup_id is not None, (
-                                "lookup_id is required when pin is True"
-                            )
-                            location = next(iter(block_mapping.keys()))
-                            self.lookup_pins[lookup_id][location].extend(key_all_layers)
+                    if pin and block_mapping:
+                        assert lookup_id is not None, (
+                            "lookup_id is required when pin is True"
+                        )
+                        # Record all layer keys per hit chunk so downstream
+                        # batched_get sees every layer, not just layer 0.
+                        idx = 0
+                        for location, hit_first_keys in block_mapping.items():
+                            for _ in hit_first_keys:
+                                chunk_key = chunk_info_list[idx][2]
+                                self.lookup_pins[lookup_id][location].extend(
+                                    chunk_key.split_layers(self.num_layers)
+                                )
+                                idx += 1
+                    for idx, (start, end, key) in enumerate(chunk_info_list):
+                        if idx >= hit_chunks:
+                            return res
                         res = end
-                        continue
-                    return res
+                else:
+                    for start, end, key in chunk_info_iterator:
+                        assert isinstance(key, CacheEngineKey)
+                        key_all_layers = key.split_layers(self.num_layers)
+
+                        (
+                            hit_layers,
+                            block_mapping,
+                        ) = self.storage_manager.batched_contains(
+                            key_all_layers,  # type: ignore
+                            search_range,
+                            pin,
+                        )
+                        # A layerwise chunk is counted as a hit only when all
+                        # layers are present in one location.
+                        if hit_layers == self.num_layers and len(block_mapping) == 1:
+                            if pin:
+                                assert lookup_id is not None, (
+                                    "lookup_id is required when pin is True"
+                                )
+                                location = next(iter(block_mapping.keys()))
+                                self.lookup_pins[lookup_id][location].extend(
+                                    key_all_layers
+                                )
+                            res = end
+                            continue
+                        return res
             else:
                 chunk_info_list = []
                 keys = []

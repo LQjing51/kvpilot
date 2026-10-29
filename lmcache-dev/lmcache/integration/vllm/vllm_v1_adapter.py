@@ -93,6 +93,15 @@ class DisaggSpec:
 tmp_disagg_tracker: dict[str, DisaggSpec] = {}
 
 
+
+def _truthy_env_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).lower() in {"1", "true", "yes", "on"}
+
+
 def extract_request_configs(sampling_params: SamplingParams) -> Optional[dict]:
     request_configs = None
     if sampling_params and sampling_params.extra_args is not None:
@@ -508,6 +517,54 @@ class LMCacheConnectorV1Impl:
                             config_key,
                         )
 
+            enable_mooncake_cpu_backend = _truthy_env_value(
+                os.getenv("ENABLE_MOONCAKE_CPU_BACKEND", "0")
+            )
+            enable_local_mooncake_hbm = _truthy_env_value(
+                os.getenv("ENABLE_LOCAL_MOONCAKE_HBM", "0")
+            )
+            enable_shm_mooncake_hbm = _truthy_env_value(
+                os.getenv("ENABLE_SHM_MOONCAKE_HBM", "0")
+            )
+            if enable_local_mooncake_hbm and not enable_mooncake_cpu_backend:
+                raise RuntimeError(
+                    "ENABLE_LOCAL_MOONCAKE_HBM requires "
+                    "ENABLE_MOONCAKE_CPU_BACKEND"
+                )
+            if enable_shm_mooncake_hbm and not enable_local_mooncake_hbm:
+                raise RuntimeError(
+                    "ENABLE_SHM_MOONCAKE_HBM requires ENABLE_MOONCAKE_CPU_BACKEND "
+                    "and ENABLE_LOCAL_MOONCAKE_HBM"
+                )
+
+            if enable_shm_mooncake_hbm:
+                parallel_config = vllm_config.parallel_config
+                tp_size = max(1, int(parallel_config.tensor_parallel_size))
+                pp_size = max(1, int(parallel_config.pipeline_parallel_size))
+                rank = int(parallel_config.rank)
+                extra_config = dict(config.extra_config or {})
+                extra_config.update(
+                    {
+                        "mooncake_preload_expected_engines": int(
+                            os.getenv("MOONCAKE_PRELOAD_EXPECTED_ENGINES", "1")
+                        ),
+                        "mooncake_preload_rank": rank,
+                        "mooncake_preload_world_size": int(parallel_config.world_size),
+                        "mooncake_preload_tp_size": tp_size,
+                        "mooncake_preload_tp_rank": rank % tp_size,
+                        "mooncake_preload_pp_size": pp_size,
+                        "mooncake_preload_pp_rank": (rank // tp_size) % pp_size,
+                        "mooncake_preload_engine_id": getattr(
+                            vllm_config.kv_transfer_config, "engine_id", ""
+                        ),
+                    }
+                )
+                config.extra_config = extra_config
+                logger.info(
+                    "Configured Mooncake shared-memory preload topo: %s",
+                    {k: extra_config[k] for k in extra_config if k.startswith("mooncake_preload")},
+                )
+
     def _init_connector_state(
         self,
         role: KVConnectorRole,
@@ -826,6 +883,8 @@ class LMCacheConnectorV1Impl:
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
+                        request_configs=request.request_configs,
+                        req_id=request.req_id,
                     )
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)

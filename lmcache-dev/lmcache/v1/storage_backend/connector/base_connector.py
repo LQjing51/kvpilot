@@ -3,6 +3,7 @@
 from typing import List, Optional
 import abc
 import asyncio
+import os
 
 # Third Party
 import torch
@@ -17,6 +18,16 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.protocol import get_remote_metadata_bytes, init_remote_metadata_info
 
 logger = init_logger(__name__)
+
+TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).lower() in TRUE_ENV_VALUES
 
 
 def NotAudit(func):
@@ -50,12 +61,12 @@ class RemoteConnector(metaclass=abc.ABCMeta):
             config: the lmcache engine config
             metadata: the lmcache engine metadata
         """
-        # TODO(chunxiaozheng): support layerwise here
         assert metadata is not None
+        enable_mooncake_cpu_backend = _truthy(os.getenv("ENABLE_MOONCAKE_CPU_BACKEND", "0"))
         self.save_chunk_meta: bool = (
             config.extra_config is None
             or config.extra_config.get("save_chunk_meta", True)
-            or config.use_layerwise
+            or (config.use_layerwise and not enable_mooncake_cpu_backend)
         )
         self.meta_shapes: list[torch.Size] = metadata.get_shapes()
         self.meta_dtypes: list[torch.dtype] = metadata.get_dtypes()
@@ -90,42 +101,39 @@ class RemoteConnector(metaclass=abc.ABCMeta):
     ) -> MemoryObj:
         assert self.full_chunk_size_bytes is not None
         assert self.single_token_size is not None
-        if (
-            bytes_read == 0
-            or bytes_read % self.single_token_size != 0
-            or bytes_read > self.full_chunk_size_bytes
-        ):
-            raise ValueError(
-                f"bytes_read: {bytes_read} is illegal, "
-                f"single_token_size: {self.single_token_size}, "
-                f"full_chunk_size_bytes: {self.full_chunk_size_bytes}"
-            )
-
-        if bytes_read == self.full_chunk_size_bytes:
-            # full chunk, return directly
-            return memory_obj
-
-        # NOTE: for unfull chunk, we have no way to verify
         shape_list = list(memory_obj.meta.shape)
         if len(shape_list) == 4:
             # Standard: [2, num_layers, num_tokens, hidden_dim]
             # or MLA:   [1, num_layers, num_tokens, hidden_dim]
             token_dim = 2
-            num_tokens = bytes_read // self.single_token_size
+            token_size = self.single_token_size
         else:
             # Layerwise 3D: [num_tokens, 2, hidden_dim]
             # Layerwise MLA 2D: [num_tokens, hidden_dim]
             token_dim = 0
-            # single_token_size spans ALL layers, but bytes_read is
-            # for a single layer.  Compute per-layer token size from
-            # the non-token dimensions of the shape.
             elements_per_token = 1
             for i in range(1, len(shape_list)):
                 elements_per_token *= shape_list[i]
             assert memory_obj.meta.dtype is not None
-            dtype_size = memory_obj.meta.dtype.itemsize
-            per_layer_token_size = elements_per_token * dtype_size
-            num_tokens = bytes_read // per_layer_token_size
+            token_size = elements_per_token * memory_obj.meta.dtype.itemsize
+
+        full_size_bytes = memory_obj.get_size()
+        if (
+            bytes_read == 0
+            or bytes_read % token_size != 0
+            or bytes_read > full_size_bytes
+        ):
+            raise ValueError(
+                f"bytes_read: {bytes_read} is illegal, "
+                f"token_size: {token_size}, full_size_bytes: {full_size_bytes}"
+            )
+
+        if bytes_read == full_size_bytes:
+            # full chunk, return directly
+            return memory_obj
+
+        # NOTE: for unfull chunk, we have no way to verify
+        num_tokens = bytes_read // token_size
         shape_list[token_dim] = num_tokens
         actual_shape = torch.Size(shape_list)
         memory_obj.raw_data = memory_obj.raw_data[:bytes_read]
