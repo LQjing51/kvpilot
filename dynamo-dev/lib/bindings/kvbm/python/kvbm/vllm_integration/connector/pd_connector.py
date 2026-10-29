@@ -162,32 +162,32 @@ class PdConnector(MultiConnector):
     # Scheduler-side methods
     # ==============================
 
-    def get_num_new_matched_tokens(
-        self,
-        request: "Request",
-        num_computed_tokens: int,
-    ) -> tuple[int, bool]:
-        """
-        Get the number of matched tokens for the request using Dynamo Connector (KVBM).
-        """
-        return self._connectors[0].get_num_new_matched_tokens(
-            request, num_computed_tokens
-        )
+    # def get_num_new_matched_tokens(
+    #     self,
+    #     request: "Request",
+    #     num_computed_tokens: int,
+    # ) -> tuple[int, bool]:
+    #     """
+    #     Get the number of matched tokens for the request using Dynamo Connector (KVBM).
+    #     """
+    #     return self._connectors[0].get_num_new_matched_tokens(
+    #         request, num_computed_tokens
+    #     )
 
-    def update_state_after_alloc(
-        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
-    ):
-        """
-        Update the state after allocation using Dynamo Connector (KVBM) and Nixl Connector.
-        """
-        empty_blocks = blocks.new_empty()
-        # allocate blocks for KV offloading connector to onboard KV blocks
-        self._connectors[0].update_state_after_alloc(
-            request, blocks, num_external_tokens
-        )
-        # no need to allocate any blocks for NIXL connector since this is in prefill worker side
-        # and it only needs to wait for decode worker to pull its data.
-        self._connectors[1].update_state_after_alloc(request, empty_blocks, 0)
+    # def update_state_after_alloc(
+    #     self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
+    # ):
+    #     """
+    #     Update the state after allocation using Dynamo Connector (KVBM) and Nixl Connector.
+    #     """
+    #     empty_blocks = blocks.new_empty()
+    #     # allocate blocks for KV offloading connector to onboard KV blocks
+    #     self._connectors[0].update_state_after_alloc(
+    #         request, blocks, num_external_tokens
+    #     )
+    #     # no need to allocate any blocks for NIXL connector since this is in prefill worker side
+    #     # and it only needs to wait for decode worker to pull its data.
+    #     self._connectors[1].update_state_after_alloc(request, empty_blocks, 0)
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

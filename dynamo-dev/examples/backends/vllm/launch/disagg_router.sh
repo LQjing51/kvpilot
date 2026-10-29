@@ -11,7 +11,7 @@ source "$SCRIPT_DIR/../../../common/launch_utils.sh"
 export PYTHONHASHSEED=0
 
 # Common configuration
-MODEL="Qwen/Qwen3-0.6B"
+MODEL="/cfs_cloud_code/kiry/model/Qwen/Qwen3-30B-A3B-Instruct-2507"
 BLOCK_SIZE=64
 
 HTTP_PORT="${DYN_HTTP_PORT:-8000}"

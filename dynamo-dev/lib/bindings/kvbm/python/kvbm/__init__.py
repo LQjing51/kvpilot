@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Extend the package path before importing any lmcache module
+from pkgutil import extend_path  # isort:skip
+__path__ = extend_path(__path__, __name__)
+
 # flake8: noqa
 import logging
 

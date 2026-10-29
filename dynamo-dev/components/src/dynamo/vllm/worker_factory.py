@@ -47,6 +47,12 @@ from .publisher import StatLoggerFactory
 
 logger = logging.getLogger(__name__)
 
+
+def _kvpilot_online() -> bool:
+    return os.environ.get("KVPILOT_ONLINE_DRAM_SAFE", "").lower() in (
+        "1", "true", "yes", "on"
+    )
+
 # (engine_client, vllm_config, default_sampling_params, prometheus_temp_dir, component_gauges)
 # component_gauges is None on the embedding-worker path: pooling engines
 # have no KV cache / scheduler gauges, so setup_vllm_engine() skips the
@@ -469,6 +475,14 @@ class WorkerFactory:
         encode_worker_client = await self._maybe_get_encode_worker_client(
             runtime, config
         )
+        # Client for reporting dram-safe verdicts back to the prefill worker.
+        prefill_feedback_client = (
+            await runtime.endpoint(
+                f"{config.namespace}.prefill.kvpilot_feedback"
+            ).client()
+            if _kvpilot_online()
+            else None
+        )
 
         handler = DecodeWorkerHandler(
             runtime,
@@ -483,6 +497,7 @@ class WorkerFactory:
             shutdown_event=shutdown_event,
             enable_frontend_decoding=config.frontend_decoding,
             encode_worker_client=encode_worker_client,
+            prefill_feedback_client=prefill_feedback_client,
         )
         handler.add_temp_dir(prometheus_temp_dir)
 
@@ -677,6 +692,13 @@ class WorkerFactory:
         clear_endpoint = runtime.endpoint(
             f"{config.namespace}.{config.component}.clear_kv_blocks"
         )
+        kvpilot_endpoint = (
+            runtime.endpoint(
+                f"{config.namespace}.{config.component}.kvpilot_feedback"
+            )
+            if _kvpilot_online()
+            else None
+        )
         rl_endpoint = (
             runtime.endpoint(f"{config.namespace}.{config.component}.rl")
             if config.enable_rl
@@ -869,6 +891,13 @@ class WorkerFactory:
                 serve_tasks.append(
                     rl_endpoint.serve_endpoint(
                         handler.rl_dispatch,
+                        metrics_labels=prefill_metrics_labels,
+                    )
+                )
+            if kvpilot_endpoint is not None:
+                serve_tasks.append(
+                    kvpilot_endpoint.serve_endpoint(
+                        handler.kvpilot_feedback,
                         metrics_labels=prefill_metrics_labels,
                     )
                 )

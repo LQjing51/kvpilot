@@ -99,6 +99,7 @@ from dynamo.vllm.kv_connector_protocols import (
 from .args import Config
 from .constants import DisaggregationMode, EmbeddingTransferMode
 from .engine_monitor import VllmEngineMonitor
+from .kvpilot import KvpilotReporter
 from .multimodal_utils.hash_utils import compute_mm_uuids_from_images
 from .multimodal_utils.model import (
     ModelFamily,
@@ -772,6 +773,15 @@ def build_sampling_params(
                 )
             sampling_params._bad_words_token_ids = value
             continue
+        if key == "forced_output_tokens" and value:
+            # Read by vLLM's ForcedOutputTokensLogitsProcessor out of
+            # extra_args, so it is not a SamplingParams attribute. The length is
+            # pinned further down, after stop_conditions and the max_tokens
+            # default have had their say.
+            if sampling_params.extra_args is None:
+                sampling_params.extra_args = {}
+            sampling_params.extra_args["forced_output_tokens"] = value
+            continue
         if value is not None and hasattr(sampling_params, key):
             setattr(sampling_params, key, value)
 
@@ -840,6 +850,15 @@ def build_sampling_params(
     # bridge pressure before chunks cross into Dynamo.
     sampling_params.detokenize = False
     sampling_params.output_kind = _DELTA_REQUEST_OUTPUT_KIND
+
+    # Forced output must emit exactly the supplied sequence, so pin the length
+    # last: an earlier stop_conditions value or max_tokens default would
+    # otherwise truncate it.
+    forced = (sampling_params.extra_args or {}).get("forced_output_tokens")
+    if forced:
+        sampling_params.min_tokens = len(forced)
+        sampling_params.max_tokens = len(forced)
+        sampling_params.ignore_eos = True
 
     return sampling_params
 
@@ -1909,6 +1928,27 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 yield {"status": "error", "message": "KV cache reset failed"}
                 return
             yield {"status": "success", "message": "KV cache cleared"}
+        except Exception as e:
+            yield {"status": "error", "message": str(e)}
+
+    async def kvpilot_feedback(self, request=None):
+        """Re-tier the blocks a decode-side dram-safe verdict names."""
+        request_id = (request or {}).get("remote_request_id")
+        if request_id is None:
+            yield {"status": "error", "message": "remote_request_id is required"}
+            return
+        try:
+            dram_safe = bool(request.get("dram_safe"))
+            moved = await self.engine_client.kvpilot_apply_label(
+                request_id, dram_safe
+            )
+            # moved == 0 means the verdict found no blocks to re-tier: the
+            # request was never tracked, or its blocks were refilled since.
+            logger.info(
+                f"KVPilot feedback applied remote_request_id={request_id} "
+                f"dram_safe={dram_safe} moved={moved}"
+            )
+            yield {"status": "success", "moved": moved}
         except Exception as e:
             yield {"status": "error", "message": str(e)}
 
@@ -3247,6 +3287,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         shutdown_event: asyncio.Event | None = None,
         enable_frontend_decoding: bool = False,
         encode_worker_client: Client | None = None,
+        prefill_feedback_client: Client | None = None,
     ):
         super().__init__(
             runtime,
@@ -3261,6 +3302,11 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             shutdown_event=shutdown_event,
             enable_frontend_decoding=enable_frontend_decoding,
             encode_worker_client=encode_worker_client,
+        )
+        self._kvpilot = (
+            KvpilotReporter(getattr(engine, "tokenizer", None), prefill_feedback_client)
+            if prefill_feedback_client is not None
+            else None
         )
 
     async def generate(self, request, context):
@@ -3483,6 +3529,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 )
                 accumulated_token_ids: dict[int, list[int]] = {}
                 accumulated_log_probs: dict[int, list[float]] = {}
+                want_kvpilot = self._kvpilot is not None and kv_params is not None
                 try:
                     async for tok in self.generate_tokens(
                         prompt,
@@ -3503,7 +3550,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                                 "prompt_tokens_details"
                             ] = prefill_prompt_tokens_details
 
-                        if want_engine_data:
+                        if want_engine_data or want_kvpilot:
                             _accumulate_engine_data(
                                 tok,
                                 request_prompt_token_ids,
@@ -3511,6 +3558,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                                 accumulated_log_probs,
                             )
                         yield tok
+                    if want_kvpilot:
+                        await self._kvpilot.report(
+                            kv_params, request, accumulated_token_ids
+                        )
                 except EngineDeadError as e:
                     logger.error(f"vLLM EngineDeadError: {e}")
                     logger.warning("Initiating Dynamo Runtime shutdown.")
@@ -3736,6 +3787,9 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         # Override for prefill: only generate 1 token
         sampling_params.max_tokens = 1
         sampling_params.min_tokens = 1
+        # Prefill's single token is discarded, so forcing it would only pin
+        # max_tokens to the decode-length sequence.
+        sampling_params.extra_args.pop("forced_output_tokens", None)
 
         # Extract LoRA request if present
         model_name = request.get("model")

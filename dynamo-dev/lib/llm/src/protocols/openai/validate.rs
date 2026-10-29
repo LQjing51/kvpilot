@@ -108,6 +108,7 @@ pub const PASSTHROUGH_EXTRA_FIELDS: &[&str] = &[
     "detokenize",
     "allowed_token_ids",
     "bad_words_token_ids",
+    "forced_output_tokens",
 ];
 
 static IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS: LazyLock<bool> =
@@ -161,6 +162,10 @@ fn validate_no_unsupported_fields_with_ignore(
         serde_json::from_value::<Vec<Vec<crate::types::TokenIdType>>>(value.clone()).map_err(
             |_| anyhow::anyhow!("`bad_words_token_ids` must be an array of token ID arrays"),
         )?;
+    }
+    if let Some(value) = unsupported_fields.get("forced_output_tokens") {
+        serde_json::from_value::<Vec<crate::types::TokenIdType>>(value.clone())
+            .map_err(|_| anyhow::anyhow!("`forced_output_tokens` must be an array of token IDs"))?;
     }
     Ok(())
 }
@@ -837,5 +842,18 @@ mod tests {
         let err =
             validate_no_unsupported_fields_with_ignore(&unsupported_fields, true).unwrap_err();
         assert!(err.to_string().contains("stop_token_ids"));
+    }
+
+    #[test]
+    fn validate_no_unsupported_fields_accepts_forced_output_tokens() {
+        let fields = HashMap::from([("forced_output_tokens".to_string(), json!([1, 2, 3]))]);
+        validate_no_unsupported_fields_with_ignore(&fields, false).unwrap();
+    }
+
+    #[test]
+    fn validate_no_unsupported_fields_rejects_malformed_forced_output_tokens() {
+        let fields = HashMap::from([("forced_output_tokens".to_string(), json!("nope"))]);
+        let err = validate_no_unsupported_fields_with_ignore(&fields, false).unwrap_err();
+        assert!(err.to_string().contains("forced_output_tokens"));
     }
 }
