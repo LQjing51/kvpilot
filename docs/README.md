@@ -12,17 +12,18 @@
 |---|---|
 | 理解项目在解决什么问题、成本模型怎么来的 | [concepts.md](concepts.md) |
 | 起服务、跑压测、调压力参数、nsys / 时区 | [benchmark.md](benchmark.md) |
+| GPU 机器重新分配后恢复环境（同步 + 编译） | [gpu-restore.md](gpu-restore.md) |
 | 搞清楚请求是怎么发出去的、chat template 归谁套 | [request-paths.md](request-paths.md) |
 | 处理 agent trace、跑离线验证、生成查表 | [datasets.md](datasets.md) |
 | 改 KV placement / eviction 代码 | [kv-placement.md](kv-placement.md) |
-| 量测 load 阻塞、HBM 分布、TTFT 拆解 | [observability.md](observability.md) |
+| 量测 exposed load（`gpu_stall`）、HBM 分布 | [observability.md](observability.md) |
 | 碰到反直觉的现象，怀疑踩坑了 | [pitfalls.md](pitfalls.md) |
-| 看已经跑过的实验（六个配置的 exposed load / TTFT / 池子分布） | [evalution/demo_test_results.md](evalution/demo_test_results.md) |
+| 做论文图：目录怎么存才能复现、OSDI 画图风格 | [evalution/figure-guidelines.md](evalution/figure-guidelines.md) |
 | 找飞书设计文档 | [references.md](references.md) |
 
 **环境变量没有单独的文档**：每个开关记在它所控制的功能那一篇里，因为开关的含义离开
 功能上下文就不成立，分开写必然会和实现漂移。找不到某个变量时按功能归属去翻——
-placement 类（`KVPILOT_*DRAM_SAFE` / `KVPILOT_MACHINE` / `KVPILOT_TOOL_RESP_LEN_PATH`）
+placement 类（`KVPILOT_PLACEMENT` / `KVPILOT_ONLINE_PREDICT` / `KVPILOT_OFFLINE_TABLE` 等）
 在 [kv-placement.md](kv-placement.md)，观测类（`GET_HBM_POOL_DISTRIBUTION` /
 `KVPILOT_LOAD_STALL`）在 [observability.md](observability.md)，其余（加载路径、nsys、
 `TZ`、worker 数）在 [benchmark.md](benchmark.md)。
@@ -37,8 +38,11 @@ kvpilot/
 ├── dynamo-dev/       Dynamo fork，分支 1.3.1   ← PD 分离编排、KV router
 ├── datasets/
 │   ├── mooncake-trace/           conversation_trace_turn4_half.jsonl
-│   └── agent-traces/
-│       └── swe-smith-trajectories/   SWE-smith agent 轨迹 + 预处理与验证脚本
+│   ├── agent-traces/             每个子目录：原始 trace + 预处理脚本 + Mooncake 格式 trace
+│   │   ├── tracelab/
+│   │   └── swe-smith-trajectories/
+│   ├── req-priority-trace/       请求粒度优先级 A/B 用的 30 分钟 trace（SWE / TraceLab）与生成脚本
+│   └── block-priority-trace/     按块放置 / exclusive 的 A/B trace（blockwise 下 HBM、DRAM 也满）与生成脚本
 ├── utils/            作图脚本与产出的图（见下）
 └── docs/             本目录
 ```
@@ -69,37 +73,35 @@ kvpilot/
 |---|---|
 | `plot_context_time.py` | 时间常数推导与作图（a/b/c 常数的单一来源），产出 `context_time.pdf` |
 | `plot_hbm_pool_distribution.py` | HBM block 分布二维直方图（`--pdf-output` 出图，`--output-file` 出文本热力图，`--csv-output` 出网格），见 [observability.md](observability.md) |
-| `plot_load_stall.py` | 每次 prefill/forward 的 load 阻塞，产出 `load_stall.pdf` |
-
 **跑实验与分析**（`run_demo.sh` / `plot_pools.sh` 在 GPU 机器上跑，其余本机可跑）
 
 | 文件 | 作用 |
 |---|---|
 | `run_demo.sh` | 一轮实验的完整流程：clean → 等显存 → setup → **自查跑的是仓库代码** → benchmark → clean。配置全走环境变量 |
 | `plot_pools.sh` | 批量出池子分布图，并校验产出真是 PDF（`head -c 4` 是否 `%PDF`） |
-| `stall_share.py` | 把 load-stall 日志聚合成 exposed load 占比，带自洽检查 |
-| `compare_runs.py` | 两轮的 token / stall 分解对比（谁在加载、加载多少、每 1k token 多贵） |
 | `compare_workload.py` | 两轮跑的是不是同一套请求：集合重合、顺序、发送时刻 |
-| `label_diagnostics.py` | 实测 dram-safe 标签能不能学，四个子命令：`signal` / `overhead` / `noise` / `denominator` |
+| `ssd_load_check/` | SSD 逐层加载：C++ loader 的逐字节正确性检查与带宽测试（`test_loader.py`），以及同一 prompt 分别从 HBM / DRAM / SSD 加载的端到端对比（`run.sh` + `analyze.py`） |
+| `trace_order/` | 把 SWE / TraceLab 重排成跨 session 轮转（session 内保序），让复用落到 DRAM / SSD：离线三层命中模型（`tier_sim.py`）、重排（`make_order.py`，含按 KV 预算并发、结束一个补一个的 `--align budget`）、1P1D 回放（`run.sh`）、从 prefill 日志统计逐层命中（`tier_hits.py`） |
+| `trace_select/` | 从全量 SWE 挑整条 session，让 HBM safe : DRAM safe ≈ 1:2（`select_safe_mix.py`，按 request-safe 实测的经验概率估计，不需要 GPU） |
+| `h2d_bw/` | 多卡同时从 DRAM 做 H2D 时每卡的带宽（`h2d_bw.py`，每卡一个进程，pinned + `cudaMemcpyBatchAsync`，不起服务）。2026-11-11 实测单卡 57.6 GB/s；共用 PCIe host bridge 的 GPU 1/2、6/7 同时读各降到 36.6；8 卡本地 NUMA 合计 376 GB/s。结果在 `run.out` |
 
 **产出**
 
 | 文件 | 作用 |
 |---|---|
 | `context_time.pdf` | 成本模型的曲线图 |
-| `load_stall.pdf` | load 阻塞六联图 |
 | `kv_replicate.{pdf,png,svg}` | KV 副本示意图（slides 用） |
 
 `plot_context_time.py` 把 PDF 写在**脚本自己所在目录**，所以移动脚本时 PDF 的落点
-会跟着走。另外两个脚本的输出路径由命令行参数给。
+会跟着走。`plot_hbm_pool_distribution.py` 的输出路径由命令行参数给。
 
 **出图只产 PDF，不产 PNG**（`kv_replicate.{png,svg}` 是 slides 用的素材，不是脚本产出）。
 自己要看图就在 `/tmp` 下渲一份临时的，别放在交付目录旁边。GPU 机器上没有 `pdftoppm` /
 `convert`，要看图得改 `savefig` 落到 `/tmp/*.png` 再取回来。
 
-**本机没装 matplotlib**，作图要在 GPU 机器上跑，见 [benchmark.md](benchmark.md) 的
-「同步代码到 GPU 机器」一节。分析脚本（`stall_share` / `compare_*` / `label_diagnostics`）
-只用标准库，本机可以直接跑。
+**作图在本机跑**：本机 python3 有 matplotlib 3.9；反过来 **GPU 机器上没有 matplotlib**。
+本机看 PDF 用 `qlmanage -t -s 1600 -o /tmp x.pdf` 渲成 PNG。分析脚本（`compare_workload`
+和各实验目录下的 `analyze.py`）只用标准库，两边都能跑。
 
 `run_demo.sh` 和 `plot_pools.sh` 通过 `KVPILOT_ROOT` 定位仓库，默认取脚本自身的上级目录，
 找不到再退回 `/root/kvpilot`。**`scp` 到 GPU 机器不通**，传单个文件用

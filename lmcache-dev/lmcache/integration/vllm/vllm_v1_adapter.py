@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import math
@@ -38,6 +39,7 @@ from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
+from lmcache.v1 import kvpilot_cache_use, kvpilot_exclusive, kvpilot_placement
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
@@ -94,12 +96,12 @@ tmp_disagg_tracker: dict[str, DisaggSpec] = {}
 
 
 
-def _truthy_env_value(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).lower() in {"1", "true", "yes", "on"}
+def _kvpilot_send_order(backend, chunk_hashes: list, seq: int) -> None:
+    """Background: a request's release order to the Mooncake master."""
+    try:
+        kvpilot_placement.set_order(backend, chunk_hashes, seq)
+    except Exception:
+        logger.exception("KVPilot release order seq=%d failed", seq)
 
 
 def extract_request_configs(sampling_params: SamplingParams) -> Optional[dict]:
@@ -301,6 +303,9 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    # KVPilot exclusive unblocking: HBM blocks lent to this request's load,
+    # whose KV goes to DRAM first (vllm/v1/core/kvpilot_exclusive.py lend()).
+    kvpilot_evict: Optional[dict] = None
 
     @staticmethod
     def from_request_tracker(
@@ -446,6 +451,13 @@ class ReqMeta:
 @dataclass
 class LMCacheConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta] = field(default_factory=list)
+    # KVPilot exclusive placement: deferred write / drop jobs for the workers
+    # (lmcache.v1.kvpilot_exclusive).
+    kvx_jobs: list[dict] = field(default_factory=list)
+    # KVPilot, every strategy: (chunk hashes, release sequence number) of the
+    # requests freed since the last step, for the Mooncake master's tail-first
+    # eviction (kvpilot_placement.set_order; rank 0 sends them).
+    kvx_order: list[tuple[list, int]] = field(default_factory=list)
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -517,53 +529,34 @@ class LMCacheConnectorV1Impl:
                             config_key,
                         )
 
-            enable_mooncake_cpu_backend = _truthy_env_value(
-                os.getenv("ENABLE_MOONCAKE_CPU_BACKEND", "0")
+            # KVPilot: Mooncake segments are shared memory; every same-host
+            # prefill worker maps the others' (mooncakestore_connector).
+            parallel_config = vllm_config.parallel_config
+            tp_size = max(1, int(parallel_config.tensor_parallel_size))
+            pp_size = max(1, int(parallel_config.pipeline_parallel_size))
+            rank = int(parallel_config.rank)
+            extra_config = dict(config.extra_config or {})
+            extra_config.update(
+                {
+                    "mooncake_preload_expected_engines": int(
+                        os.getenv("MOONCAKE_PRELOAD_EXPECTED_ENGINES", "1")
+                    ),
+                    "mooncake_preload_rank": rank,
+                    "mooncake_preload_world_size": int(parallel_config.world_size),
+                    "mooncake_preload_tp_size": tp_size,
+                    "mooncake_preload_tp_rank": rank % tp_size,
+                    "mooncake_preload_pp_size": pp_size,
+                    "mooncake_preload_pp_rank": (rank // tp_size) % pp_size,
+                    "mooncake_preload_engine_id": getattr(
+                        vllm_config.kv_transfer_config, "engine_id", ""
+                    ),
+                }
             )
-            enable_local_mooncake_hbm = _truthy_env_value(
-                os.getenv("ENABLE_LOCAL_MOONCAKE_HBM", "0")
+            config.extra_config = extra_config
+            logger.info(
+                "Configured Mooncake shared-memory preload topo: %s",
+                {k: extra_config[k] for k in extra_config if k.startswith("mooncake_preload")},
             )
-            enable_shm_mooncake_hbm = _truthy_env_value(
-                os.getenv("ENABLE_SHM_MOONCAKE_HBM", "0")
-            )
-            if enable_local_mooncake_hbm and not enable_mooncake_cpu_backend:
-                raise RuntimeError(
-                    "ENABLE_LOCAL_MOONCAKE_HBM requires "
-                    "ENABLE_MOONCAKE_CPU_BACKEND"
-                )
-            if enable_shm_mooncake_hbm and not enable_local_mooncake_hbm:
-                raise RuntimeError(
-                    "ENABLE_SHM_MOONCAKE_HBM requires ENABLE_MOONCAKE_CPU_BACKEND "
-                    "and ENABLE_LOCAL_MOONCAKE_HBM"
-                )
-
-            if enable_shm_mooncake_hbm:
-                parallel_config = vllm_config.parallel_config
-                tp_size = max(1, int(parallel_config.tensor_parallel_size))
-                pp_size = max(1, int(parallel_config.pipeline_parallel_size))
-                rank = int(parallel_config.rank)
-                extra_config = dict(config.extra_config or {})
-                extra_config.update(
-                    {
-                        "mooncake_preload_expected_engines": int(
-                            os.getenv("MOONCAKE_PRELOAD_EXPECTED_ENGINES", "1")
-                        ),
-                        "mooncake_preload_rank": rank,
-                        "mooncake_preload_world_size": int(parallel_config.world_size),
-                        "mooncake_preload_tp_size": tp_size,
-                        "mooncake_preload_tp_rank": rank % tp_size,
-                        "mooncake_preload_pp_size": pp_size,
-                        "mooncake_preload_pp_rank": (rank // tp_size) % pp_size,
-                        "mooncake_preload_engine_id": getattr(
-                            vllm_config.kv_transfer_config, "engine_id", ""
-                        ),
-                    }
-                )
-                config.extra_config = extra_config
-                logger.info(
-                    "Configured Mooncake shared-memory preload topo: %s",
-                    {k: extra_config[k] for k in extra_config if k.startswith("mooncake_preload")},
-                )
 
     def _init_connector_state(
         self,
@@ -628,6 +621,21 @@ class LMCacheConnectorV1Impl:
         self.current_layer = 0
 
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
+        # Exclusive placement: a prefill writes nothing below HBM; the
+        # scheduler sends deferred writes once the next turn's tier is known.
+        self._kvx_enabled = kvpilot_placement.exclusive()
+        self.force_skip_save = self.force_skip_save or self._kvx_enabled
+        self._kvx_outbox: list[dict] = []
+        self._kvx_writer: Optional[kvpilot_exclusive.ExclusiveWriter] = None
+        # Unblocking: request id -> blocks lent to its load (scheduler side);
+        # the worker side writes them out with an Evictor.
+        self._kvx_evict: dict[str, dict] = {}
+        self._kvx_evictor: Optional[kvpilot_exclusive.Evictor] = None
+        # Release order for the Mooncake master: queued on the scheduler side,
+        # sent by rank 0's worker off the forward thread.
+        self._kvx_order: list[tuple[list, int]] = []
+        self._kvx_order_seq = 0
+        self._kvx_order_pool: Optional[ThreadPoolExecutor] = None
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
 
@@ -669,6 +677,72 @@ class LMCacheConnectorV1Impl:
     def lookup_client(self) -> Optional["LookupClientInterface"]:
         """Get the lookup client from manager."""
         return self._manager.lookup_client
+
+    def kvpilot_set_group_placement(
+        self,
+        chunk_hashes: list[int],
+        tiers: list[Optional[str]],
+        penalties: list[float],
+    ) -> int:
+        """KVPilot (scheduler side): set chunk groups' tier and penalty on the
+        Mooncake master (see kvpilot_placement).
+
+        Args:
+            chunk_hashes: One per chunk.
+            tiers: Tier per chunk (None = no session needs it).
+            penalties: Penalty (ms) per chunk.
+
+        Returns:
+            Chunk groups the Mooncake master updated.
+        """
+        return self.lookup_client.kvpilot_set_group_placement(
+            chunk_hashes, tiers, penalties
+        )
+
+    def kvpilot_chunk_hashes(
+        self, request_id: str, token_ids: list[int], n: int
+    ) -> Optional[list[int]]:
+        """KVPilot placement (scheduler side): chunk hashes of the first `n`
+        full prompt chunks, from the request's lookup when cached.
+
+        Args:
+            request_id: The prefill request id (its lookup id).
+            token_ids: The prompt tokens, used when the lookup is gone.
+            n: Number of full chunks wanted.
+
+        Returns:
+            The hashes, or None if the prompt has fewer full chunks.
+        """
+        return self.lookup_client.kvpilot_chunk_hashes(request_id, token_ids, n)
+
+    def kvpilot_exclusive_submit(self, job: dict) -> None:
+        """KVPilot exclusive placement (scheduler side): send `job` to every
+        worker with the next step's metadata."""
+        self._kvx_outbox.append(job)
+
+    def kvpilot_group_order(self, chunk_hashes: list) -> None:
+        """KVPilot (scheduler side): a request released these full prompt
+        chunks, head first. The Mooncake master evicts each request's chunks
+        from its tail and older releases first (kvpilot_placement.set_order).
+
+        Args:
+            chunk_hashes: LMCache chunk hashes of the request's full prompt
+                chunks, in prompt order.
+        """
+        self._kvx_order_seq += 1
+        self._kvx_order.append((list(chunk_hashes), self._kvx_order_seq))
+
+    def kvpilot_exclusive_evict(self, request_id: str, evict: dict) -> None:
+        """KVPilot exclusive unblocking (scheduler side): HBM blocks lent to
+        `request_id`'s load, scheduled this step; its ReqMeta carries them to
+        the workers, which write their KV to DRAM before the load overwrites
+        it.
+
+        Args:
+            request_id: The request being admitted.
+            evict: "hashes" (LMCache chunk hashes), "block_ids", "dram_pen".
+        """
+        self._kvx_evict[request_id] = evict
 
     @property
     def lookup_server(self):
@@ -819,6 +893,27 @@ class LMCacheConnectorV1Impl:
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
 
+        if metadata.kvx_jobs:
+            if self._kvx_writer is None:
+                assert self.lmcache_engine is not None
+                self._kvx_writer = kvpilot_exclusive.ExclusiveWriter(
+                    self.lmcache_engine, kvcaches
+                )
+            for job in metadata.kvx_jobs:
+                self._kvx_writer.submit(job)
+        if metadata.kvx_order and self.lmcache_engine.metadata.worker_id == 0:
+            if self._kvx_order_pool is None:
+                self._kvx_order_pool = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="kvpilot-order"
+                )
+            backend = dict(
+                self.lmcache_engine.storage_manager.get_active_storage_backends()
+            )["RemoteBackend"]
+            for hashes, seq in metadata.kvx_order:
+                self._kvx_order_pool.submit(
+                    _kvpilot_send_order, backend, hashes, seq
+                )
+
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
             logger.debug("In connector.start_load_kv, but the attn_metadata is None")
@@ -845,6 +940,14 @@ class LMCacheConnectorV1Impl:
 
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
+
+            evict = None
+            if request.kvpilot_evict is not None:
+                if not self.use_layerwise or self.enable_blending:
+                    raise RuntimeError("KVPilot: lent HBM blocks need the layerwise load")
+                if self._kvx_evictor is None:
+                    self._kvx_evictor = kvpilot_exclusive.Evictor(self.lmcache_engine)
+                evict = self._kvx_evictor.prepare(request.req_id, request.kvpilot_evict)
 
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
@@ -885,11 +988,14 @@ class LMCacheConnectorV1Impl:
                         sync=sync,
                         request_configs=request.request_configs,
                         req_id=request.req_id,
+                        kvpilot_evict=evict,
                     )
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
+                    if evict is not None:
+                        self._kvx_evictor.finish(evict)
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens[:lmcache_cached_tokens],
@@ -1357,6 +1463,10 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        # Exclusive placement jobs report as finished sends; the scheduler
+        # unpins their HBM blocks once every rank has reported.
+        if self._kvx_writer is not None:
+            return self._kvx_writer.take_done() or None, None
         return None, None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -1438,6 +1548,24 @@ class LMCacheConnectorV1Impl:
                 token_ids = token_ids.tolist()
 
             request_configs = extract_request_configs(request.sampling_params)
+            extra_args = request.sampling_params.extra_args or {}
+            cache_use_control = extra_args.get(kvpilot_cache_use.EXTRA_ARGS_KEY)
+            cache_use_max = extra_args.get(kvpilot_cache_use.MAX_TOKENS_EXTRA_ARGS_KEY)
+            if (
+                cache_use_control is not None
+                or cache_use_max is not None
+                or self._kvx_enabled
+            ):
+                # Exclusive placement needs it too: the chunks HBM covers have
+                # no copy below, so the lookup must not look for one.
+                request_configs = {
+                    **(request_configs or {}),
+                    kvpilot_cache_use.HBM_TOKENS_KEY: num_computed_tokens,
+                }
+                if cache_use_control is not None:
+                    request_configs[kvpilot_cache_use.CONTROL_KEY] = cache_use_control
+                if cache_use_max is not None:
+                    request_configs[kvpilot_cache_use.MAX_TOKENS_KEY] = cache_use_max
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
@@ -1602,6 +1730,10 @@ class LMCacheConnectorV1Impl:
         force_skip_save = self.kv_role == "kv_consumer" or self.force_skip_save
 
         meta = LMCacheConnectorMetadata()
+        if self._kvx_outbox:
+            meta.kvx_jobs, self._kvx_outbox = self._kvx_outbox, []
+        if self._kvx_order:
+            meta.kvx_order, self._kvx_order = self._kvx_order, []
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
@@ -1648,8 +1780,19 @@ class LMCacheConnectorV1Impl:
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
             )
+            evict = self._kvx_evict.pop(request.req_id, None)
+            if evict is not None:
+                if req_meta is None or load_spec is None or not load_spec.can_load:
+                    raise RuntimeError(
+                        f"KVPilot: {request.req_id} lent HBM blocks but loads nothing"
+                    )
+                req_meta.kvpilot_evict = evict
             if req_meta is not None:
                 meta.add_request(req_meta)
+        if self._kvx_evict:
+            raise RuntimeError(
+                f"KVPilot: HBM blocks lent to unscheduled {list(self._kvx_evict)}"
+            )
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
 

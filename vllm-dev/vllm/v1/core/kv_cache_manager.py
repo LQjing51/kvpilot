@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-import json
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -12,8 +11,13 @@ from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, env_on
-from vllm.v1.core.kvpilot_online import OnlineDramSafe
+from vllm.v1.core import kvpilot_hbm_snapshot, kvpilot_placement
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kvpilot_belady import BeladyPlacement
+from vllm.v1.core.kvpilot_time_model import TimeModel
+from vllm.v1.core.kvpilot_exclusive import ExclusivePlacement
+from vllm.v1.core.kvpilot_inclusive import InclusivePlacement
+from vllm.v1.core.kvpilot_lru import LruPlacement
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_kind,
@@ -23,6 +27,8 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+_SAMPLE_POOL = kvpilot_hbm_snapshot.enabled()
 
 
 @dataclass
@@ -165,46 +171,49 @@ class KVCacheManager:
             )
             for group in kv_cache_config.kv_cache_groups
         )
-        self.kvpilot_trace_metadata: dict[int, dict[str, object]] = {}
-        self.kvpilot_offline = env_on("KVPILOT_OFFLINE_DRAM_SAFE")
-        self.kvpilot_online = (
-            OnlineDramSafe(self.block_pool.free_block_queue)
-            if env_on("KVPILOT_ONLINE_DRAM_SAFE")
-            else None
-        )
-        if self.kvpilot_offline:
-            metadata_path = os.getenv("KVPILOT_TRACE_METADATA_PATH")
-            if not metadata_path:
-                raise RuntimeError(
-                    "KVPILOT_TRACE_METADATA_PATH is required when "
-                    "KVPILOT_OFFLINE_DRAM_SAFE is set"
+        strategy = kvpilot_placement.strategy()
+        logger.info("KVPilot placement=%s", strategy or "lru")
+        model = None
+        if strategy in kvpilot_placement.MODEL:
+            path = os.environ["KVPILOT_TIME_COEFFS_PATH"]
+            model = TimeModel.load(path, scheduler_block_size)
+            if model.chunk != max_num_batched_tokens:
+                raise ValueError(
+                    f"{path} was fitted with chunk {model.chunk}, the scheduler "
+                    f"runs max_num_batched_tokens={max_num_batched_tokens}"
                 )
-            with open(metadata_path) as f:
-                num_trace_requests = 0
-                for request_idx, line in enumerate(f):
-                    if not line.strip():
-                        continue
-                    num_trace_requests += 1
-                    record = json.loads(line)
-                    metadata = record.get("kvpilot")
-                    if isinstance(metadata, dict):
-                        self.kvpilot_trace_metadata[request_idx] = metadata
-            if len(self.kvpilot_trace_metadata) != num_trace_requests:
-                # Unlabelled requests silently fall back to keeping every block
-                # in HBM, which changes what the run measures. Fail loudly
-                # rather than report a degraded experiment as a valid one.
-                raise RuntimeError(
-                    "KVPilot metadata is incomplete: labelled "
-                    f"{len(self.kvpilot_trace_metadata)} of "
-                    f"{num_trace_requests} requests in {metadata_path}. "
-                    "Regenerate it with build_kvpilot_trace_metadata.py so "
-                    "every trace request carries a 'kvpilot' entry."
-                )
-            logger.info(
-                "Loaded KVPilot metadata for %d requests from %s",
-                len(self.kvpilot_trace_metadata),
-                metadata_path,
+        if strategy == kvpilot_placement.EXCLUSIVE:
+            self.kvpilot = ExclusivePlacement(
+                self.block_pool, scheduler_block_size, model=model
             )
+        elif strategy in (
+            kvpilot_placement.EXCLUSIVE_UNBLOCKING, kvpilot_placement.EXCLUSIVE_BLOCKWISE
+        ):
+            # Free blocks a signal keeps: one prefill chunk.
+            self.kvpilot = ExclusivePlacement(
+                self.block_pool,
+                scheduler_block_size,
+                reserve=-(-max_num_batched_tokens // scheduler_block_size),
+                model=model,
+                blockwise=strategy == kvpilot_placement.EXCLUSIVE_BLOCKWISE,
+            )
+        elif strategy in (kvpilot_placement.INCLUSIVE, kvpilot_placement.INCLUSIVE_PENALTY):
+            self.kvpilot = InclusivePlacement(
+                self.block_pool,
+                scheduler_block_size,
+                model=model,
+                by_penalty=strategy == kvpilot_placement.INCLUSIVE_PENALTY,
+            )
+        elif strategy == kvpilot_placement.BELADY:
+            self.kvpilot = BeladyPlacement(
+                self.block_pool, scheduler_block_size,
+                os.environ["KVPILOT_BELADY_TRACE"],
+            )
+        else:
+            # LRU: only the release order, for the master's tail-first eviction.
+            self.kvpilot = LruPlacement(scheduler_block_size)
+        # Blocks the last failed allocate_slots() was short of.
+        self.kvpilot_shortfall = 0
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
@@ -262,6 +271,21 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+        # KVPilot: cache_use_max_tokens pins the reused prefix (all tiers; the
+        # DRAM side is capped in LMCache's lookup). As a list it gives one span
+        # per cache_use_control tier, in order from the start of the prompt, so
+        # HBM can serve only a leading span.
+        extra_args = (
+            request.sampling_params.extra_args or {}
+            if request.sampling_params is not None
+            else {}
+        )
+        cap = extra_args.get("cache_use_max_tokens")
+        if isinstance(cap, list):
+            tiers = extra_args.get("cache_use_control") or []
+            cap = cap[0] if tiers[:1] == [1] else 0
+        if cap is not None:
+            max_cache_hit_length = min(max_cache_hit_length, cap)
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
@@ -408,6 +432,9 @@ class KVCacheManager:
                 apply_admission_cap=True,
             )
             if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+                self.kvpilot_shortfall = (
+                    num_blocks_to_allocate - self.block_pool.get_num_free_blocks()
+                )
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -438,6 +465,7 @@ class KVCacheManager:
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         if num_blocks_to_allocate > available_blocks:
             # Cannot allocate new blocks
+            self.kvpilot_shortfall = num_blocks_to_allocate - available_blocks
             return None
 
         if (
@@ -478,6 +506,39 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
+    def kvpilot_admission_blocks(
+        self,
+        request: Request,
+        new_computed_blocks: KVCacheBlocks,
+        num_new_computed_tokens: int,
+        num_external_computed_tokens: int,
+        num_new_tokens: int,
+        num_lookahead_tokens: int = 0,
+        num_encoder_tokens: int = 0,
+    ) -> int:
+        """Free blocks `allocate_slots` (without full_sequence_must_fit) needs
+        to admit `request` for this step: its loaded prefix and its first
+        chunk. KVPilot exclusive unblocking sizes its lending by it."""
+        num_local_computed_tokens = (
+            request.num_computed_tokens + num_new_computed_tokens
+        )
+        total_computed_tokens = min(
+            num_local_computed_tokens + num_external_computed_tokens,
+            self.max_model_len,
+        )
+        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        return self.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=min(
+                num_tokens_main_model + num_lookahead_tokens, self.max_model_len
+            ),
+            new_computed_blocks=new_computed_blocks.blocks,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=num_local_computed_tokens
+            + num_external_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+        )
+
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
@@ -486,55 +547,23 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        # NOTE:
-        # Read from the request's own field rather than prefill_stats: the
-        # latter is consumed via `take_prefill_stats()` when the final output is
-        # emitted, which happens before this free on the async KV-transfer path
-        # (Scheduler._update_from_kv_xfer_finished) — i.e. always, in P/D
-        # disaggregation. The field is captured where prefill_stats is set, so
-        # it survives that hand-off.
-        kv_hit_rate = request.kvpilot_kv_hit_rate
-
-        if self.kvpilot_offline:
-            try:
-                request_idx = int(request.request_id.split("-", 1)[0])
-            except ValueError:
-                request_idx = -1
-            metadata = self.kvpilot_trace_metadata.get(request_idx, {})
-            next_safe = metadata.get("kvpilot_next_dram_safe_by_block")
-            has_block_metadata = isinstance(next_safe, list)
+        if _SAMPLE_POOL:
+            # Observability: position of each block in this request, so the
+            # census row (req_line, block_idx) joins to per-block metadata.
             for blocks in self.coordinator.get_blocks(request.request_id):
                 for block_idx, block in enumerate(blocks):
-                    if block.block_hash is None:
-                        continue
-                    if has_block_metadata:
-                        if block_idx < len(next_safe):
-                            block.kvpilot_next_dram_safe = (
-                                next_safe[block_idx] is True
-                            )
-                        else:
-                            # The final trace hash is unstable across turns
-                            # and therefore has no future reuse.
-                            block.kvpilot_next_dram_safe = True
-                    else:
-                        # Missing labels are kept in HBM conservatively.
-                        block.kvpilot_next_dram_safe = False
+                    block.kvpilot_last_req_block_idx = block_idx
+
         # coordinator.free() drops the request's block list, so capture it
         # first; track() runs after, when the blocks are queued.
-        online_blocks = (
+        blocks = (
             self.coordinator.get_blocks(request.request_id)
-            if self.kvpilot_online is not None
+            if self.kvpilot is not None
             else None
         )
-        self.coordinator.free(request.request_id, request.num_tokens, kv_hit_rate)
-        if online_blocks is not None:
-            self.kvpilot_online.track(request.request_id, online_blocks)
-
-    def kvpilot_apply_label(self, request_id: str, dram_safe: bool) -> int:
-        """Apply a decode-side dram-safe verdict to `request_id`'s blocks."""
-        if self.kvpilot_online is None:
-            return 0
-        return self.kvpilot_online.apply(request_id, dram_safe)
+        self.coordinator.free(request.request_id)
+        if blocks is not None:
+            self.kvpilot.track(request.request_id, blocks, request.prompt_token_ids)
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

@@ -9,6 +9,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1 import kvpilot_cache_use, kvpilot_placement
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
@@ -60,6 +61,10 @@ class LMCacheLookupClient(LookupClientInterface):
         # looked up, the following lookups of the same
         # request must have the same result.
         self.reqs_status: dict[str, int] = {}
+        # KVPilot: chunk hashes/lengths of each looked-up request, kept until
+        # the scheduler names its freed blocks by them (every strategy: the
+        # release order the Mooncake master evicts by needs them too).
+        self._kvp_chunks: dict[str, tuple[list, list]] = {}
 
         # First Party
         from lmcache.v1.token_database import (
@@ -113,6 +118,8 @@ class LMCacheLookupClient(LookupClientInterface):
             if not hashes:
                 return 0
 
+            self._kvp_chunks[lookup_id] = (hashes, offsets)
+
             msg_buf = [
                 hashes,
                 offsets,
@@ -159,6 +166,59 @@ class LMCacheLookupClient(LookupClientInterface):
 
     def clear_lookup_status(self, lookup_id: str) -> None:
         self.reqs_status.pop(lookup_id, None)
+
+    def kvpilot_set_group_placement(
+        self, chunk_hashes: list[int], tiers: list[Optional[str]], penalties: list[float]
+    ) -> int:
+        """Set chunk groups' tier and penalty on the Mooncake master, through
+        rank 0's lookup server (see kvpilot_placement).
+
+        Args:
+            chunk_hashes: One per chunk.
+            tiers: Tier per chunk (None = no session needs it).
+            penalties: Penalty (ms) per chunk.
+
+        Returns:
+            Number of chunk groups the master updated.
+        """
+        responses = self.transport.send_and_recv_all(
+            [chunk_hashes, tiers, penalties, "", kvpilot_placement.HINT_MARKER]
+        )
+        return max(int.from_bytes(r, "big") for r in responses)
+
+    def kvpilot_chunk_hashes(
+        self, lookup_id: str, token_ids: list[int], n: int
+    ) -> Optional[list[int]]:
+        """Chunk hashes of the first `n` full chunks of a looked-up request.
+
+        Takes the hashes this request's lookup computed (and forgets them);
+        recomputes them from `token_ids` if that lookup is gone.
+
+        Args:
+            lookup_id: The request id the lookup ran under.
+            token_ids: The tokens that lookup was given.
+            n: Number of full chunks wanted.
+
+        Returns:
+            The hashes, or None if there are fewer than `n` full chunks.
+        """
+        entry = self._kvp_chunks.pop(lookup_id, None)
+        if entry is None:
+            hashes, offsets = [], []
+            for start, end, h in self.token_database.process_tokens(
+                token_ids, make_key=False
+            ):
+                hashes.append(h)
+                offsets.append(end - start)
+        else:
+            hashes, offsets = entry
+        chunk = self.config.chunk_size
+        full = []
+        for h, length in zip(hashes, offsets, strict=False):
+            if length != chunk:
+                break
+            full.append(int(h))
+        return full[:n] if len(full) >= n else None
 
     def supports_producer_reuse(self) -> bool:
         """Return True as LMCacheLookupClient supports
@@ -233,6 +293,18 @@ class LMCacheLookupServer:
                     else:
                         request_configs_str = request_configs_bytes
 
+                    if request_configs_str == kvpilot_placement.HINT_MARKER:
+                        updated = kvpilot_placement.apply_hint(
+                            self.lmcache_engine,
+                            data_frames[0],
+                            data_frames[1],
+                            data_frames[2],
+                        )
+                        self.transport.send_response(
+                            identity, int(updated).to_bytes(4, "big")
+                        )
+                        continue
+
                     request_configs = (
                         json.loads(request_configs_str) if request_configs_str else None
                     )
@@ -246,6 +318,14 @@ class LMCacheLookupServer:
                             lookup_id=lookup_id,
                             pin=True,
                             request_configs=request_configs,
+                        )
+                        lookup_result = kvpilot_cache_use.limit_hit(
+                            self.lmcache_engine,
+                            hashes,
+                            offsets,
+                            lookup_result,
+                            request_configs,
+                            lookup_id,
                         )
                     else:
                         tokens = data_frames[0]

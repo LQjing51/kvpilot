@@ -1,12 +1,12 @@
 #!/bin/bash
-# Drive one demo_test.md experiment end to end: clean, wait for GPU memory,
-# setup, verify the repo code is actually live, benchmark, clean. Configuration
-# comes from the environment, so one script serves every variant and the
-# workload stays identical across them.
+# Drive one experiment end to end: clean, wait for GPU memory, setup, verify
+# the repo code is actually live, benchmark, clean. Configuration comes from the
+# environment, so one script serves every variant and the workload stays
+# identical across them.
 #
-#   NAME=demo-tests/noprefix DISABLE_LOCAL_PREFIX_CACHE_LOOKUP=true bash run_demo.sh
+#   NAME=demo-tests/incl KVPILOT_PLACEMENT=inclusive-safe-reqwise \
+#       KVPILOT_OFFLINE_TABLE=... bash run_demo.sh
 #
-# Results and the meaning of each switch: docs/evalution/demo_test_results.md.
 # Runs on the GPU host; copy it there (scp is blocked, use base64 over ssh).
 set -uo pipefail
 
@@ -45,18 +45,11 @@ export GET_HBM_POOL_DISTRIBUTION="${GET_HBM_POOL_DISTRIBUTION:-false}"
 # share, TTFT) come from logs, so it is off unless asked for.
 export NSYS_PROFILE="${NSYS_PROFILE:-0}"
 
-export DISABLE_LOCAL_PREFIX_CACHE_LOOKUP="${DISABLE_LOCAL_PREFIX_CACHE_LOOKUP:-false}"
-export ENABLE_MOONCAKE_CPU_BACKEND="${ENABLE_MOONCAKE_CPU_BACKEND:-false}"
-export ENABLE_LOCAL_MOONCAKE_HBM="${ENABLE_LOCAL_MOONCAKE_HBM:-false}"
-export ENABLE_SHM_MOONCAKE_HBM="${ENABLE_SHM_MOONCAKE_HBM:-false}"
-export MOONCAKE_PRELOAD_EXPECTED_ENGINES="${MOONCAKE_PRELOAD_EXPECTED_ENGINES:-2}"
-export KVPILOT_ONLINE_DRAM_SAFE="${KVPILOT_ONLINE_DRAM_SAFE:-false}"
-export KVPILOT_OFFLINE_DRAM_SAFE="${KVPILOT_OFFLINE_DRAM_SAFE:-false}"
 
 say() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
 say "=== ${NAME} ==="
-say "prefix_lookup_disabled=${DISABLE_LOCAL_PREFIX_CACHE_LOOKUP} mooncake_cpu=${ENABLE_MOONCAKE_CPU_BACKEND} shm_hbm=${ENABLE_SHM_MOONCAKE_HBM} online_safe=${KVPILOT_ONLINE_DRAM_SAFE} measured=${KVPILOT_MEASURED_DRAM_SAFE_PATH:-}"
+say "placement=${KVPILOT_PLACEMENT:-lru} online_predict=${KVPILOT_ONLINE_PREDICT:-0} table=${KVPILOT_OFFLINE_TABLE:-}"
 say "workload: req=${BM_MAX_INFLIGHT_REQ} sess=${BM_MAX_INFLIGHT_SESSION} n=${BM_NUM_REQUESTS} rate=${BM_SESSION_ARRIVAL_RATE} tool=${BM_TOOL_TIME}"
 
 bash dynamo_script.sh clean >/dev/null 2>&1
@@ -79,8 +72,8 @@ fi
 
 # The repo is on PYTHONPATH rather than installed, so a missing export yields a
 # healthy-looking run of upstream vLLM with none of the KVPilot code in it.
-n=$(grep -c 'Free blocks distribution' "$LOG_DIR/prefill-0.log" 2>/dev/null || echo 0)
-say "repo-code check: 'Free blocks distribution' lines = ${n}"
+n=$(grep -c 'KVPilot placement=' "$LOG_DIR/prefill-0.log" 2>/dev/null || echo 0)
+say "repo-code check: 'KVPilot placement=' lines = ${n}"
 if [ "$n" -eq 0 ]; then
     say "ABORT: running stock vLLM, not the repo"
     bash dynamo_script.sh clean >/dev/null 2>&1

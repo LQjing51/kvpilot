@@ -172,13 +172,6 @@ class Request:
 
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
-        # KV hit rate of this request's first scheduled prefill, copied out of
-        # prefill_stats while it is still populated. prefill_stats is consumed
-        # (set to None) when the request's output is emitted, which precedes
-        # the block free on the disaggregated path, so eviction policy cannot
-        # read it there.
-        self.kvpilot_kv_hit_rate: float = 0.0
-
         # Load-stall accounting for this request's prefill, all zero unless
         # $KVPILOT_LOAD_STALL is set. The token counts are fixed at the first
         # prefill; the timing accumulates because chunked prefill spans several
@@ -187,9 +180,12 @@ class Request:
         self.kvpilot_hit_tokens: int = 0
         self.kvpilot_dram_tokens: int = 0
         self.kvpilot_scheduled_ns: int = 0
-        self.kvpilot_stall_ns: int = 0
+        self.kvpilot_gpu_stall_ns: int = 0
         self.kvpilot_num_waits: int = 0
         self.kvpilot_num_steps: int = 0
+        # Waiting for HBM: from the first failed allocation to admission.
+        self.kvpilot_block_start_ns: int = 0
+        self.kvpilot_blocked_ns: int = 0
 
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
@@ -279,6 +275,16 @@ class Request:
         return self.num_encoder_inputs > 0
 
     def get_skip_reading_prefix_cache(self) -> bool:
+        # KVPilot: tier 1 of cache_use_control is this worker's HBM prefix
+        # cache; tiers 2/3 are filtered by the LMCache lookup. Checked first:
+        # SamplingParams resolves skip_reading_prefix_cache to a bool.
+        cache_use_control = (
+            (self.sampling_params.extra_args or {}).get("cache_use_control")
+            if self.sampling_params is not None
+            else None
+        )
+        if cache_use_control is not None and 1 not in cache_use_control:
+            return True
         if (
             self.sampling_params is not None
             and self.sampling_params.skip_reading_prefix_cache is not None

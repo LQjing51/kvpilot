@@ -11,7 +11,9 @@ Each trace record is sent as an independent request:
                    = ``output_length`` (with ``ignore_eos``), and do not force
                    any specific output tokens.
     * timing    -> requests are dispatched at ``timestamp_ms / time_scale``
-                   relative to start.
+                   relative to start, in file order; a record with a
+                   ``session_id`` also waits until the previous record of the
+                   same session has finished.
 
 Trace line schema::
 
@@ -25,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 import time
 import uuid
 from collections.abc import Iterator
@@ -43,6 +46,18 @@ class TraceRecord:
     input_length: int
     output_length: int
     hash_ids: list[int]
+    # Optional, for scripted experiments: request-id line number (default:
+    # position in the trace), extra request-body fields, and a pause before
+    # sending inside a --chain group (e.g. until a warm request's KV is on SSD).
+    line: int = -1
+    extra_body: dict | None = None
+    delay_ms: float = 0.0
+    # A record waits until the previous record of the same session has
+    # finished.
+    session_id: str | None = None
+    # Call types this round's output made (agent traces); --forced-output
+    # renders them into the decode output.
+    tool_calls: list[str] | None = None
 
 
 def iter_trace(path: str) -> Iterator[TraceRecord]:
@@ -59,6 +74,11 @@ def iter_trace(path: str) -> Iterator[TraceRecord]:
                     input_length=int(obj["input_length"]),
                     output_length=int(obj["output_length"]),
                     hash_ids=list(obj["hash_ids"]),
+                    line=int(obj.get("line", -1)),
+                    extra_body=obj.get("extra_body"),
+                    delay_ms=float(obj.get("delay_ms", 0.0)),
+                    session_id=obj.get("session_id"),
+                    tool_calls=obj.get("tool_calls"),
                 )
             except (json.JSONDecodeError, KeyError, ValueError) as e:
                 print(f"warn: skip line {line_num}: {e}")
@@ -70,7 +90,7 @@ def load_trace(path: str, max_requests: int | None = None) -> list[TraceRecord]:
         records.append(rec)
         if max_requests is not None and len(records) >= max_requests:
             break
-    records.sort(key=lambda r: r.timestamp_ms)
+    records.sort(key=lambda r: r.timestamp_ms)  # stable: ties keep file order
     return records
 
 
@@ -189,6 +209,28 @@ def build_request(
     return full[:needed]
 
 
+def render_tool_calls(labels: list[str]) -> str:
+    """This round's calls as the text the decode-side judge parses.
+
+    The judge finds call types with `<function=([^>\\s]+)>`; only the name is
+    read, so the body stays empty.
+    """
+    return "".join(f"<function={name}></function>" for name in labels)
+
+
+def build_forced_output(
+    labels: list[str] | None, out_len: int, tokenizer, pad_token: int
+) -> list[int]:
+    """The exact tokens decode must emit: the calls first, then padding up to
+    ``out_len``. The calls are never trimmed (that would change the label), so
+    a round shorter than its rendered calls runs a few tokens long."""
+    ids = (
+        tokenizer(render_tool_calls(labels), add_special_tokens=False)["input_ids"]
+        if labels else []
+    )
+    return ids + [pad_token] * max(0, max(1, out_len) - len(ids))
+
+
 # ---- replay client ---------------------------------------------------------
 
 
@@ -234,6 +276,9 @@ async def send_one(
     request_id: str,
     timeout_sec: float,
     guided_regex: str | None,
+    extra_body: dict | None = None,
+    forced_ids: list[int] | None = None,
+    on_first_token=None,
 ) -> tuple[float, float, int, int, str | None]:
     """Returns (ttft_ms, e2e_ms, actual_out, num_chunks, error).
 
@@ -259,11 +304,19 @@ async def send_one(
         # would echo ``prompt_token_ids`` (~tens of KB for long prompts),
         # blowing past aiohttp's default per-line limit of 128 KB.
     }
-    if guided_regex is not None:
+    if forced_ids:
+        # Dynamo passes this to vLLM's ForcedOutputTokensLogitsProcessor and
+        # re-pins max/min_tokens to its length.
+        payload["forced_output_tokens"] = forced_ids
+    elif guided_regex is not None:
         # Dynamo's frontend currently has a UTF-8 boundary bug in incremental
         # detokenization. Constraining generated text to printable ASCII avoids
         # multi-byte output chunks that can panic the frontend mid-stream.
         payload["guided_regex"] = guided_regex
+    if extra_body:
+        # e.g. cache_use_control: KV reuse tiers for prefill (1 HBM, 2 local
+        # DRAM, 3 remote DRAM); cache_use_max_tokens: cap on reused prefix.
+        payload.update(extra_body)
 
     # Dynamo's frontend only honors `request-id` / `x-dynamo-request-id`
     # (and only if the value parses as a UUID); `X-Request-Id` is captured
@@ -305,6 +358,8 @@ async def send_one(
                     # First chunk with text => prefill done.
                     if ttft_ns is None:
                         ttft_ns = time.perf_counter_ns() - start_ns
+                        if on_first_token is not None:
+                            on_first_token()
                 usage = data.get("usage")
                 if usage:
                     # Final chunk (include_usage=True). usage.completion_tokens
@@ -359,41 +414,71 @@ async def replay(args: argparse.Namespace) -> None:
             f"[{args.token_offset}, {args.vocab_size})"
         )
 
-    sem = asyncio.Semaphore(args.num_clients)
+    tokenizer = None
+    pad_token = 0
+    if args.forced_output:
+        from transformers import AutoTokenizer  # type: ignore
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer or args.model, trust_remote_code=True
+        )
+        pool = safe_pool or build_safe_token_pool(
+            args.tokenizer or args.model, args.token_offset, args.vocab_size
+        )
+        pad_token = pool[0]
+        n_calls = sum(len(r.tool_calls or []) for r in records)
+        print(f"info: forced output on: {n_calls} tool calls rendered as "
+              f"<function=NAME>, padded with token {pad_token}")
+    if args.max_output_tokens:
+        print(f"info: output length capped at {args.max_output_tokens} tokens")
+
+    def output_len(rec: TraceRecord) -> int:
+        if args.max_output_tokens:
+            return min(rec.output_length, args.max_output_tokens)
+        return rec.output_length
+
+    sem = asyncio.Semaphore(args.num_clients if args.num_clients > 0 else sys.maxsize)
     results: list[RequestResult] = []
     t0_ms = time.perf_counter_ns() // 1_000_000
 
-    async def schedule(idx: int, rec: TraceRecord) -> None:
-        # Honor the trace's arrival time, scaled by time_scale (>1 = faster).
-        target_ms = rec.timestamp_ms / max(args.time_scale, 1e-9)
-        elapsed_ms = time.perf_counter_ns() // 1_000_000 - t0_ms
-        if target_ms > elapsed_ms:
-            await asyncio.sleep((target_ms - elapsed_ms) / 1000.0)
+    async def send_record(idx: int, rec: TraceRecord, on_first_token=None) -> None:
         prompt_ids = build_request(
             rec,
             vocab_range=vocab_range,
             token_offset=args.token_offset,
             safe_pool=safe_pool,
         )
+        out_len = output_len(rec)
+        forced_ids = None
+        if tokenizer is not None:
+            forced_ids = build_forced_output(
+                rec.tool_calls, out_len, tokenizer, pad_token
+            )
+            out_len = len(forced_ids)
         # Parsed by analyze_lp_ttft_breakdown.py.
         print(
             f"[req] idx={idx} ts={rec.timestamp_ms}ms"
-            f" in={rec.input_length} out={rec.output_length}"
+            f" in={rec.input_length} out={out_len}"
             f" hashes={len(rec.hash_ids)}"
         )
-        async with sem:
-            start_time_ms = float(time.perf_counter_ns() // 1_000_000 - t0_ms)
-            async with aiohttp.ClientSession() as session:
-                ttft, e2e, actual, num_chunks, err = await send_one(
-                    session,
-                    completions_url,
-                    args.model,
-                    prompt_ids,
-                    rec.output_length,
-                    request_id=_make_request_id(idx),
-                    timeout_sec=args.timeout,
-                    guided_regex=output_regex,
-                )
+        start_time_ms = float(time.perf_counter_ns() // 1_000_000 - t0_ms)
+        async with aiohttp.ClientSession() as session:
+            # Wall clock, for joining with server-side timestamps (e.g. the
+            # prefill worker's `done=`) on the same host.
+            sent = time.time()
+            ttft, e2e, actual, num_chunks, err = await send_one(
+                session,
+                completions_url,
+                args.model,
+                prompt_ids,
+                out_len,
+                request_id=_make_request_id(rec.line if rec.line >= 0 else idx),
+                timeout_sec=args.timeout,
+                guided_regex=output_regex,
+                extra_body=rec.extra_body,
+                forced_ids=forced_ids,
+                on_first_token=on_first_token,
+            )
         tpot = (
             (e2e - ttft) / max(actual - 1, 1) if actual > 1 and ttft > 0 else 0.0
         )
@@ -415,16 +500,74 @@ async def replay(args: argparse.Namespace) -> None:
         if err:
             print(
                 f"[ERR] idx={idx} ts={rec.timestamp_ms}ms in={rec.input_length}"
-                f" out={rec.output_length}/{actual} {err}"
+                f" out={out_len}/{actual} {err}"
             )
         else:
             print(
-                f"[ok ] idx={idx} out={actual}/{rec.output_length}"
+                f"[ok ] idx={idx} out={actual}/{out_len}"
                 f" ttft={ttft:.1f}ms tpot={tpot:.2f}ms e2e={e2e:.1f}ms"
-                f" chunks={num_chunks}"
+                f" chunks={num_chunks} sent={sent:.6f}"
             )
 
-    await asyncio.gather(*(schedule(i, r) for i, r in enumerate(records)))
+    # One dispatcher walks the records in order and takes a client slot before
+    # each send, so sends leave in line order (independent tasks sleeping to
+    # the same instant would wake in arbitrary order). With --chain, records
+    # sharing a `line` go out back to back on one client slot (e.g. a warm
+    # request then the measured one), and only distinct lines overlap.
+    groups: list[list[tuple[int, TraceRecord]]] = []
+    for idx, rec in enumerate(records):
+        if args.chain and groups and rec.line >= 0 and groups[-1][0][1].line == rec.line:
+            groups[-1].append((idx, rec))
+        else:
+            groups.append([(idx, rec)])
+
+    # The latest dispatched group of each session, set when it finishes. The
+    # dispatcher blocks on it, so later lines also wait and the send order
+    # stays the file order.
+    session_done: dict[str, asyncio.Event] = {}
+    session_waits = 0
+
+    async def run_group(
+        group: list[tuple[int, TraceRecord]], done: asyncio.Event | None
+    ) -> None:
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                sem.release()
+
+        try:
+            for i, (idx, rec) in enumerate(group):
+                if rec.delay_ms > 0:
+                    await asyncio.sleep(rec.delay_ms / 1000.0)
+                early = args.release_at_first_token and i == len(group) - 1
+                await send_record(idx, rec, release if early else None)
+        finally:
+            release()
+            if done is not None:
+                done.set()
+
+    tasks = []
+    for group in groups:
+        target_ms = group[0][1].timestamp_ms / max(args.time_scale, 1e-9)
+        elapsed_ms = time.perf_counter_ns() // 1_000_000 - t0_ms
+        if target_ms > elapsed_ms:
+            await asyncio.sleep((target_ms - elapsed_ms) / 1000.0)
+        done = None
+        sid = group[0][1].session_id
+        if sid is not None:
+            prev = session_done.get(sid)
+            if prev is not None and not prev.is_set():
+                session_waits += 1
+                await prev.wait()
+            done = session_done[sid] = asyncio.Event()
+        await sem.acquire()
+        tasks.append(asyncio.create_task(run_group(group, done)))
+    print(f"info: dispatcher waited on the previous round of a session "
+          f"{session_waits} times")
+    await asyncio.gather(*tasks)
 
     _print_summary(results, args)
 
@@ -501,7 +644,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "-p", "--num-clients", type=int, default=32,
-        help="Number of parallel client coroutines",
+        help="Max requests in flight; 0 = unlimited",
     )
     p.add_argument(
         "-n", "--max-requests", type=int, default=None,
@@ -527,6 +670,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument(
+        "--chain",
+        action="store_true",
+        help=(
+            "Send consecutive records with the same `line` sequentially on one "
+            "client (e.g. warm then measured request); -p bounds how many "
+            "lines run at once."
+        ),
+    )
+    p.add_argument(
         "--output-regex",
         default="[ -~]*",
         help=(
@@ -539,6 +691,36 @@ def build_parser() -> argparse.ArgumentParser:
         "--disable-output-regex",
         action="store_true",
         help="Disable the default guided_regex output constraint.",
+    )
+    p.add_argument(
+        "--release-at-first-token",
+        action="store_true",
+        help=(
+            "Free a client slot at the first output token instead of at "
+            "completion. With -p 1 the prefill worker runs one prefill at a "
+            "time (no queueing in TTFT) while decodes overlap. A session's "
+            "next round still waits for the whole previous round."
+        ),
+    )
+    p.add_argument(
+        "--forced-output",
+        action="store_true",
+        help=(
+            "Pin decode output: render each record's `tool_calls` as "
+            "<function=NAME> (what the KVPilot decode-side judge parses), "
+            "padded to the output length. Replaces --output-regex."
+        ),
+    )
+    p.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=0,
+        help="Cap each record's output length (0 = trace value).",
+    )
+    p.add_argument(
+        "--tokenizer",
+        default=None,
+        help="Tokenizer for --forced-output (default: --model).",
     )
     p.add_argument(
         "--safe-token-pool",

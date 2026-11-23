@@ -40,11 +40,15 @@ class QueryResult {
     const std::vector<Replica::Descriptor> replicas;
     /** @brief Time point when the lease for this key expires */
     const std::chrono::steady_clock::time_point lease_timeout;
+    /** @brief GetReplicaList pinned memory replicas; unpin after use. */
+    const bool memory_pinned;
 
     QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
-                std::chrono::steady_clock::time_point lease_timeout_param)
+                std::chrono::steady_clock::time_point lease_timeout_param,
+                bool memory_pinned_param = false)
         : replicas(std::move(replicas_param)),
-          lease_timeout(lease_timeout_param) {}
+          lease_timeout(lease_timeout_param),
+          memory_pinned(memory_pinned_param) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
@@ -131,6 +135,32 @@ class Client {
      */
     tl::expected<std::vector<Segment>, ErrorCode> GetSharedMemorySegments(
         const std::vector<std::string>& segment_names);
+
+    /**
+     * @brief KVPilot: set chunk groups' tier and penalty (ms).
+     * @return Number of groups updated.
+     */
+    tl::expected<int64_t, ErrorCode> SetGroupPlacement(
+        const std::vector<std::string>& groups,
+        const std::vector<int32_t>& tiers,
+        const std::vector<double>& penalties_ms);
+
+    tl::expected<int64_t, ErrorCode> BatchUnpinMemoryReplicas(
+        const std::vector<std::string>& keys);
+
+    /**
+     * @brief KVPilot zero-copy write-back: a put split into its master calls,
+     * for a caller that writes the allocated buffers itself between start and
+     * end (one slice of `sizes[i]` bytes per key).
+     */
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    KvpBatchPutStart(const std::vector<std::string>& keys,
+                     const std::vector<uint64_t>& sizes,
+                     const ReplicateConfig& config);
+    std::vector<tl::expected<void, ErrorCode>> KvpBatchPutEnd(
+        const std::vector<std::string>& keys);
+    std::vector<tl::expected<void, ErrorCode>> KvpBatchPutRevoke(
+        const std::vector<std::string>& keys);
 
     /**
      * @brief Queries replica lists for object keys that match a regex pattern.

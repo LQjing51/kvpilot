@@ -2,6 +2,8 @@
 # Standard
 from typing import List, Optional, Tuple, Union
 import abc
+import os
+import threading
 
 # Third Party
 import torch
@@ -1087,8 +1089,18 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
+        # KVPilot exclusive unblocking: copies lent blocks' KV out (start_evict).
+        self.evict_stream = torch.cuda.Stream()
+        self._evictor: Optional["lmc_ops.LayerEvictor"] = None
 
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
+        # KVPilot SSD loader. Created now when SSD offload is on, so the first
+        # SSD load does not pay for its pinned buffers and threads; otherwise
+        # on first use by lookup or retrieve.
+        self._ssd: Optional["lmc_ops.SsdLayerwiseLoader"] = None
+        self._ssd_lock = threading.Lock()
+        if os.getenv("KVPILOT_SSD_OFFLOAD_PATH"):
+            self._ssd_loader()
 
     @classmethod
     def from_metadata(
@@ -1170,7 +1182,234 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         raise NotImplementedError
 
+    def token_bytes(self) -> int:
+        """Bytes one token occupies in one layer's token-major chunk."""
+        return self.element_size * (
+            self.hidden_dim_size if self.use_mla else 2 * self.hidden_dim_size
+        )
+
     @_lmcache_nvtx_annotate
+    def start_layers(
+        self,
+        start: int,
+        end: int,
+        chunk_tokens: List[int],
+        layer_ptrs: Union[List[List[int]], torch.Tensor],
+        lookahead: int,
+        timing: bool,
+        evict_events: Optional[List[int]] = None,
+        **kwargs,
+    ) -> Optional["lmc_ops.LoadTiming"]:
+        """Begin one request's layerwise H2D; `step_layer` drives the rest.
+
+        Nothing waits for compute: the load stream runs ahead at copy speed,
+        and `step_layer(i)` makes the calling stream wait for layer i before
+        that layer's attention.
+
+        Each layer is one `cudaMemcpyBatchAsync` of every chunk into a staging
+        buffer, then one scatter into the paged KV. The copies run on the copy
+        engines, so the load does not take SMs from the forward the way a
+        kernel that reads host memory directly does (that kernel waits on PCIe
+        while holding the SMs, and slowed compute by up to 3x at 64K tokens).
+        Two staging buffers alternate between layers; both copy and scatter
+        run on the load stream, so layer i's copy into a buffer is ordered
+        after layer i - 2's scatter out of it.
+
+        :param start, end: token range loaded, contiguous.
+        :param chunk_tokens: tokens per chunk, in order, summing to end - start.
+        :param layer_ptrs: [layer][chunk] pinned host address of each chunk,
+            token-major ([tokens, 2, hidden] or [tokens, hidden] for MLA);
+            a list, or an int64 CPU tensor.
+        :param lookahead: layers to enqueue before the forward; pass
+            ``num_layers`` so every layer is queued at ``start`` and
+            ``step_layer`` only waits.
+        :param timing: also record per-layer GPU timing.
+        :param evict_events: `start_evict`'s events when the load overwrites
+            lent blocks: layer i's scatter waits for event i.
+
+        :return: The timing handle, or None when `timing` is False.
+        """
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None
+        # Sets gpu_kv_format; the first request a worker sees may be a load.
+        self._lazy_initialize_buffer(self.kvcaches)
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        slots = slot_mapping[start:end]
+        nbytes = self.token_bytes()
+        sizes = [n * nbytes for n in chunk_tokens]
+        if isinstance(layer_ptrs, torch.Tensor):
+            ptrs = layer_ptrs.to(torch.int64).contiguous()
+        else:
+            ptrs = torch.tensor(layer_ptrs, dtype=torch.int64)
+        # slot_mapping was written on the compute stream, and the paged KV it
+        # addresses may still be read by work already queued there.
+        self.load_stream.wait_stream(torch.cuda.current_stream())
+        if not hasattr(self, "_loader"):
+            self._loader = lmc_ops.LayerwiseLoader()
+        with torch.cuda.stream(self.load_stream):
+            staging = self._staging_buffers(end - start)
+            return self._loader.start(
+                ptrs, sizes, staging[0], staging[1], self.kvcaches, slots,
+                self.gpu_kv_format, lookahead, timing, evict_events or [],
+            )
+
+    def start_evict(
+        self, slots: torch.Tensor, layer_ptrs: torch.Tensor, **kwargs
+    ) -> Tuple[List[int], torch.cuda.Event]:
+        """KVPilot exclusive unblocking: copy the KV of HBM blocks lent to the
+        load about to start out to their DRAM replicas, every layer queued now
+        on a stream of its own (C++ LayerEvictor).
+
+        Pass the events to `start_layers` / `start_layers_ssd`: a layer's
+        scatter then waits for that layer's copy, while the load's H2D runs
+        alongside it in the other PCIe direction.
+
+        :param slots: int64 CPU, the lent blocks' slots, block after block.
+        :param layer_ptrs: int64 CPU [layers, blocks], each block's replica
+            per layer (token-major value layout).
+
+        :return: The per-layer events, and an event recorded after the last
+            layer's copy.
+        """
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None
+        self._lazy_initialize_buffer(self.kvcaches)
+        if self._evictor is None:
+            self._evictor = lmc_ops.LayerEvictor()
+        # The blocks' KV was written on the compute stream.
+        self.evict_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.evict_stream):
+            cap = getattr(self, "_evict_cap", 0)
+            if len(slots) > cap:
+                cap = max(len(slots), 2 * cap)
+                self._evict_bufs = [
+                    torch.empty(self.get_shape(cap), dtype=self.dtype, device=self.device)
+                    for _ in range(2)
+                ]
+                self._evict_cap = cap
+            self._evictor.start(
+                layer_ptrs, self._evict_bufs[0], self._evict_bufs[1], self.kvcaches,
+                slots.to(self.device), self.gpu_kv_format,
+            )
+            done = torch.cuda.Event()
+            done.record()
+        return self._evictor.events(), done
+
+    def step_layer(self, layer_id: int, wait: bool) -> None:
+        """Enqueue the next layer's H2D; if `wait`, wait for layer_id's here."""
+        self._loader.step(layer_id, wait)
+
+    def open_ssd_files(self, paths: List[str]) -> List[bool]:
+        """Open SSD files ahead of the load; False where one cannot be opened.
+
+        An open file stays readable even if Mooncake evicts its bucket before
+        the load, so a lookup that opened it can count its chunks as hits.
+        """
+        return self._ssd_loader().open_files(paths)
+
+    @_lmcache_nvtx_annotate
+    def start_layers_ssd(
+        self,
+        start: int,
+        end: int,
+        chunk_tokens: List[int],
+        paths: List[str],
+        file_idx: torch.Tensor,
+        offsets: torch.Tensor,
+        timing: bool,
+        writeback: Optional[torch.Tensor] = None,
+        evict_events: Optional[List[int]] = None,
+        **kwargs,
+    ) -> Optional["lmc_ops.LoadTiming"]:
+        """Begin one request's layerwise load where some chunks are on SSD.
+
+        Like `start_layers`, but each (layer, chunk) is either read from a file
+        on local SSD into a pinned slot by the C++ loader's I/O threads, or
+        copied from pinned host memory directly (a DRAM replica). The I/O
+        threads read ahead of the forward and hand each layer to the load
+        stream as soon as its reads finish; `step_layer_ssd(i)` then makes the
+        calling stream wait for layer i.
+
+        :param start, end: token range loaded, contiguous.
+        :param chunk_tokens: tokens per chunk, in order, summing to end - start.
+        :param paths: files referenced by `file_idx`.
+        :param file_idx: int32 [layers, chunks]; index into `paths`, or -1 for
+            a host chunk.
+        :param offsets: int64 [layers, chunks]; byte offset of the value in its
+            file, or the host address of a host chunk. Values are token-major.
+        :param timing: also record per-layer GPU timing.
+        :param writeback: optional int64 [layers, chunks]; where nonzero, the
+            pinned host buffer that also receives that SSD value, for a
+            write-back to DRAM. Wait for it with `wait_ssd_writeback`.
+        :param evict_events: as for `start_layers`.
+
+        :return: The timing handle, or None when `timing` is False.
+        """
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None
+        self._lazy_initialize_buffer(self.kvcaches)
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        slots = slot_mapping[start:end]
+        nbytes = self.token_bytes()
+        sizes = [n * nbytes for n in chunk_tokens]
+        loader = self._ssd_loader()
+        self.load_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.load_stream):
+            staging = self._staging_buffers(end - start)
+            return loader.start(
+                paths, file_idx, offsets, sizes, staging[0], staging[1],
+                self.kvcaches, slots, self.gpu_kv_format, timing, writeback,
+                evict_events or [],
+            )
+
+    def step_layer_ssd(self, layer_id: int, wait: bool) -> None:
+        """Block until layer_id is on the load stream; if `wait`, wait for it."""
+        self._ssd_loader().step(layer_id, wait)
+
+    def ssd_generation(self) -> int:
+        """Number of the latest `start_layers_ssd`."""
+        return self._ssd_loader().generation()
+
+    def set_ssd_writeback(self, gen: int, writeback: torch.Tensor) -> torch.Tensor:
+        """Hand load `gen` its write-back table late: values whose reads have
+        not started are armed. Returns uint8 [layers, chunks], 1 = armed."""
+        return self._ssd_loader().set_writeback(gen, writeback)
+
+    def wait_ssd_writeback(self, gen: int) -> bool:
+        """Block until load `gen` has filled its write-back buffers; False if
+        that load failed."""
+        return self._ssd_loader().wait_writeback(gen)
+
+    def _ssd_loader(self) -> "lmc_ops.SsdLayerwiseLoader":
+        # Lookup (lookup-server thread) and retrieve (forward thread) both use
+        # it, so it is created under a lock.
+        with self._ssd_lock:
+            if self._ssd is None:
+                # The loader binds its threads to the device current here.
+                with torch.cuda.device(self.device):
+                    # 64 read threads per rank (32 reads 5-10% slower with two
+                    # ranks on the same disks, 128 slower still); 256 MiB of
+                    # pinned read slots bounds how far reads run ahead.
+                    self._ssd = lmc_ops.SsdLayerwiseLoader(64, 256 << 20)
+            return self._ssd
+
+    def _staging_buffers(self, num_tokens: int) -> List[torch.Tensor]:
+        """Two token-major staging buffers of at least num_tokens, reused.
+
+        Grown on demand and never shrunk. Called on the load stream, so the
+        buffers belong to its allocator pool: a buffer replaced by a larger
+        one is only reused after the load stream's queued work on it.
+        """
+        cap = getattr(self, "_staging_cap", 0)
+        if num_tokens > cap:
+            cap = max(num_tokens, 2 * cap)
+            self._staging = [
+                torch.empty(self.get_shape(cap), dtype=self.dtype, device=self.device)
+                for _ in range(2)
+            ]
+            self._staging_cap = cap
+        return self._staging
+
     def batched_to_gpu(self, starts: List[int], ends: List[int], **kwargs):
         """
         This function is a generator that moves the KV cache from the memory
@@ -1208,6 +1447,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         # attribution can charge each range to one request instead of every
         # request whose window happens to contain it.
         req_id: str = kwargs.get("req_id", "unspecified")
+        load_timer = kwargs.get("load_timer")
+        if load_timer:
+            load_timer.start(self.load_stream)
 
         self._lazy_initialize_buffer(self.kvcaches)
 
@@ -1246,6 +1488,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
             # memobj -> gpu_buffer -> kvcaches
             with torch.cuda.stream(self.load_stream):
+                copy_start = (
+                    load_timer.copy_begin(self.load_stream) if load_timer else None
+                )
                 torch.cuda.nvtx.range_push(
                     f"LMCache.batched_to_gpu.copy_chunks.layer_{layer_id}"
                     f".req_{req_id}"
@@ -1298,11 +1543,15 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         )
                     finally:
                         torch.cuda.nvtx.range_pop()
+                if load_timer:
+                    load_timer.copy_end(copy_start, self.load_stream)
         yield
 
         # synchronize the last layer
         if sync:
             current_stream.wait_stream(self.load_stream)
+        if load_timer:
+            load_timer.finish()
 
         # free the buffer memory
         if tmp_gpu_buffer_obj is not None:
@@ -1437,6 +1686,63 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         if tmp_gpu_buffer_obj is not None:
             tmp_gpu_buffer_obj.ref_count_down()
 
+        yield
+
+    def batched_from_gpu_to_addrs(
+        self,
+        addrs: List[List[int]],
+        sizes: List[int],
+        starts: List[int],
+        ends: List[int],
+        **kwargs,
+    ):
+        """
+        Like batched_from_gpu, but each layer's chunks go from the GPU buffer
+        straight to host addresses (Mooncake replicas, written in place) in one
+        batched D2H, with no memory objects in between. addrs[layer][chunk] is
+        the destination (0 = skip) and sizes[chunk] its byte size. Yields
+        num_layers + 1 times; every copy is complete once it is exhausted.
+        """
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+        assert self.use_gpu, "direct stores need the GPU staging buffer"
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        sync: bool = kwargs["sync"]
+
+        self._lazy_initialize_buffer(self.kvcaches)
+        slot_mapping_full = torch.cat(
+            [slot_mapping[start:end] for start, end in zip(starts, ends, strict=True)]
+        )
+        mem_fmt = MemoryFormat.KV_MLA_FMT if self.use_mla else MemoryFormat.KV_T2D
+        assert self.gpu_buffer_allocator is not None
+        tmp = self.gpu_buffer_allocator.allocate(
+            self.get_shape(len(slot_mapping_full)), self.dtype, mem_fmt
+        )
+        assert tmp is not None and tmp.tensor is not None, (
+            "Failed to allocate GPU buffer in GPUConnector"
+        )
+
+        current_stream = torch.cuda.current_stream()
+        for layer_id in range(self.num_layers):
+            with torch.cuda.stream(self.store_stream):
+                self.store_stream.wait_stream(current_stream)
+                lmc_ops.single_layer_kv_transfer(
+                    tmp.tensor,
+                    self.kvcaches[layer_id],
+                    slot_mapping_full,
+                    lmc_ops.TransferDirection.D2H,
+                    self.gpu_kv_format,
+                    token_major=True,
+                )
+                lmc_ops.batched_memcpy_d2h(tmp.tensor, addrs[layer_id], sizes)
+            yield
+            if sync:
+                self.store_stream.synchronize()
+
+        self.store_stream.synchronize()
+        tmp.ref_count_down()
         yield
 
     def get_shape(self, num_tokens: int) -> torch.Size:

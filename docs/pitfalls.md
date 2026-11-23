@@ -36,17 +36,34 @@ H20 BF16 148。历史上 `plot_context_time.py` 曾用稀疏值，且 H20 字段
 **LMCache 的 hit tokens 是嵌套口径**：`hit` 包含了已在 HBM 的部分，命中率高不等于有
 加载。要算真正从 DRAM 来的量用 `need to load`，不要用 `hit`。
 
-**`Prefix cache hit rate: 0.0%` 全程不动**说明 `DISABLE_LOCAL_PREFIX_CACHE_LOOKUP`
-开着，不是缓存失效。
+**`Prefix cache hit rate: 0.0%` 全程不动**说明请求的 `cache_use_control` 不含 1（跳过本地
+prefix 查找），不是缓存失效。
 
 ## 跨进程/跨机
 
 **非交互 ssh 会静默跑成 stock vLLM**。`PYTHONPATH` 只在 `/root/.bashrc` 里，
 `.bashrc` 不对非交互 shell 生效。自查：
-`grep -c 'Free blocks distribution' prefill-0.log`，0 就是没生效。详见
+`grep -c 'KVPilot placement=' prefill-0.log`，0 就是没生效。详见
 [benchmark.md](benchmark.md)。
 
 **`setup <name>` 写到 `<name>-logs/`**，会自动加后缀。
+
+**Mooncake DRAM 被写满后，同机命中曾整次 lookup 失败**（已改成全映射，见下）。原来每个 TP worker 只
+preload 另一个 prefill 引擎上同 rank 的 segment。本 worker 的 segment 分配不下时，Mooncake 会把 KV 放进
+任何有空间的 segment（master 不区分 rank），落到别的 rank 的 segment 时 lookup 抛
+`Mooncake shared-memory replica was not preloaded or rewritten`，整次按 0 命中，还常伴随
+`Timeout occurred for rank N`（这一条请求多出 1–2 s）。64 GiB / TP worker 下写入集中的 trace 会触发
+（`paper-figure/toolagent-turn5plus-tier-safe-per-request` 的 dram 轮 336 / 2105 行、
+`prefix-suffix-compute-vs-load-dram-ssd` 第 2 遍 35 / 90 条，这两份数据都是改之前跑的），正常节奏的 turn5plus
+回放一次都没出现。现在每个 worker preload 本机所有 prefill worker 的 segment（`_preload_shared_memory_peers`），
+日志 `shared_memory_preload_ready ... peers=3`（2P × TP2）。刚写入就被淘汰、写入未完成时来读
+（`REPLICA_IS_NOT_READY`）这两种部分命中仍会发生，测量类实验仍要先 grep 这几条。
+
+**全映射 + 200 GiB segment 会让 prefill OOM**。`cudaHostRegister` 每 GiB host 内存占 2 MiB 显存（实测，
+GPU 页表），而 Mooncake 注册自己和 peer 的 segment 是在 vLLM 测完可用显存、分完 KV cache 之后。每个进程注册
+4 × 200 GiB = 1.6 GiB 显存，比只映射同 rank 时多 800 MiB，第一次 forward 申请激活就 `CUDA out of memory`，
+两个 prefill 引擎随即 `EngineDeadError`，所有请求 500（2026-11-03 全量 toolagent 回放）。64 GiB segment
+只占 512 MiB，没有问题；要用 200 GiB 得给显存留出这部分余量。
 
 **`scp` 到 Taiji-GPU 不通**（`Connection closed`），用 `base64 | ssh ... base64 -d`。
 
@@ -62,20 +79,14 @@ H20 BF16 148。历史上 `plot_context_time.py` 曾用稀疏值，且 H20 字段
 **session 会卡在 `Collection` 状态不落盘**，`clean` 的 SIGTERM 不一定送得到。要
 `nsys sessions list` 后逐个 `nsys stop --session=...`，否则 `.nsys-rep` 一个字节都没有。
 
-**TTFT 分析的 `base_ns` 会被陈旧 profile 带偏**：换了跑之后如果没重新 export sqlite，
-会读到上一次的时间基准，症状是 `load_total` 全 0。
-
-**nsys 按 worker 全局摊会导致 hit=0 的请求也有 exposed load**：per-request 归因必须用
-该请求**自己**的 load 区间（`loads_by_rid`），用 worker 全局集合会把每个并发请求的 load
-重复计数（实测 8 路并发下 10 倍超计）。
-
 ## 数据处理
 
 **Qwen3 模板会静默吞掉 list 形态的 `content`**，替换成空串，实测丢 64% 的 token 且不
 报错。预处理必须先拍平成字符串。
 
-**两个 trace 的 tool label 命名空间零重叠**，查表用错会 100% 落 `_default`、判据退化成
-常数，日志里看不出来。所以 `KVPILOT_TOOL_RESP_LEN_PATH` 是 fail-closed 的。
+**两个 trace 的 tool label 命名空间零重叠**，在线判据的分布文件用错数据集时几乎每轮都落到混合分布，
+判据退化成近似常数。所以 `KVPILOT_TOOL_RESP_DISTRIBUTION_PATH` 必须显式给，D 侧日志带 `label_misses=未命中/总数`，
+接近总数就是用错了。
 
 **查表 JSON 的值未必是中位数**，取的是 `--predict-percentile`，所以键名叫 `resp_len`
 不叫 `p50`，文件里还记了 `_percentile`——不同分位点跑出的表长得一模一样，不记就会拿去
@@ -92,18 +103,40 @@ H20 BF16 148。历史上 `plot_context_time.py` 曾用稀疏值，且 H20 字段
 **`TZ` 必须是 `UTC0` 不能是 `UTC`**，见 [benchmark.md](benchmark.md)。方括号日志
 是 CST 不是 UTC。
 
-**per-request 的列不能相加**。N 路并发时同一个 kernel 落进 N 个 TTFT 窗口被重复计费，
-求和后 compute 随并发增长而 load 不增长，这个不对称会把 `exposed_load/ttft` 压到远低于
-成本模型的真值。要聚合就用 `ttft_share_aggregate` 那套并集口径。
+**`save_kv_layer` 每层都会被调用，里面的 RPC 会乘以 48**。2026-11-04 为了让 SSD-only
+的命中能写回 DRAM，`save_kv_layer` 在「没有新 token 要存」时也去查一遍前缀是否在 DRAM
+（`leading_dram_tokens`，当时每个 chunk 一次 master RPC），但没把结论缓存，48 层每层重查：
+suffix < 512（不足一个 chunk）的请求 prefill 慢到每前缀 token 约 77 µs（20K 前缀 1.5 s，
+正常约 60 ms），`[1]` 与 `[2]`/`[4]` 一起被拖慢、delay / compute 被稀释。症状是 e2e 在
+suffix = 512 处断崖、`stall=0`、两行日志之间一片空白。期间的 1P1D boundary、SWE
+request-safe、ToolAgent 的补测都作废。
 
-**load 占比是陷阱，要看绝对值**：TTFT 膨胀 + compute 全局重复计数会压低占比。实测 `c`
-比模型预测慢约 600 倍。
+**空闲约 1 s 后的第一个请求 prefill 慢约 2 ms**（2026-11-05 对照实验，1P1D：同一
+(prefix, suffix) 上「前面紧跟一个请求」vs「先空闲 1 s」，t1 稳定差 1.2–2.3 ms）。对比两个
+请求的 e2e 时它们必须处于同样的冷热状态：boundary 曾在每个请求前空闲 1 s（compute 被抬高、
+比值偏 safe），request-safe 只在 `[4]` 前等 1 s（d4 多出约 2 ms、SSD 偏 unsafe），compute
+约 50 ms 时这 2 ms 就是 4 个百分点。现在被计时的请求前都紧跟一个请求：boundary 在每对前发同形状预热，
+request-safe 不预热，把每行的 `[4]` 排在下一行的 `[2]` 之后。
 
-**排队占比两张图差 100 倍是设计使然**，不是 bug：一个分母是自己的 TTFT，一个是 GPU
-墙上时间的并集，且后者只计 GPU 真正空转的部分。详见 [observability.md](observability.md)。
+**safe 与否对 suffix 不单调**：加载逐层流水，同一 prefix 下加载总时长 L 基本恒定，compute ≥ L
+就藏得住；但 compute 随 suffix 跳变（attention kernel 选择；suffix 1024 以上走 eager），
+如 60K 时 suffix 144 / 148 / 180 / 212 的 compute 为 58 / 84 / 67 / 100 ms，safe / unsafe 来回翻。
+eager 段（suffix 1024–2048）DRAM 还多 2–4 ms 固定开销，比值贴着 5%。「每个 prefix 一个 suffix
+分界点」只是近似，比对时要知道不一致集中在这些地方。
 
-**aggregate 那几列里 `load_tot` 和 `store_tot` 不属于互斥划分**，它们与 compute 相交，
-加起来超 100% 是正常的。
+**单请求测试不要依赖跨行的缓存历史，也不要为它改端到端的 save 路径**。request-safe 曾让
+各行共用 trace 里的 prefix hash：前缀几分钟前写入、早被挤出 DRAM 只剩 SSD 时，warm 从
+SSD 直接读进 GPU、不写回 DRAM，紧接着的 `[2]` 只拿到一个 chunk。为此加的 SSD-only 写回
+（上一条的 `leading_dram_tokens`，以及 store 判重要求 DRAM 副本、put 前删 SSD 元数据、
+last prefill 不再 `skip_save`）改的是所有请求的 save 路径，被计时的请求也背上了关键路径
+上的查询，2026-11-05 全部撤回。现在每行用全新 hash 的 prefix，只取 trace 的长度
+（`paper-figure/Figure3-request-safe/make_trace.py`）。
+
+**比几毫秒的开销，要在同一个服务里对照**。2026-11-10 写回诊断：同一个 trace（32K prefix 只从 SSD 读）
+起两次服务、都不写回，这个请求的 e2e 中位数 263.1 对 269.5 ms、`gpu_stall` 也差约 6 ms（e2e − `gpu_stall` 只差
+1 ms）；而同一个服务里写回与不写回只差 1.5 ms。跨服务比会把 6 ms 的实例差异当成改动的效果。做法：在同一个服务里
+按请求交替开关（当时用 `KVPILOT_SSD_WRITEBACK` 给请求号列表、`run_wb_diag.sh half`，两者已随写回开关删掉；
+要再做这种对照，得临时加一个按请求的开关）。
 
 ## 作图
 

@@ -3,6 +3,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include "mem_kernels.cuh"
+#include "ssd_loader.cuh"
 #include "mp_mem_kernels.cuh"
 #include "cachegen_kernels.cuh"
 #include "pos_kernels.cuh"
@@ -46,6 +47,55 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("lmc_key_value_cache"), py::arg("vllm_key_value_cache"),
         py::arg("slot_mapping"), py::arg("direction"), py::arg("gpu_kv_format"),
         py::arg("token_major") = false);
+  m.def("multi_chunk_kv_transfer_h2d", &multi_chunk_kv_transfer_h2d,
+        py::arg("chunk_ptrs"), py::arg("vllm_key_value_cache"),
+        py::arg("slot_mapping"), py::arg("chunk_size"),
+        py::arg("gpu_kv_format"), py::call_guard<py::gil_scoped_release>());
+  m.def("batched_memcpy_h2d", &batched_memcpy_h2d, py::arg("src_ptrs"),
+        py::arg("sizes"), py::arg("dst"),
+        py::call_guard<py::gil_scoped_release>());
+  m.def("batched_memcpy_d2h", &batched_memcpy_d2h, py::arg("src"),
+        py::arg("dst_ptrs"), py::arg("sizes"),
+        py::call_guard<py::gil_scoped_release>());
+  py::class_<LoadTiming, std::shared_ptr<LoadTiming>>(m, "LoadTiming")
+      .def("result", &LoadTiming::result,
+           py::call_guard<py::gil_scoped_release>());
+  py::class_<LayerEvictor>(m, "LayerEvictor")
+      .def(py::init<>())
+      .def("start", &LayerEvictor::start, py::arg("layer_ptrs"),
+           py::arg("staging0"), py::arg("staging1"), py::arg("kvcaches"),
+           py::arg("slot_mapping"), py::arg("gpu_kv_format"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("events", &LayerEvictor::events);
+  py::class_<LayerwiseLoader>(m, "LayerwiseLoader")
+      .def(py::init<>())
+      .def("start", &LayerwiseLoader::start, py::arg("layer_ptrs"),
+           py::arg("sizes"), py::arg("staging0"), py::arg("staging1"),
+           py::arg("kvcaches"), py::arg("slot_mapping"), py::arg("gpu_kv_format"),
+           py::arg("lookahead"), py::arg("timing"),
+           py::arg("evict_events") = std::vector<int64_t>(),
+           py::call_guard<py::gil_scoped_release>())
+      .def("step", &LayerwiseLoader::step, py::arg("layer"), py::arg("wait"),
+           py::call_guard<py::gil_scoped_release>());
+  py::class_<SsdLayerwiseLoader>(m, "SsdLayerwiseLoader")
+      .def(py::init<int64_t, int64_t>(), py::arg("num_io_threads"),
+           py::arg("inflight_bytes"))
+      .def("open_files", &SsdLayerwiseLoader::open_files, py::arg("paths"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("start", &SsdLayerwiseLoader::start, py::arg("paths"),
+           py::arg("file_idx"), py::arg("offsets"), py::arg("sizes"),
+           py::arg("staging0"), py::arg("staging1"), py::arg("kvcaches"),
+           py::arg("slot_mapping"), py::arg("gpu_kv_format"), py::arg("timing"),
+           py::arg("writeback") = py::none(),
+           py::arg("evict_events") = std::vector<int64_t>(),
+           py::call_guard<py::gil_scoped_release>())
+      .def("step", &SsdLayerwiseLoader::step, py::arg("layer"),
+           py::arg("wait"), py::call_guard<py::gil_scoped_release>())
+      .def("generation", &SsdLayerwiseLoader::generation)
+      .def("set_writeback", &SsdLayerwiseLoader::set_writeback, py::arg("gen"),
+           py::arg("writeback"), py::call_guard<py::gil_scoped_release>())
+      .def("wait_writeback", &SsdLayerwiseLoader::wait_writeback,
+           py::arg("gen"), py::call_guard<py::gil_scoped_release>());
   m.def("single_layer_kv_transfer_sgl", &single_layer_kv_transfer_sgl,
         py::arg("lmc_key_value_cache"), py::arg("sgl_key_cache"),
         py::arg("sgl_value_cache"), py::arg("slot_mapping"),

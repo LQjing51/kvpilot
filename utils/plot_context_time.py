@@ -155,12 +155,12 @@ class ModelSpec:
 
 # H20
 MODELS: List[ModelSpec] = [
-    ModelSpec("Qwen3-30B-A3B",          "bf16", 786_432,    5_460_983_808,    98_304,  [100.0, 200.0, 500.0], 0, 20 * 1024.0),
-    ModelSpec("MiMo-V2-Flash-309B",     "fp8",  368_640,    28_595_716_096,   111_360, [100.0, 200.0, 500.0], 0, 20 * 1024.0),
+    ModelSpec("Qwen3-30B-A3B",          "bf16", 786_432,    5_460_983_808,    98_304,  [100.0, 200.0, 300.0], 0, 20 * 1024.0),
+    # ModelSpec("MiMo-V2-Flash-309B",     "fp8",  368_640,    28_595_716_096,   111_360, [100.0, 200.0, 400.0], 0, 20 * 1024.0),
     # ModelSpec("Llama-3-70B",            "fp16", 2_621_440,  136_902_082_560,  327_680, [50.0, 100.0, 200.0], 0, 20 * 1024.0),
     # ModelSpec("MiniMax-M2-230B",        "fp8",  1_523_712,  80_354_476_032,   126_976, [50.0, 100.0, 200.0], 0, 20 * 1024.0),
     # ModelSpec("DeepSeek-V3-671B",       "fp8",  16_990_208, 71_182_974_976,   35_136,  [50.0, 100.0, 200.0], 0, 20 * 1024.0),
-    ModelSpec("DeepSeek-V3.2-671B",     "fp8",  999_424,    107_894_800_384,  43_188,  [100.0, 200.0, 500.0], 0, 500 * 1024.0),
+    ModelSpec("DeepSeek-V3.2-671B",     "fp8",  999_424,    107_894_800_384,  43_188,  [100.0, 200.0, 300.0], 0, 500 * 1024.0),
     # ModelSpec("DeepSeek-V4-Pro-1.6T",   "fp8",  186_368,    105_983_057_920,  4_444,   [50.0, 100.0, 200.0], 0, 20 * 1024.0),
     # ModelSpec("DeepSeek-V4-Flash-284B", "fp8",  106_496,    27_623_456_768,   3_104,   [50.0, 100.0, 200.0], 0, 20 * 1024.0),
 ]
@@ -215,15 +215,21 @@ CHART_MARGIN_B_PT = 52
 Y_LABEL_X_PT = 20
 X_LABEL_Y_PT = 10
 FONT_PT = 20.0
+TITLE_FONT_PT = 24.0  # model names, axis titles, legend
 FORMULA_FONT_PT = 18.0
 FORMULA_LINE_GAP_PT = 4.0
 FORMULA_AREA_TOP_GAP_PT = 6.0
 FORMULA_AREA_H_PT = 0.0
+LEGEND_H_PT = 34
+LEGEND_SWATCH_PT = 36
+LEGEND_TEXT_GAP_PT = 8
+LEGEND_ENTRY_GAP_PT = 36
 
 
 @dataclass(frozen=True)
 class Series:
-    name: str
+    name: str   # legend entry
+    label: str  # annotation drawn next to the line
     color_rgb: Tuple[float, float, float]
     ys: List[float]
 
@@ -282,12 +288,22 @@ def _pdf_escape_text(s: str) -> str:
     return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
+# Helvetica AFM advance widths (1/1000 em) for ASCII 32..126, so centring is exact.
+_HELVETICA_W = [
+    278, 278, 355, 556, 556, 889, 667, 222, 333, 333, 389, 584, 278, 333, 278, 278,
+    556, 556, 556, 556, 556, 556, 556, 556, 556, 556,
+    278, 278, 584, 584, 584, 556, 1015,
+    667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833,
+    722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611,
+    278, 278, 278, 469, 556, 222,
+    556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833,
+    556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500,
+    334, 260, 334, 584,
+]
+
+
 def _approx_text_width_pt(s: str, font_size: float) -> float:
-    if not s:
-        return 0.0
-    ascii_count = sum(1 for ch in s if ord(ch) < 128)
-    non_ascii_count = len(s) - ascii_count
-    return ascii_count * font_size * 0.56 + non_ascii_count * font_size * 1.0
+    return sum(_HELVETICA_W[ord(ch) - 32] if 32 <= ord(ch) <= 126 else 1000 for ch in s) * font_size / 1000.0
 
 
 class _Pdf:
@@ -327,27 +343,23 @@ def _pdf_rgb_stroke(rgb: Tuple[float, float, float]) -> str:
     return f"{r:.4f} {g:.4f} {b:.4f} RG"
 
 
-def _prefill_color(idx: int, total: int) -> Tuple[float, float, float]:
-    if total <= 1:
-        t = 0.0
-    else:
-        t = idx / (total - 1)
-    # dark red (0.55, 0.0, 0.0) -> light red/pink (1.0, 0.65, 0.65)
-    r = 0.55 + (1.00 - 0.55) * t
-    g = 0.00 + (0.65 - 0.00) * t
-    b = 0.00 + (0.65 - 0.00) * t
-    return (r, g, b)
+COMPUTE_NAME, COMPUTE_RGB = "compute time", (0.80, 0.15, 0.15)
+LOAD_NAME, LOAD_RGB = "load time", (0.20, 0.40, 0.85)
 
 
-def _prefill_name(append: float) -> str:
-    return f"prefill_time (append={int(append)})"
-
-
-_LOAD_PALETTE: List[Tuple[str, Tuple[float, float, float]]] = [
-    ("load_time_hbm",  (0.20, 0.40, 0.85)),
-    ("load_time_dram", (0.40, 0.60, 0.95)),
-    ("load_time_nic",  (0.65, 0.80, 1.00)),
-]
+def _draw_legend(content: List[str], entries: Sequence[Tuple[str, Tuple[float, float, float]]],
+                 center_x: float, baseline_y: float) -> None:
+    widths = [LEGEND_SWATCH_PT + LEGEND_TEXT_GAP_PT + _approx_text_width_pt(name, TITLE_FONT_PT) for name, _ in entries]
+    x = center_x - (sum(widths) + LEGEND_ENTRY_GAP_PT * (len(entries) - 1)) / 2.0
+    for (name, rgb), w in zip(entries, widths):
+        line_y = baseline_y + TITLE_FONT_PT * 0.35
+        content.append(f"{_pdf_rgb_stroke(rgb)} 2.4 w")
+        content.append(f"{x:.2f} {line_y:.2f} m {(x + LEGEND_SWATCH_PT):.2f} {line_y:.2f} l S")
+        content.append("0 0 0 rg")
+        content.append(f"BT /F1 {TITLE_FONT_PT:.0f} Tf")
+        content.append(f"{(x + LEGEND_SWATCH_PT + LEGEND_TEXT_GAP_PT):.2f} {baseline_y:.2f} Td ({_pdf_escape_text(name)}) Tj")
+        content.append("ET")
+        x += w + LEGEND_ENTRY_GAP_PT
 
 
 def _draw_subplot(content: List[str], *, xs: Sequence[float], series: Sequence[Series],
@@ -420,11 +432,6 @@ def _draw_subplot(content: List[str], *, xs: Sequence[float], series: Sequence[S
     content.append("0 0 0 RG 2 w")
     content.append(f"{plot_left:.2f} {plot_bottom:.2f} {plot_w:.2f} {plot_h:.2f} re S")
 
-    load_display = {
-        "load_time_hbm":  "HBM",
-        "load_time_dram": "DRAM",
-        "load_time_nic":  "RNIC",
-    }
     prefill_label_specs: List[Tuple[float, float, str, Tuple[float, float, float]]] = []
     load_label_specs: List[Tuple[float, float, str, Tuple[float, float, float]]] = []
     for s in series:
@@ -438,17 +445,10 @@ def _draw_subplot(content: List[str], *, xs: Sequence[float], series: Sequence[S
         for x, y in pts[1:]:
             content.append(f"{x:.2f} {y:.2f} l")
         content.append("S")
-        if s.name.startswith("prefill_time") and len(pts) >= 2:
-            label = s.name[len("prefill_time"):].strip()
-            if label.startswith("(") and label.endswith(")"):
-                label = label[1:-1]
-            anchor_idx = max(1, int(len(pts) * 0.55))
-            ax, ay = pts[anchor_idx]
-            prefill_label_specs.append((ax, ay, label, s.color_rgb))
-        elif s.name in load_display and len(pts) >= 2:
-            anchor_idx = max(1, int(len(pts) * 0.9))
-            ax, ay = pts[anchor_idx]
-            load_label_specs.append((ax, ay, load_display[s.name], s.color_rgb))
+        if len(pts) >= 2:
+            is_compute = s.name == COMPUTE_NAME
+            ax, ay = pts[max(1, int(len(pts) * (0.55 if is_compute else 0.9)))]
+            (prefill_label_specs if is_compute else load_label_specs).append((ax, ay, s.label, s.color_rgb))
 
     placed_boxes: List[Tuple[float, float, float, float]] = []
     line_h = FORMULA_FONT_PT + 2
@@ -478,26 +478,26 @@ def _draw_subplot(content: List[str], *, xs: Sequence[float], series: Sequence[S
     for spec in sorted(prefill_label_specs, key=lambda t: t[0]):
         _place_label_above(*spec)
 
-    # load labels above their anchor; HBM is darkest/highest, place in reverse to keep order tidy
+    # load labels above their anchor, lowest line first
     for spec in sorted(load_label_specs, key=lambda t: t[1]):
         _place_label_above(*spec)
 
     x_label = "prefix length (tokens)"
-    x_label_w = _approx_text_width_pt(x_label, FONT_PT)
+    x_label_w = _approx_text_width_pt(x_label, TITLE_FONT_PT)
     content.append("0 0 0 rg")
-    content.append(f"BT /F1 {FONT_PT:.0f} Tf")
+    content.append(f"BT /F1 {TITLE_FONT_PT:.0f} Tf")
     content.append(f"{(plot_left + plot_w / 2.0 - x_label_w / 2.0):.2f} {(origin_y + X_LABEL_Y_PT):.2f} Td ({_pdf_escape_text(x_label)}) Tj")
     content.append("ET")
     if draw_y_label:
         # Rotated text grows upward from its baseline origin, so offset by half
         # the string width to centre it on the plot area (not the subplot box,
         # which includes the bottom margin holding the x-axis label).
-        label = "comp/load time (us)"
-        label_w = _approx_text_width_pt(label, FONT_PT)
+        label = "computation or loading time (us)"
+        label_w = _approx_text_width_pt(label, TITLE_FONT_PT)
         y_mid = plot_bottom + plot_h / 2.0
         content.append("q")
         content.append(f"0 1 -1 0 {(origin_x + Y_LABEL_X_PT):.2f} {(y_mid - label_w / 2.0):.2f} cm")
-        content.append(f"BT /F1 {FONT_PT:.0f} Tf")
+        content.append(f"BT /F1 {TITLE_FONT_PT:.0f} Tf")
         content.append(f"0 0 Td ({_pdf_escape_text(label)}) Tj")
         content.append("ET")
         content.append("Q")
@@ -506,19 +506,26 @@ def _draw_subplot(content: List[str], *, xs: Sequence[float], series: Sequence[S
 def _render_pdf_multi_model(model_plots: Sequence[Tuple[str, Sequence[float], Sequence[Series], Sequence[str]]]) -> bytes:
     n = len(model_plots)
     page_w = PAGE_MARGIN_L_PT + PAGE_MARGIN_R_PT + n * SUBPLOT_WIDTH_PT + (n - 1) * SUBPLOT_GAP_PT
-    page_h = PAGE_MARGIN_B_PT + FORMULA_AREA_H_PT + SUBPLOT_HEIGHT_PT + TOP_AREA_H_PT
+    page_h = PAGE_MARGIN_B_PT + FORMULA_AREA_H_PT + SUBPLOT_HEIGHT_PT + TOP_AREA_H_PT + LEGEND_H_PT
     content: List[str] = []
     content.append("1 1 1 rg 0 0 0 RG")
     content.append(f"0 0 {page_w:.2f} {page_h:.2f} re f")
 
+    legend: dict = {}
+    for _, _, series, _ in model_plots:
+        for s in series:
+            legend.setdefault(s.name, s.color_rgb)
+    _draw_legend(content, list(legend.items()), page_w / 2.0, page_h - LEGEND_H_PT + 4)
+
     for i, (model_name, xs, series, formulas) in enumerate(model_plots):
         ox = PAGE_MARGIN_L_PT + i * (SUBPLOT_WIDTH_PT + SUBPLOT_GAP_PT)
         oy = PAGE_MARGIN_B_PT + FORMULA_AREA_H_PT
-        model_text_w = _approx_text_width_pt(model_name, FONT_PT)
-        model_x = ox + SUBPLOT_WIDTH_PT / 2.0 - model_text_w / 2.0
+        model_text_w = _approx_text_width_pt(model_name, TITLE_FONT_PT)
+        plot_w = SUBPLOT_WIDTH_PT - CHART_MARGIN_L_PT - CHART_MARGIN_R_PT
+        model_x = ox + CHART_MARGIN_L_PT + plot_w / 2.0 - model_text_w / 2.0
         model_y = oy + SUBPLOT_HEIGHT_PT + MODEL_TITLE_GAP_PT
         content.append("0 0 0 rg")
-        content.append(f"BT /F1 {FONT_PT:.0f} Tf")
+        content.append(f"BT /F1 {TITLE_FONT_PT:.0f} Tf")
         content.append(f"{model_x:.2f} {model_y:.2f} Td ({_pdf_escape_text(model_name)}) Tj")
         content.append("ET")
         _draw_subplot(
@@ -573,7 +580,7 @@ def main() -> int:
 
     if not any(spec.appends for spec in MODELS):
         raise ValueError("no append lengths configured on any model")
-    load_palette = dict(_LOAD_PALETTE)
+
 
     model_plots: List[Tuple[str, Sequence[float], Sequence[Series], Sequence[str]]] = []
     for spec in MODELS:
@@ -586,19 +593,14 @@ def main() -> int:
         hbm  = [c.c_hbm_us  * x for x in xs]
         dram = [c.c_dram_us * x for x in xs]
         nic  = [c.c_nic_us  * x for x in xs]
-        appends_sorted = sorted(spec.appends)
         series: List[Series] = []
-        for i, ap in enumerate(appends_sorted):
+        for ap in sorted(spec.appends):
             ys = [c.a_us * ap * (x + ap / 2.0) + c.b_us * ap for x in xs]
-            series.append(Series(
-                name=_prefill_name(ap),
-                color_rgb=_prefill_color(i, len(appends_sorted)),
-                ys=ys,
-            ))
+            series.append(Series(COMPUTE_NAME, f"append={int(ap)}", COMPUTE_RGB, ys))
         series.extend([
-            Series(name="load_time_hbm",  color_rgb=load_palette["load_time_hbm"],  ys=hbm),
-            Series(name="load_time_dram", color_rgb=load_palette["load_time_dram"], ys=dram),
-            Series(name="load_time_nic",  color_rgb=load_palette["load_time_nic"],  ys=nic),
+            Series(LOAD_NAME, "HBM",  LOAD_RGB, hbm),
+            Series(LOAD_NAME, "DRAM", LOAD_RGB, dram),
+            Series(LOAD_NAME, "RNIC", LOAD_RGB, nic),
         ])
         model_plots.append((spec.name, xs, series, []))
 

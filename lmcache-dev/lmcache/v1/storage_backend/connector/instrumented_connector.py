@@ -207,6 +207,58 @@ class InstrumentedRemoteConnector(RemoteConnector):
     def support_batched_contains(self) -> bool:
         return self._connector.support_batched_contains()
 
+    def batched_replica_location(self, keys: List[CacheEngineKey]) -> list:
+        return self._connector.batched_replica_location(keys)
+
+    def batched_local_raw_views(self, keys: List[CacheEngineKey]):
+        fn = getattr(self._connector, "batched_local_raw_views", None)
+        return fn(keys) if fn is not None else None
+
+    def batched_local_sources(self, keys: List[CacheEngineKey]):
+        fn = getattr(self._connector, "batched_local_sources", None)
+        return fn(keys) if fn is not None else None
+
+    def batch_unpin_memory_replicas(self, keys: List[str]) -> int:
+        # Must forward: batched_local_sources pins under priority eviction.
+        fn = getattr(self._connector, "batch_unpin_memory_replicas", None)
+        return int(fn(keys)) if fn is not None else 0
+
+    def batched_locate_local_ssd(self, keys: List[CacheEngineKey]):
+        fn = getattr(self._connector, "batched_locate_local_ssd", None)
+        return fn(keys) if fn is not None else None
+
+    def kvpilot_put_start_local(self, keys: List[str], sizes: List[int]):
+        return self._connector.kvpilot_put_start_local(keys, sizes)
+
+    def kvpilot_put_end(self, keys: List[str]):
+        fn = getattr(self._connector, "kvpilot_put_end", None)
+        return fn(keys) if fn is not None else None
+
+    def kvpilot_put_revoke(self, keys: List[str]):
+        fn = getattr(self._connector, "kvpilot_put_revoke", None)
+        return fn(keys) if fn is not None else None
+
+    def kvpilot_set_group_placement(
+        self, groups: List[str], tiers: List[int], penalties_ms: List[float]
+    ) -> int:
+        return self._connector.kvpilot_set_group_placement(groups, tiers, penalties_ms)
+
+    def kvpilot_remove_local_disk(self, keys: List[str]) -> int:
+        return self._connector.kvpilot_remove_local_disk(keys)
+
+    def kvpilot_offload_local(
+        self, keys: List[str], ptrs: List[int], sizes: List[int]
+    ) -> int:
+        return self._connector.kvpilot_offload_local(keys, ptrs, sizes)
+
+    def kvpilot_exist(self, keys: List[str]):
+        fn = getattr(self._connector, "kvpilot_exist", None)
+        return fn(keys) if fn is not None else None
+
+    def kvpilot_remove(self, keys: List[str]):
+        fn = getattr(self._connector, "kvpilot_remove", None)
+        return fn(keys) if fn is not None else None
+
     def reshape_partial_chunk(
         self, memory_obj: MemoryObj, bytes_read: int
     ) -> MemoryObj:

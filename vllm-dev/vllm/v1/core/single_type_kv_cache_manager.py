@@ -96,7 +96,10 @@ class SingleTypeKVCacheManager(ABC):
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
-        return sum(blk.ref_cnt == 0 and not blk.is_null for blk in blocks)
+        # A KVPilot held block is not counted free, so touching it takes none.
+        return sum(
+            blk.ref_cnt == 0 and not blk.is_null and not blk.kvp_held for blk in blocks
+        )
 
     def get_num_blocks_to_allocate(
         self,
@@ -363,14 +366,12 @@ class SingleTypeKVCacheManager(ABC):
         """
         return None
 
-    def free(self, request_id: str, num_tokens: int = 0,
-             kv_hit_rate: float = 0.0) -> None:
+    def free(self, request_id: str) -> None:
         """
         Free the blocks for the request.
 
         Args:
             request_id: The request ID.
-            num_tokens: Total token count of the request (prompt + output).
         """
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
@@ -379,10 +380,7 @@ class SingleTypeKVCacheManager(ABC):
         # freed first.
         ordered_blocks = reversed(req_blocks)
 
-        self.block_pool.free_blocks(ordered_blocks,
-                                    kvpilot_req_num_tokens=num_tokens,
-                                    kvpilot_req_kv_hit_rate=kv_hit_rate,
-                                    request_id=request_id)
+        self.block_pool.free_blocks(ordered_blocks, request_id=request_id)
         self.num_cached_block.pop(request_id, None)
 
     @abstractmethod
@@ -758,8 +756,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
 
         return mask
 
-    def free(self, request_id: str, num_tokens: int = 0,
-             kv_hit_rate: float = 0.0) -> None:
+    def free(self, request_id: str) -> None:
         # similar to remove_skipped_blocks(), prepend the uncached blocks
         # and append the cached blocks to the free queue
         req_blocks = self.req_to_blocks.pop(request_id, [])
@@ -771,18 +768,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                     uncached_blocks.append(block)
                 else:
                     cached_blocks.append(block)
+            self.block_pool.free_blocks(cached_blocks, request_id=request_id)
             self.block_pool.free_blocks(
-                cached_blocks,
-                kvpilot_req_num_tokens=num_tokens,
-                kvpilot_req_kv_hit_rate=kv_hit_rate,
-                request_id=request_id,
-            )
-            self.block_pool.free_blocks(
-                uncached_blocks,
-                prepend=True,
-                kvpilot_req_num_tokens=num_tokens,
-                kvpilot_req_kv_hit_rate=kv_hit_rate,
-                request_id=request_id,
+                uncached_blocks, prepend=True, request_id=request_id
             )
         self.num_cached_block.pop(request_id, None)
 
@@ -1220,12 +1208,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 self._allocated_block_reqs.add(request_id)
                 return req_blocks[prev_block_len:]
 
-    def free(self, request_id: str, num_tokens: int = 0,
-             kv_hit_rate: float = 0.0) -> None:
+    def free(self, request_id: str) -> None:
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
-        super().free(request_id, num_tokens, kv_hit_rate)
+        super().free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """

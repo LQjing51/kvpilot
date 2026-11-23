@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Preprocess SWE-smith trajectories into input for benchmark_serving_multi_turn.py.
+"""Turn raw SWE-smith trajectories into a Mooncake-style trace, one request per line.
 
-SWE-smith ships two incompatible styles in one dataset:
+Each trajectory is normalized into alternating user/assistant messages. Round k
+is the request whose prompt is messages[:2k+1] rendered through the Qwen3 chat
+template, and whose output is assistant message 2k+1.
+
+Normalization. SWE-smith ships two styles in one dataset:
 
   structured   assistant turns carry a `tool_calls` array, and tool results are
                their own `role:"tool"` messages   (9,116 of 24,100 trajectories)
@@ -9,45 +13,75 @@ SWE-smith ships two incompatible styles in one dataset:
                `<function=NAME><parameter=k>v</parameter></function>`, and the
                observation comes back as a plain `user` turn  (the other 14,984)
 
-The inline style already matches what benchmark_serving_multi_turn.py accepts —
-two keys per message, user/assistant strictly alternating — so this script
-normalizes the structured ones INTO that style rather than the other way round.
-The benchmark then needs no modification at all, and both halves of the dataset
-become usable together.
+Structured ones are rewritten into the inline style, which is what
+`kvpilot_signal.turn_labels` parses. The two render within 1.5% of each other in
+tokens, because Qwen3's template serializes tool turns into a `user` message
+anyway. List-shaped `content` is flattened to text: the template's
+`{%- if message.content is string %}` silently substitutes '' for a list, which
+would erase every tool observation (measured: 64% of tokens lost). Trajectories
+the harness killed (last assistant message `Exit due to ...`) are dropped: they
+are not agent behaviour, and their 5-10 token last turn distorts the output
+budget.
 
-Rendering the same trajectory both ways through Qwen3's chat template differs by
-1.5% in tokens (12,182 vs 11,997), because that template serializes tool turns
-into a `user` message with `<tool_response>` anyway.
+A trajectory is cut before its first round with input + output above
+--max-model-len, as in prepare_tracelab_trace.py.
 
-Dropped, because no chat template reads them and one actively breaks:
-  - `agent`, `message_type`, `cache_control`  — SWE-agent bookkeeping
-  - `thought`, `action`                       — duplicates of content/tool_calls
-  - `tool_call_id(s)`, `tool_calls[].id/type/index` — Qwen3 renders none of them
-  - list-shaped `content`  — `{%- if message.content is string %}` in the
-    template silently substitutes '' for a list, which would erase every tool
-    observation (measured: 64% of tokens lost). Flattened to text instead.
+hash_ids: `hash_ids[i]` names the content of blocks 0..i, BLOCK tokens each, the
+last one possibly partial -- nodes of a prefix tree over the real token stream,
+so whatever sharing exists, in-session or across trajectories, appears by
+itself. `prefix_length` is the longest token prefix shared with any earlier
+prompt, read off the same tree (matched full blocks, then the closest sibling
+of the first unmatched one), so the full dataset costs one pass. `verify`
+replays the file through an unbounded cache to check every request hits
+floor(prefix_length / BLOCK) blocks.
+
+Each line, in trajectory order:
+    timestamp      null -- SWE-smith records no times
+    session_id round_index input_length prefix_length output_length hash_ids
+    tool_calls     call types this round's output made, in order
+
+Size: either the first --num-requests requests (0 = every trajectory), or, with
+--min-unique-kv-gib, whole trajectories until the distinct full blocks hold
+that much KV at --kv-bytes-per-token (98,304 = Qwen3-30B-A3B BF16: 48 layers x
+4 KV heads x 128 x K/V x 2 B). The committed file is --min-unique-kv-gib 400;
+swe_full.jsonl is --num-requests 0. --sessions keeps only the listed
+trajectories, as if the others were not in the input.
 
 Usage:
-  python3 prepare_swe_trace.py --input-file swe_smith_all.jsonl \\
-      --output-file swe_trace.json --max-trajectories 200
-
-  python3 benchmark_serving_multi_turn.py -i swe_trace.json \\
-      -m <MODEL_PATH> -u http://localhost:8000 -p 32
+  python3 prepare_swe_trace.py [--input swe_smith_all.jsonl]
+                               [--out swe_mooncake.jsonl]
+                               [--num-requests 2000 | --min-unique-kv-gib 400]
+                               [--sessions FILE] [--workers N]
+                               [--max-model-len 262144] [--tokenizer PATH]
 """
 
 import argparse
+import bisect
 import json
+import os
 import re
+import sys
 from collections import Counter
+from itertools import islice
+from multiprocessing import Pool
+
+import numpy as np
+
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "../../../vllm-dev/vllm/v1/core"
+    ),
+)
+from kvpilot_signal import turn_labels  # noqa: E402
+
+# mooncake_trace_replay.py expands every hash id into this many tokens.
+BLOCK = 512
+TOKEN = np.int32
 
 
 def flatten_content(content):
-    """Return message text, collapsing the `[{"type":"text","text":...}]` form.
-
-    Tool observations and first user turns use the list form. Qwen3's template
-    tests `message.content is string` and falls back to '' otherwise, so a list
-    left as-is renders empty.
-    """
+    """Return message text, collapsing the `[{"type":"text","text":...}]` form."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -94,27 +128,21 @@ def inline_tool_calls(tool_calls):
 
 # SWE-agent writes its own termination note as the final assistant message when
 # a run is killed rather than submitted: cost limit, wall-clock limit, repeated
-# syntax errors, or an upstream API error. Those turns carry no tool call, so
-# they are not agent behaviour and their length (5-10 tokens for the templated
-# ones) would distort the last request's output budget.
+# syntax errors, or an upstream API error.
 RX_ABORTED = re.compile(r"^\s*Exit due to ", re.I)
 
 
-def aborted_reason(messages):
-    """The harness's termination note, if this trajectory was killed."""
+def aborted(messages):
     for msg in reversed(messages):
-        if msg.get("role") != "assistant":
-            continue
-        text = flatten_content(msg.get("content")).strip()
-        return text if RX_ABORTED.match(text) else None
-    return None
+        if msg.get("role") == "assistant":
+            return bool(RX_ABORTED.match(flatten_content(msg.get("content"))))
+    return False
 
 
 def normalize(messages):
-    """Convert one trajectory to alternating user/assistant, two keys each.
+    """Alternating user/assistant, starting with user and ending with assistant.
 
-    Returns None when the result cannot satisfy the benchmark's invariants,
-    so the caller can skip it rather than fail mid-run.
+    Returns None when not even one user -> assistant round is left.
     """
     out = []
     for msg in messages:
@@ -127,7 +155,7 @@ def normalize(messages):
                 text = f"{text}\n\n{calls}" if text.strip() else calls
 
         # A tool observation is context the model must answer, which is the
-        # role a `user` turn plays here — and the same thing the inline half of
+        # role a `user` turn plays here -- and the same thing the inline half of
         # the dataset already does with its observations.
         if role == "tool":
             role = "user"
@@ -135,16 +163,15 @@ def normalize(messages):
         if role not in ("system", "user", "assistant"):
             continue
 
-        # The benchmark asserts the first message it sends is a user turn, so a
-        # leading system prompt has to merge into it.
+        # A leading system prompt merges into the first user turn.
         if role == "system":
             if out:
                 continue
             out.append({"role": "user", "content": text})
             continue
 
-        # Consecutive same-role turns would break the alternation assertion.
-        # They arise whenever an assistant turn held only tool_calls.
+        # Consecutive same-role turns arise whenever an assistant turn held
+        # only tool_calls; merging them keeps one round per user -> assistant.
         if out and out[-1]["role"] == role:
             merged = out[-1]["content"].rstrip()
             out[-1]["content"] = f"{merged}\n{text}" if text else merged
@@ -152,8 +179,6 @@ def normalize(messages):
 
         out.append({"role": role, "content": text})
 
-    # First turn must be user, and the transcript must end on an assistant turn
-    # because the benchmark reads messages[messages_to_use] as the answer.
     while out and out[0]["role"] != "user":
         out.pop(0)
     while out and out[-1]["role"] != "assistant":
@@ -168,153 +193,222 @@ def normalize(messages):
     return out
 
 
+class Ids:
+    """Prefix-tree node ids: one per (parent id, block content).
+
+    `children[parent]` keeps each node's child blocks sorted as bytes. Tokens
+    are fixed-width, so the child sharing the most leading tokens with a new
+    block is one of its two neighbours in that order.
+    """
+
+    def __init__(self):
+        self.table = {}
+        self.children = {}
+
+    def get(self, parent, content):
+        node = self.table.get((parent, content))
+        if node is None:
+            node = self.table[(parent, content)] = len(self.table)
+            bisect.insort(self.children.setdefault(parent, []), content)
+        return node
+
+    def shared(self, parent, content):
+        """Leading tokens `content` has in common with some child of `parent`."""
+        kids = self.children.get(parent, [])
+        i = bisect.bisect_left(kids, content)
+        a, best = np.frombuffer(content, TOKEN), 0
+        for other in kids[max(0, i - 1): i + 1]:
+            b = np.frombuffer(other, TOKEN)
+            m = min(len(a), len(b))
+            diff = np.flatnonzero(a[:m] != b[:m])
+            best = max(best, int(diff[0]) if len(diff) else m)
+        return best
+
+    def place(self, p):
+        """(hash_ids, longest token prefix shared with any earlier prompt)."""
+        h, parent, prefix = [], None, None
+        for s in range(0, len(p), BLOCK):
+            content = p[s: s + BLOCK].tobytes()
+            if prefix is None and (parent, content) not in self.table:
+                prefix = s + self.shared(parent, content)
+            parent = self.get(parent, content)
+            h.append(parent)
+        return h, len(p) if prefix is None else prefix
+
+
+_tok = _max_model_len = _sessions = None
+
+
+def _init_worker(tokenizer, max_model_len, sessions):
+    global _tok, _max_model_len, _sessions
+    from transformers import AutoTokenizer
+
+    _tok = AutoTokenizer.from_pretrained(tokenizer)
+    _max_model_len, _sessions = max_model_len, sessions
+
+
+def tokenize(line):
+    """One raw trajectory -> (traj_id, kind, rounds, cut_rounds), or None when
+    --sessions leaves it out.
+
+    kind is "aborted" / "malformed" (dropped) or "structured" / "inline".
+    rounds holds (prompt tokens, output length, tool calls) up to the
+    --max-model-len cut; cut_rounds is how many rounds that cut dropped.
+    """
+    record = json.loads(line)
+    if _sessions is not None and record["traj_id"] not in _sessions:
+        return None
+    if aborted(record["messages"]):
+        return record["traj_id"], "aborted", [], 0
+    msgs = normalize(record["messages"])
+    if msgs is None:
+        return record["traj_id"], "malformed", [], 0
+    structured = any(m.get("tool_calls") for m in record["messages"])
+
+    rounds = []
+    n_rounds = len(msgs) // 2
+    for rnd in range(n_rounds):
+        p = np.array(_tok.apply_chat_template(
+            msgs[: 2 * rnd + 1], tokenize=True, add_generation_prompt=True), dtype=TOKEN)
+        out_len = len(_tok(msgs[2 * rnd + 1]["content"],
+                           add_special_tokens=False).input_ids)
+        if len(p) + out_len > _max_model_len:
+            return (record["traj_id"], "structured" if structured else "inline",
+                    rounds, n_rounds - rnd)
+        rounds.append((p, out_len, turn_labels(msgs[2 * rnd + 1])))
+    return record["traj_id"], "structured" if structured else "inline", rounds, 0
+
+
+def tokenized(args):
+    """tokenize() over the input in file order, `--workers` processes at a time."""
+    sessions = set(open(args.sessions).read().split()) if args.sessions else None
+    with open(args.input) as fh, Pool(
+            args.workers, _init_worker,
+            (args.tokenizer, args.max_model_len, sessions)) as pool:
+        while batch := list(islice(fh, 8 * args.workers)):
+            yield from pool.map(tokenize, batch, chunksize=1)
+
+
+def convert(args, stats):
+    ids = Ids()
+    rows = []
+    full_blocks = set()             # ids of distinct full blocks written so far
+    kv_target = args.min_unique_kv_gib * 2**30 / (BLOCK * args.kv_bytes_per_token)
+    limit = None if args.min_unique_kv_gib else (args.num_requests or None)
+    for traj in tokenized(args):
+        if limit is not None and len(rows) >= limit:
+            break
+        if args.min_unique_kv_gib and len(full_blocks) >= kv_target:
+            break
+        if traj is None:
+            continue
+        traj_id, kind, rounds, cut_rounds = traj
+        stats["trajectories_seen"] += 1
+        if stats["trajectories_seen"] % 1000 == 0:
+            print(f"  ... 轨迹 {stats['trajectories_seen']:,}，请求 {len(rows):,}",
+                  file=sys.stderr, flush=True)
+        if kind in ("aborted", "malformed"):
+            stats[f"drop_{kind}"] += 1
+            continue
+        stats[kind] += 1
+
+        for rnd, (p, out_len, tool_calls) in enumerate(rounds):
+            h, prefix = ids.place(p)
+            full_blocks.update(h[: len(p) // BLOCK])
+            rows.append({
+                "timestamp": None,
+                "session_id": traj_id,
+                "round_index": rnd,
+                "input_length": len(p),
+                "prefix_length": prefix,
+                "output_length": out_len,
+                "hash_ids": h,
+                "tool_calls": tool_calls,
+            })
+            if limit is not None and len(rows) >= limit:
+                break
+        else:
+            if cut_rounds:
+                stats["cut_sessions"] += 1
+                stats["cut_rounds"] += cut_rounds
+    stats["unique_full_blocks"] = len(full_blocks)
+    return rows
+
+
+def renumber(rows):
+    """Ids from 0 in order of first appearance in the output."""
+    new = {}
+    for r in rows:
+        r["hash_ids"] = [new.setdefault(h, len(new)) for h in r["hash_ids"]]
+
+
+def verify(rows):
+    """Unbounded-cache replay in file order; returns (mismatches, hit rate)."""
+    seen = set()
+    bad = hit = total = 0
+    for r in rows:
+        full = r["input_length"] // BLOCK
+        h = r["hash_ids"]
+        k = 0
+        while k < full and h[k] in seen:
+            k += 1
+        bad += k != r["prefix_length"] // BLOCK
+        hit += k * BLOCK
+        total += r["input_length"]
+        seen.update(h[:full])
+    return bad, hit / total if total else 0.0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--input-file",
-        default="swe_smith_all.jsonl",
-        help="8 个 tool-*.parquet 合并出的原始 JSONL，一行一条轨迹。",
-    )
-    ap.add_argument(
-        "--output-file",
-        default="swe_trace.json",
-        help="给 benchmark_serving_multi_turn.py 用的 JSON 数组。",
-    )
-    ap.add_argument("--max-trajectories", type=int, default=0, help="0 = 全部")
-    ap.add_argument(
-        "--resolved-only",
-        action="store_true",
-        help="只保留补丁真正修好任务的轨迹（全量里约 39%%）。",
-    )
-    ap.add_argument(
-        "--tokenizer",
-        default=None,
-        help="模型路径或 HF 名称。给了才能统计 token 分布并启用 "
-        "--max-prompt-tokens（需要 transformers）。",
-    )
-    ap.add_argument(
-        "--max-prompt-tokens",
-        type=int,
-        default=0,
-        help="整段对话超过这个 token 数就跳过，避免撞 --max-model-len。0 = 不限。",
-    )
-    ap.add_argument("--min-turns", type=int, default=2)
-    ap.add_argument(
-        "--keep-aborted",
-        action="store_true",
-        help="保留被 harness 强制终止的轨迹（末条是 'Exit due to ...'）。"
-        "默认剔除：它们没有 tool call，末条只有 5-10 token，"
-        "会让最后一次请求的输出预算失真。",
-    )
+    ap.add_argument("--input", default="swe_smith_all.jsonl",
+                    help="8 个 tool-*.parquet 合并出的原始 JSONL，一行一条轨迹")
+    ap.add_argument("--out", default="swe_mooncake.jsonl")
+    ap.add_argument("--num-requests", type=int, default=2000,
+                    help="按文件顺序写满 N 条请求为止；0 = 全部轨迹")
+    ap.add_argument("--min-unique-kv-gib", type=float, default=0,
+                    help="非 0 时取代 --num-requests：按整条轨迹写，直到不同的整块 "
+                         "合计 KV 达到这么多 GiB")
+    ap.add_argument("--kv-bytes-per-token", type=int, default=98_304,
+                    help="每 token 的 KV 字节（全部层、K+V）；默认 Qwen3-30B-A3B BF16")
+    ap.add_argument("--max-model-len", type=int, default=262144,
+                    help="服务端 --max-model-len；轨迹在第一次 input+output "
+                         "超过它的那一轮截断")
+    ap.add_argument("--tokenizer", default="Qwen/Qwen3-30B-A3B-Instruct-2507",
+                    help="须与服务端模型一致；集群上传本地路径")
+    ap.add_argument("--sessions",
+                    help="只处理这个文件里列出的 traj_id（空白分隔），其余轨迹当作不存在："
+                         "不计数、不进前缀树")
+    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1),
+                    help="tokenize 的进程数")
     args = ap.parse_args()
 
-    tokenizer = None
-    if args.tokenizer:
-        from transformers import AutoTokenizer
+    s = Counter()
+    rows = convert(args, s)
+    renumber(rows)
+    bad, hit_rate = verify(rows)
 
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    with open(args.out, "w") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
 
-    out = []
-    skipped = too_long = aborted = 0
-    aborted_reasons = Counter()
-    n_structured = n_inline = 0
-    turn_counts = []
-    token_counts = []
-
-    with open(args.input_file) as fh:
-        for line in fh:
-            record = json.loads(line)
-            if args.resolved_only and not record.get("resolved"):
-                continue
-
-            reason = aborted_reason(record["messages"])
-            if reason is not None and not args.keep_aborted:
-                aborted += 1
-                aborted_reasons[reason.split(":")[0][:60]] += 1
-                continue
-
-            was_structured = any(m.get("tool_calls") for m in record["messages"])
-            messages = normalize(record["messages"])
-            if messages is None or len(messages) < args.min_turns:
-                skipped += 1
-                continue
-
-            if tokenizer is not None:
-                total = sum(
-                    len(tokenizer(m["content"], add_special_tokens=False).input_ids)
-                    for m in messages
-                )
-                if args.max_prompt_tokens and total > args.max_prompt_tokens:
-                    too_long += 1
-                    continue
-                token_counts.append(total)
-
-            out.append({"id": record["traj_id"], "messages": messages})
-            turn_counts.append(len(messages))
-            if was_structured:
-                n_structured += 1
-            else:
-                n_inline += 1
-
-            if args.max_trajectories and len(out) >= args.max_trajectories:
-                break
-
-    # indent=1 keeps one "id" per line: the benchmark regex-scans the raw file
-    # to map each conversation back to its source line number.
-    with open(args.output_file, "w") as fh:
-        json.dump(out, fh, ensure_ascii=False, indent=1)
-
-    print(f"轨迹数:       {len(out):,}  (原结构化 {n_structured:,} + 原内联 {n_inline:,})")
-    if skipped:
-        print(f"不合规跳过:   {skipped:,}")
-    if too_long:
-        print(f"超长跳过:     {too_long:,}")
-    if aborted:
-        print(f"异常终止剔除: {aborted:,}")
-        for reason, cnt in aborted_reasons.most_common():
-            print(f"   {cnt:6,d}  {reason}")
-    if turn_counts:
-        turn_counts.sort()
-        print(
-            f"每轨迹轮数:   p50={turn_counts[len(turn_counts) // 2]}"
-            f" min={turn_counts[0]} max={turn_counts[-1]}"
-        )
-    if token_counts:
-        token_counts.sort()
-        q = lambda p: token_counts[int(len(token_counts) * p)]  # noqa: E731
-        print(
-            f"整段 token:   p50={q(0.5):,} p90={q(0.9):,} max={token_counts[-1]:,}"
-        )
-    print(f"已写入:       {args.output_file}")
-
-    verify(args.output_file)
-
-
-def verify(path):
-    """Re-read the output and assert exactly what the benchmark asserts."""
-    data = json.load(open(path))
-    problems = 0
-    for item in data:
-        messages = item["messages"]
-        for msg in messages:
-            if set(msg.keys()) != {"role", "content"}:
-                problems += 1
-                break
-            if not isinstance(msg["content"], str):
-                problems += 1
-                break
-        for i in range(len(messages) - 1):
-            if messages[i]["role"] == messages[i + 1]["role"]:
-                problems += 1
-                break
-        if messages[0]["role"] != "user" or messages[-1]["role"] != "assistant":
-            problems += 1
-        if len(messages) % 2:
-            problems += 1
-    print(
-        f"校验:         {len(data):,} 条轨迹，{problems} 处问题"
-        f"（键名/类型/交替/首末/偶数轮）"
-    )
+    sessions = len({r["session_id"] for r in rows})
+    cross = sum(r["round_index"] == 0 and r["prefix_length"] >= BLOCK for r in rows)
+    print(f"读入轨迹 {s['trajectories_seen']:,}")
+    print(f"  剔除 harness 强制终止的    {s['drop_aborted']:,}")
+    print(f"  剔除 规整后不足一轮的      {s['drop_malformed']:,}")
+    print(f"  超过 --max-model-len {args.max_model_len:,} 截断 "
+          f"{s['cut_sessions']:,} 条轨迹，丢尾部 {s['cut_rounds']:,} 轮")
+    print(f"保留轨迹 原结构化 {s['structured']:,} + 原内联 {s['inline']:,}")
+    print(f"写出 {len(rows):,} 条请求 / {sessions:,} 条轨迹，"
+          f"round 0 跨轨迹命中 ≥1 块的 {cross:,} 条")
+    kv = s["unique_full_blocks"] * BLOCK * args.kv_bytes_per_token / 2**30
+    print(f"不同的整块 {s['unique_full_blocks']:,} 个 = {kv:.1f} GiB KV")
+    print(f"无限缓存回放：命中率 {hit_rate:.1%}，"
+          f"命中块数 != floor(prefix/{BLOCK}) 的 {bad} 条")
+    print(f"-> {args.out}")
+    if bad:
+        sys.exit("hash_ids 与 prefix_length 不一致")
 
 
 if __name__ == "__main__":

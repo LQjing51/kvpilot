@@ -265,12 +265,11 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     heartbeat_running_.store(true);
     heartbeat_thread_ = std::thread([this]() {
         LOG(INFO) << "Starting periodic task with interval: "
-                  << config_.heartbeat_interval_seconds
-                  << "s, running is: " << heartbeat_running_.load();
+                  << config_.HeartbeatInterval().count()
+                  << "ms, running is: " << heartbeat_running_.load();
         while (heartbeat_running_.load()) {
             Heartbeat();
-            std::this_thread::sleep_for(
-                std::chrono::seconds(config_.heartbeat_interval_seconds));
+            std::this_thread::sleep_for(config_.HeartbeatInterval());
         }
     });
     client_buffer_gc_running_.store(true);
@@ -365,6 +364,11 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                        << query_result.error();
             continue;
         }
+        // BatchQuery → GetReplicaList pins memory (KVPilot);
+        // drop those pins once the offload read (and any D2H staging) is done.
+        auto unpin_query = [this, &keys]() {
+            (void)client_->BatchUnpinMemoryReplicas(keys);
+        };
 
         auto eviction_handler = [this](const std::vector<std::string>&
                                            evicted_keys) {
@@ -445,6 +449,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         for (auto& buf : staging_bufs) {
             pinned_buffer_pool_->Release(buf);
         }
+        unpin_query();
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();
@@ -672,6 +677,61 @@ void FileStorage::ClientBufferGCThreadFunc() {
             std::chrono::seconds(config_.client_buffer_gc_interval_seconds));
     }
     LOG(INFO) << "action=client_buffer_gc_thread_stopped";
+}
+
+std::vector<std::tuple<std::string, int64_t, int64_t>> FileStorage::BatchLocate(
+    const std::vector<std::string>& keys) {
+    auto bucket_backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    if (!bucket_backend) {
+        return std::vector<std::tuple<std::string, int64_t, int64_t>>(
+            keys.size(), {std::string(), 0, 0});
+    }
+    return bucket_backend->BatchLocate(keys);
+}
+
+tl::expected<int64_t, ErrorCode> FileStorage::OffloadHostBuffers(
+    const std::vector<std::string>& keys, const std::vector<Slice>& values) {
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        batch[keys[i]] = {values[i]};
+    }
+    auto complete_handler =
+        [this](const std::vector<std::string>& done,
+               std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+        for (auto& metadata : metadatas) {
+            metadata.transport_endpoint = local_rpc_addr_;
+        }
+        auto result = client_->NotifyOffloadSuccess(done, metadatas);
+        if (!result) {
+            LOG(ERROR) << "OffloadHostBuffers: NotifyOffloadSuccess failed: "
+                       << result.error();
+            return result.error();
+        }
+        return ErrorCode::OK;
+    };
+    auto eviction_handler = [this](const std::vector<std::string>& evicted) {
+        if (evicted.empty()) return;
+        (void)client_->BatchEvictDiskReplica(evicted, ReplicaType::LOCAL_DISK);
+    };
+    auto res =
+        storage_backend_->BatchOffload(batch, complete_handler, eviction_handler);
+    if (!res) {
+        LOG(ERROR) << "OffloadHostBuffers failed: " << res.error();
+        return tl::make_unexpected(res.error());
+    }
+    return static_cast<int64_t>(keys.size());
+}
+
+int64_t FileStorage::BatchRemoveKeys(const std::vector<std::string>& keys) {
+    auto bucket_backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    if (!bucket_backend) {
+        LOG(ERROR) << "BatchRemoveKeys: SSD offload needs the bucket backend";
+        return -1;
+    }
+    return bucket_backend->BatchRemoveKeys(keys);
 }
 
 bool FileStorage::ReleaseBuffer(uint64_t batch_id) {

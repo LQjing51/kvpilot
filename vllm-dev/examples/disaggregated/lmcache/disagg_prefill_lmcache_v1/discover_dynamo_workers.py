@@ -189,7 +189,9 @@ def warm_nixl_pairs(
 
     for prefill_id in prefill_ids:
         for decode_id in decode_ids:
-            request_id = str(uuid.uuid4())
+            # First group ffffffff: KVPilot's signal source treats it as a
+            # warm-up request (no trace line).
+            request_id = "ffffffff" + str(uuid.uuid4())[8:]
             payload = {
                 "model": args.model,
                 "prompt": [100 + ((prefill_id + decode_id + i) % 1000) for i in range(4096)],

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include <glog/logging.h>
 
 #include <atomic>
@@ -9,6 +11,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "file_interface.h"
@@ -216,6 +219,17 @@ struct FileStorageConfig {
 
     // Interval between heartbeats sent to the control plane (in seconds)
     uint32_t heartbeat_interval_seconds = 10;
+
+    // KVPilot: the same interval in milliseconds; > 0 overrides the seconds.
+    // A value reaches SSD up to one heartbeat after its put, so a short
+    // interval bounds that wait.
+    uint32_t heartbeat_interval_ms = 100;
+
+    std::chrono::milliseconds HeartbeatInterval() const {
+        return heartbeat_interval_ms > 0
+                   ? std::chrono::milliseconds(heartbeat_interval_ms)
+                   : std::chrono::milliseconds(heartbeat_interval_seconds * 1000ULL);
+    }
 
     // Interval between client_buffer_gc (in seconds)
     uint32_t client_buffer_gc_interval_seconds = 1;
@@ -737,6 +751,22 @@ class BucketStorageBackend : public StorageBackendInterface {
         const std::vector<std::string>& keys,
         std::unordered_map<std::string, StorageObjectMetadata>&
             batch_object_metadata);
+
+    /**
+     * @brief KVPilot: (data file path, value offset, value size) per key, an
+     * empty path for keys not stored here. Unlike BatchQuery, a missing key is
+     * not an error, so a caller can probe a mixed batch in one call.
+     */
+    std::vector<std::tuple<std::string, int64_t, int64_t>> BatchLocate(
+        const std::vector<std::string>& keys);
+
+    /**
+     * @brief KVPilot exclusive placement: drop keys whose chunk left SSD.
+     * A bucket with no key left is deleted, freeing its space; the rest stay
+     * until their last key goes. Missing keys are skipped.
+     * @return Number of keys this backend held.
+     */
+    int64_t BatchRemoveKeys(const std::vector<std::string>& keys);
 
     /**
      * @brief Loads data for multiple objects in a batch operation.

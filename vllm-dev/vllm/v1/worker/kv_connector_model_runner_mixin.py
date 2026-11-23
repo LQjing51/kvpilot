@@ -94,10 +94,10 @@ class KVConnectorModelRunnerMixin:
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
         #
-        # Timed alongside the per-layer waits: with layerwise loading this
-        # submits the fetches and then blocks on the first layer, so it is a
-        # genuine pre-forward stall and belongs in the same total. Reset first,
-        # so the accumulator covers exactly this forward.
+        # Timed alongside the per-layer waits: with layerwise loading this sets
+        # the load up before the forward, while the GPU has nothing queued, so
+        # it is a genuine pre-forward stall and belongs in the same total.
+        # Reset first, so the accumulator covers exactly this forward.
         kvpilot_load_stall.begin_step()
         timer = kvpilot_load_stall.time_wait()
         if timer is None:
@@ -122,10 +122,8 @@ class KVConnectorModelRunnerMixin:
 
             # Read after the forward has returned, so every per-layer wait is
             # included. A forward is shared by the whole batch, so this is a
-            # step total; the scheduler splits it per request.
-            output.kvpilot_stall_ns, output.kvpilot_num_waits = (
-                kvpilot_load_stall.take_step()
-            )
+            # step total; the scheduler charges it to the step's prefill.
+            output.kvpilot_wait_ns = kvpilot_load_stall.take_step()
 
             if not defer_finalize:
                 kv_connector.clear_connector_metadata()

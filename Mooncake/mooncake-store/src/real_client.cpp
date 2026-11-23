@@ -731,12 +731,6 @@ RealClient::RealClient() {
     mooncake::init_ylt_log_level();
     const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
     use_hugepage_ = (hp != nullptr);
-    // Back global segments with POSIX shared memory so same-host peers can mmap
-    // them and read KV without a cross-process copy.
-    const char *shm_hbm = std::getenv("ENABLE_SHM_MOONCAKE_HBM");
-    use_shm_segments_ =
-        shm_hbm != nullptr && std::string(shm_hbm) != "0" &&
-        std::string(shm_hbm) != "false" && std::string(shm_hbm) != "False";
 }
 
 RealClient::~RealClient() {
@@ -4806,6 +4800,136 @@ RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
         }
     }
     return replica_map;
+}
+
+std::vector<std::tuple<std::string, int64_t, int64_t>>
+RealClient::batch_locate_local_ssd(const std::vector<std::string> &keys) {
+    if (!file_storage_) {
+        return std::vector<std::tuple<std::string, int64_t, int64_t>>(
+            keys.size(), {std::string(), 0, 0});
+    }
+    return file_storage_->BatchLocate(keys);
+}
+
+int64_t RealClient::batch_offload_local(const std::vector<std::string> &keys,
+                                        const std::vector<uintptr_t> &ptrs,
+                                        const std::vector<size_t> &sizes) {
+    if (!file_storage_) {
+        LOG(ERROR) << "batch_offload_local: SSD offload is off";
+        return -1;
+    }
+    std::vector<Slice> values;
+    values.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        values.push_back(Slice{reinterpret_cast<void *>(ptrs[i]), sizes[i]});
+    }
+    auto result = file_storage_->OffloadHostBuffers(keys, values);
+    return result ? result.value() : -1;
+}
+
+int64_t RealClient::batch_remove_local_disk(
+    const std::vector<std::string> &keys) {
+    if (!file_storage_) {
+        LOG(ERROR) << "batch_remove_local_disk: SSD offload is off";
+        return -1;
+    }
+    return file_storage_->BatchRemoveKeys(keys);
+}
+
+int64_t RealClient::batch_set_group_placement(
+    const std::vector<std::string> &groups, const std::vector<int32_t> &tiers,
+    const std::vector<double> &penalties_ms) {
+    if (!client_) {
+        LOG(ERROR) << "batch_set_group_placement: client not initialized";
+        return -1;
+    }
+    auto result = client_->SetGroupPlacement(groups, tiers, penalties_ms);
+    if (!result) {
+        LOG(ERROR) << "batch_set_group_placement failed: "
+                   << toString(result.error());
+        return -1;
+    }
+    return result.value();
+}
+
+int64_t RealClient::batch_unpin_memory_replicas(
+    const std::vector<std::string> &keys) {
+    if (!client_) {
+        LOG(ERROR) << "batch_unpin_memory_replicas: client not initialized";
+        return -1;
+    }
+    auto result = client_->BatchUnpinMemoryReplicas(keys);
+    if (!result) {
+        LOG(ERROR) << "batch_unpin_memory_replicas failed: "
+                   << toString(result.error());
+        return -1;
+    }
+    return result.value();
+}
+
+std::vector<uint64_t> RealClient::batch_put_start_local(
+    const std::vector<std::string> &keys, const std::vector<uint64_t> &sizes,
+    const ReplicateConfig &config) {
+    std::vector<uint64_t> addrs(keys.size(), 0);
+    if (!client_ || keys.size() != sizes.size() || keys.empty()) {
+        return addrs;
+    }
+    auto results = client_->KvpBatchPutStart(keys, sizes, config);
+    std::vector<std::string> unusable;
+    for (size_t i = 0; i < keys.size() && i < results.size(); ++i) {
+        if (!results[i]) {
+            continue;
+        }
+        uint64_t addr = 0;
+        bool other = false;
+        for (const auto &replica : results[i].value()) {
+            if (!replica.is_memory_replica()) {
+                other = true;
+                continue;
+            }
+            const auto &buf = replica.get_memory_descriptor().buffer_descriptor;
+            if (addr == 0 && buf.transport_endpoint_ == local_hostname &&
+                buf.size_ == sizes[i]) {
+                addr = buf.buffer_address_;
+            } else {
+                other = true;
+            }
+        }
+        // Only a single replica in our own segment can be written in place.
+        if (addr == 0 || other) {
+            unusable.push_back(keys[i]);
+        } else {
+            addrs[i] = addr;
+        }
+    }
+    if (!unusable.empty()) {
+        client_->KvpBatchPutRevoke(unusable);
+    }
+    return addrs;
+}
+
+std::vector<int> RealClient::batch_put_end(
+    const std::vector<std::string> &keys) {
+    std::vector<int> codes(keys.size(),
+                           static_cast<int>(ErrorCode::INTERNAL_ERROR));
+    if (!client_ || keys.empty()) return codes;
+    auto results = client_->KvpBatchPutEnd(keys);
+    for (size_t i = 0; i < keys.size() && i < results.size(); ++i) {
+        codes[i] = results[i] ? 0 : static_cast<int>(results[i].error());
+    }
+    return codes;
+}
+
+std::vector<int> RealClient::batch_put_revoke(
+    const std::vector<std::string> &keys) {
+    std::vector<int> codes(keys.size(),
+                           static_cast<int>(ErrorCode::INTERNAL_ERROR));
+    if (!client_ || keys.empty()) return codes;
+    auto results = client_->KvpBatchPutRevoke(keys);
+    for (size_t i = 0; i < keys.size() && i < results.size(); ++i) {
+        codes[i] = results[i] ? 0 : static_cast<int>(results[i].error());
+    }
+    return codes;
 }
 
 std::vector<std::string> RealClient::batch_replica_clear(

@@ -13,7 +13,7 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
-from vllm.v1.core import kvpilot_hbm_snapshot
+from vllm.v1.core import kvpilot_hbm_snapshot, kvpilot_placement
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -22,12 +22,8 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashWithGroupId,
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
-    FreeKVCacheHeap,
-    FreeKVCacheLengthQueue,
-    FreeKVCacheOfflineDramSafeQueue,
-    FreeKVCacheOnlineDramSafeQueue,
+    FreeKVCacheClassQueue,
     KVCacheBlock,
-    env_on,
     generate_block_hash_extra_keys,
     get_block_hash,
     get_group_id,
@@ -177,25 +173,13 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        if env_on("KVPILOT_ONLINE_DRAM_SAFE"):
-            self.free_block_queue = FreeKVCacheOnlineDramSafeQueue(self.blocks)
-            logger.info("Using KVPilot online DRAM-safe KV block eviction")
-        elif env_on("KVPILOT_OFFLINE_DRAM_SAFE"):
-            self.free_block_queue = FreeKVCacheOfflineDramSafeQueue(self.blocks)
-            logger.info("Using KVPilot offline DRAM-safe KV block eviction")
+        if kvpilot_placement.strategy() != kvpilot_placement.LRU:
+            self.free_block_queue = FreeKVCacheClassQueue(self.blocks)
         else:
             self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
-        # self.free_block_queue = FreeKVCacheHeap(self.blocks)
-        # self.free_block_queue = FreeKVCacheLengthQueue(self.blocks)
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
-        self.disable_local_prefix_cache_lookup = env_on(
-            "DISABLE_LOCAL_PREFIX_CACHE_LOOKUP"
-        )
-        if self.disable_local_prefix_cache_lookup:
-            logger.info("Local prefix cache lookup is disabled by "
-                        "DISABLE_LOCAL_PREFIX_CACHE_LOOKUP")
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -227,9 +211,6 @@ class BlockPool:
         Returns:
             The cached blocks if exists, or None.
         """
-        if self.disable_local_prefix_cache_lookup:
-            return None
-
         cached_blocks = []
         for group_id in kv_cache_group_ids:
             block_hash_with_group_id = make_block_hash_with_group_id(
@@ -432,11 +413,6 @@ class BlockPool:
             return False
 
         block.reset_hash()
-        # The block is being repurposed; clear stale priority metadata so
-        # the next user starts fresh.
-        block.kvpilot_req_num_tokens = 0
-        block.kvpilot_req_kv_hit_rate = 0.0
-        block.kvpilot_next_dram_safe = False
 
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(
@@ -447,6 +423,11 @@ class BlockPool:
                 )
             )
         return True
+
+    def kvpilot_uncache(self, block: KVCacheBlock) -> bool:
+        """Drop a block's KV from the prefix cache (exclusive placement: its
+        copy now lives in a lower tier). The block itself stays where it is."""
+        return self._maybe_evict_cached_block(block)
 
     def touch(self, blocks: Sequence[KVCacheBlock],
               request_id: str | None = None) -> None:
@@ -489,54 +470,10 @@ class BlockPool:
         #         request_id, len(touched_info), touched_info,
         #     )
 
-    def _log_free_block_distribution(self) -> None:
-        """Log free-block counts plus cached-block request statistics."""
-        all_free = self.free_block_queue.get_all_free_blocks()
-        if not all_free:
-            return
-
-        cached_free = [b for b in all_free if b.block_hash is not None]
-        num_cached = len(cached_free)
-        num_blank = len(all_free) - num_cached
-        # counter is only meaningful for FreeKVCacheHeap; -1 for other pools.
-        get_counter = getattr(self.free_block_queue, "get_counter", None)
-        counter = get_counter() if get_counter is not None else -1
-
-        if not cached_free:
-            logger.info(
-                "Free blocks distribution: counter=%d total=%d "
-                "(blank=%d, cached=%d)",
-                counter, len(all_free), num_blank, num_cached,
-            )
-            return
-
-        def percentile(values, p):
-            idx = int(p / 100.0 * (len(values) - 1))
-            return values[idx]
-
-        token_values = sorted(b.kvpilot_req_num_tokens for b in cached_free)
-        hit_rate_values = sorted(b.kvpilot_req_kv_hit_rate for b in cached_free)
-        logger.info(
-            "Free blocks distribution: counter=%d total=%d "
-            "(blank=%d, cached=%d) | "
-            "cached_req_num_tokens: min=%d, p20=%d, p40=%d, p60=%d, "
-            "p80=%d, max=%d | "
-            "cached_req_kv_hit_rate: min=%.3f, p20=%.3f, p40=%.3f, "
-            "p60=%.3f, p80=%.3f, max=%.3f",
-            counter, len(all_free), num_blank, num_cached, token_values[0],
-            percentile(token_values, 20), percentile(token_values, 40),
-            percentile(token_values, 60), percentile(token_values, 80),
-            token_values[-1], hit_rate_values[0], percentile(hit_rate_values, 20),
-            percentile(hit_rate_values, 40), percentile(hit_rate_values, 60),
-            percentile(hit_rate_values, 80), hit_rate_values[-1],
-        )
-
     def free_blocks(
         self,
         ordered_blocks: Iterable[KVCacheBlock],
         prepend: bool = False,
-        kvpilot_req_num_tokens: int = 0,
-        kvpilot_req_kv_hit_rate: float = 0.0,
         request_id: str | None = None,
     ) -> None:
         """Free a list of blocks. The blocks should be ordered by their
@@ -547,12 +484,8 @@ class BlockPool:
                 priority.
             prepend: Whether to put newly-free blocks at the front of the free
                 queue to be prioritized for reuse.
-            kvpilot_req_num_tokens: Total token count of the request that owned
-                these blocks. Used by length-based priority queues.
-            kvpilot_req_kv_hit_rate: KV hit rate of the request that owned these
-                blocks. Used by heap priority eviction.
-            request_id: Optional request ID that owned these blocks,
-                used only for logging.
+            request_id: Optional request ID that owned these blocks, used
+                only by the HBM pool census.
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
@@ -564,27 +497,11 @@ class BlockPool:
             if _SAMPLE_POOL and request_id
             else -1
         )
-        # logger.debug(
-        #     "free_blocks called for req=%s with %d blocks, "
-        #     "kvpilot_req_num_tokens=%d",
-        #     request_id, len(blocks_list), kvpilot_req_num_tokens,
-        # )
         for block in blocks_list:
             block.ref_cnt -= 1
             if _SAMPLE_POOL:
                 block.kvpilot_last_access_ns = now_ns
                 block.kvpilot_last_req_line = line
-            # kvpilot_req_num_tokens drives eviction priority. Un-hashed blocks
-            # (e.g. trailing partial blocks) are never cached and have no reuse
-            # value, so pin them to 0 rather than inheriting the owner's length.
-            if block.block_hash is None:
-                block.kvpilot_req_num_tokens = 0
-                block.kvpilot_req_kv_hit_rate = 0.0
-                block.kvpilot_next_dram_safe = False
-            else:
-                block.kvpilot_req_kv_hit_rate = kvpilot_req_kv_hit_rate
-                if kvpilot_req_num_tokens > block.kvpilot_req_num_tokens:
-                    block.kvpilot_req_num_tokens = kvpilot_req_num_tokens
         freed_blocks = [
             block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
         ]
@@ -592,7 +509,6 @@ class BlockPool:
             self.free_block_queue.prepend_n(freed_blocks)
         else:
             self.free_block_queue.append_n(freed_blocks)
-        self._log_free_block_distribution()
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -637,9 +553,6 @@ class BlockPool:
         # Remove all hashes from all blocks
         for block in self.blocks:
             block.reset_hash()
-            block.kvpilot_req_num_tokens = 0
-            block.kvpilot_req_kv_hit_rate = 0.0
-            block.kvpilot_next_dram_safe = False
 
         # Rebuild the free pool so its internal ordering / classification is
         # consistent with the freshly reset block state. Mirrors __init__:

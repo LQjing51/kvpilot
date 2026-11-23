@@ -111,7 +111,54 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     # lazy import to avoid triggering `torch.compile` too early
     from vllm.config.quantization import _ONLINE_SHORTHANDS
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
-    from vllm.models.deepseek_v4 import DeepseekV4FP8Config
+
+    # DeepseekV4FP8Config pulls FlashMLA. _verify_quantization probes every
+    # override name (including this one) for any FP8 checkpoint, so a missing
+    # flashmla submodule must not break plain fp8 / Qwen-FP8.
+    if quantization == "deepseek_v4_fp8":
+        try:
+            from vllm.models.deepseek_v4 import DeepseekV4FP8Config
+            return DeepseekV4FP8Config
+        except ImportError:
+            from vllm.model_executor.layers.quantization.base_config import (
+                QuantizationConfig as _QC,
+            )
+
+            class _UnavailableDeepseekV4FP8(_QC):
+                @classmethod
+                def override_quantization_method(cls, *args, **kwargs):
+                    return None
+
+                @classmethod
+                def get_name(cls):
+                    return "deepseek_v4_fp8"
+
+                @classmethod
+                def get_supported_act_dtypes(cls):
+                    return []
+
+                @classmethod
+                def get_min_capability(cls):
+                    return 0
+
+                @classmethod
+                def get_config_filenames(cls):
+                    return []
+
+                @classmethod
+                def from_config(cls, config):
+                    raise ImportError(
+                        "deepseek_v4_fp8 requires FlashMLA "
+                        "(vllm.third_party.flashmla)"
+                    )
+
+                def get_quant_method(self, *args, **kwargs):
+                    raise ImportError(
+                        "deepseek_v4_fp8 requires FlashMLA "
+                        "(vllm.third_party.flashmla)"
+                    )
+
+            return _UnavailableDeepseekV4FP8
 
     from .auto_gptq import AutoGPTQConfig
     from .awq import AWQConfig
@@ -162,7 +209,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "inc": INCConfig,
         "mxfp4": Mxfp4Config,
         "gpt_oss_mxfp4": GptOssMxfp4Config,
-        "deepseek_v4_fp8": DeepseekV4FP8Config,
         "humming": HummingConfig,
         "online": OnlineQuantizationConfig,
     }

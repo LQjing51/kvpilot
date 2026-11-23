@@ -18,6 +18,7 @@ from typing import (
 import asyncio
 import functools
 import threading
+import time
 
 # Third Party
 import torch
@@ -53,6 +54,15 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+
+async def _timed(coro, out: List[int]):
+    # Starts when the loop runs it, so queueing behind earlier layers is excluded.
+    t0 = time.perf_counter_ns()
+    try:
+        return await coro
+    finally:
+        out.append(time.perf_counter_ns() - t0)
 
 
 # Helper function to get the class name of the backend
@@ -515,6 +525,7 @@ class StorageManager:
         self,
         keys: List[List[CacheEngineKey]],
         location: Optional[str] = None,
+        fetch_ns: Optional[List[int]] = None,
     ) -> Generator[Future, None, None]:
         """
         Non-blocking function to get the memory objects into the storages
@@ -526,6 +537,9 @@ class StorageManager:
             dimension corresponds to the number of layers, and the second
             dimension corresponds to the number of chunks.
 
+        :param fetch_ns: If given, each layer's fetch duration (ns, from
+            when it starts running on the loop to when it returns) is appended.
+
         :return: A generator that yields a future for each layer.
         """
         if location is None:
@@ -535,6 +549,8 @@ class StorageManager:
             backend = self.storage_backends[location]
             # TODO(Jiayi): need to make async loading and layerwise compatible
             coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
+            if fetch_ns is not None:
+                coro = _timed(coro, fetch_ns)
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
             yield task
 

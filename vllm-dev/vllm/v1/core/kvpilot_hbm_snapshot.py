@@ -8,10 +8,10 @@ come out of that: idle time is what LRU orders by, and the request's lookahead
 load/compute ratio -- joined offline through the request id -- is what KVPilot
 orders by. Plotting one against the other shows where the two disagree.
 
-Deliberately independent of the dram-safe feature: nothing here imports the
-predictor or the tiered queues, and no verdict is read or written. The plot's
-whole purpose is to compare a KVPilot run against a plain-LRU baseline, so this
-has to record the same fields when every KVPilot switch is off.
+Deliberately independent of the placement strategies: nothing here imports
+them, and no signal is read or written. The plot's whole purpose is to compare
+a KVPilot run against a plain-LRU baseline, so this has to record the same
+fields when placement is off.
 
 The ratio is not sampled. It is a property of the request, not of the block, and
 it is only known after the turn ends -- which for the last turn of a session is
@@ -127,7 +127,9 @@ class HbmPoolSampler:
                     if block.kvpilot_last_access_ns
                     else -1,
                     block.kvpilot_last_req_line,
-                    block.kvpilot_queue_id,
+                    # Position within that request; with req_line, the join
+                    # key to the offline per-block metadata.
+                    block.kvpilot_last_req_block_idx,
                 ]
             )
         return {
@@ -137,7 +139,7 @@ class HbmPoolSampler:
             "num_blank": num_blank,
             "num_in_use": num_in_use,
             "dropped": self._dropped,
-            # [block_id, state, idle_ns, req_line, tier]
+            # [block_id, state, idle_ns, req_line, req_block_idx]
             "blocks": blocks,
         }
 

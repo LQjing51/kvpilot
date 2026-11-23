@@ -782,6 +782,13 @@ def build_sampling_params(
                 sampling_params.extra_args = {}
             sampling_params.extra_args["forced_output_tokens"] = value
             continue
+        if key in ("cache_use_control", "cache_use_max_tokens") and value is not None:
+            # Which tiers / how much prefix prefill may reuse KV from; read by
+            # vLLM (HBM) and the LMCache lookup (local / remote DRAM, SSD).
+            if sampling_params.extra_args is None:
+                sampling_params.extra_args = {}
+            sampling_params.extra_args[key] = value
+            continue
         if value is not None and hasattr(sampling_params, key):
             setattr(sampling_params, key, value)
 
@@ -1932,25 +1939,15 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             yield {"status": "error", "message": str(e)}
 
     async def kvpilot_feedback(self, request=None):
-        """Re-tier the blocks a decode-side dram-safe verdict names."""
-        request_id = (request or {}).get("remote_request_id")
-        if request_id is None:
-            yield {"status": "error", "message": "remote_request_id is required"}
-            return
-        try:
-            dram_safe = bool(request.get("dram_safe"))
-            moved = await self.engine_client.kvpilot_apply_label(
-                request_id, dram_safe
-            )
-            # moved == 0 means the verdict found no blocks to re-tier: the
-            # request was never tracked, or its blocks were refilled since.
-            logger.info(
-                f"KVPilot feedback applied remote_request_id={request_id} "
-                f"dram_safe={dram_safe} moved={moved}"
-            )
-            yield {"status": "success", "moved": moved}
-        except Exception as e:
-            yield {"status": "error", "message": str(e)}
+        """Place a freed request's blocks by the decode side's KVPilot signal."""
+        request_id = request["remote_request_id"]
+        applied = await self.engine_client.kvpilot_apply_placement(
+            request_id, request["signal"]
+        )
+        logger.info(
+            f"KVPilot placement applied remote_request_id={request_id} {applied}"
+        )
+        yield {"status": "success", **applied}
 
     async def get_perf_metrics(self, request=None):
         """Return self-benchmark FPM results, or an error dict if none."""
@@ -3468,6 +3465,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             if sampling_params.extra_args is None:
                 sampling_params.extra_args = {}
             sampling_params.extra_args["kv_transfer_params"] = kv_params
+            # cache_use_control governs prefill reuse only; decode keeps its
+            # own prefix cache behavior.
+            sampling_params.extra_args.pop("cache_use_control", None)
+            sampling_params.extra_args.pop("cache_use_max_tokens", None)
             logger.debug(
                 f"Using disaggregated params from prefill for request {request_id}"
             )

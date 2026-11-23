@@ -1,0 +1,26 @@
+5140 prefills, prompt tokens 75,182,732
+measured   HBM 19.4%  DRAM 45.5%  SSD 27.5%  new  7.6%  | req w/ DRAM 68.9%  w/ SSD 36.2%
+simulation at hbm 2361 blocks, dram 4266 blocks
+simulated  HBM 19.6%  DRAM 46.4%  SSD 26.4%  new  7.6%  | req w/ DRAM 64.1%  w/ SSD 24.7%   (same 5140 lines)
+simulated  HBM 19.6%  DRAM 46.4%  SSD 26.4%  new  7.6%  | req w/ DRAM 64.1%  w/ SSD 24.7%   (whole trace)
+by trace window: measured | simulated
+       0-513    HBM 91.3%  DRAM  0.0%  SSD  0.0%  new  8.7%  | req w/ DRAM  0.0%  w/ SSD  0.0%
+                HBM 91.3%  DRAM  0.0%  SSD  0.0%  new  8.7%  | req w/ DRAM  0.0%  w/ SSD  0.0%
+     514-1027   HBM 90.2%  DRAM  0.0%  SSD  0.0%  new  9.8%  | req w/ DRAM  0.0%  w/ SSD  0.0%
+                HBM 90.2%  DRAM  0.0%  SSD  0.0%  new  9.8%  | req w/ DRAM  0.0%  w/ SSD  0.0%
+    1028-1541   HBM 53.0%  DRAM 36.9%  SSD  0.0%  new 10.1%  | req w/ DRAM 37.4%  w/ SSD  0.0%
+                HBM 55.2%  DRAM 34.6%  SSD  0.0%  new 10.1%  | req w/ DRAM 36.2%  w/ SSD  0.0%
+    1542-2055   HBM  0.0%  DRAM 89.4%  SSD  0.0%  new 10.6%  | req w/ DRAM 91.1%  w/ SSD  0.0%
+                HBM  0.0%  DRAM 89.4%  SSD  0.0%  new 10.6%  | req w/ DRAM 91.1%  w/ SSD  0.0%
+    2056-2569   HBM  0.0%  DRAM 75.6%  SSD 15.6%  new  8.9%  | req w/ DRAM 90.7%  w/ SSD 22.4%
+                HBM  0.0%  DRAM 76.1%  SSD 15.1%  new  8.9%  | req w/ DRAM 85.6%  w/ SSD 17.5%
+    2570-3083   HBM  0.0%  DRAM 65.9%  SSD 27.3%  new  6.8%  | req w/ DRAM 91.1%  w/ SSD 42.4%
+                HBM  0.0%  DRAM 67.5%  SSD 25.7%  new  6.8%  | req w/ DRAM 87.4%  w/ SSD 25.5%
+    3084-3597   HBM  0.0%  DRAM 55.3%  SSD 38.5%  new  6.2%  | req w/ DRAM 93.8%  w/ SSD 62.1%
+                HBM  0.0%  DRAM 56.0%  SSD 37.8%  new  6.2%  | req w/ DRAM 84.2%  w/ SSD 41.4%
+    3598-4111   HBM  0.0%  DRAM 52.1%  SSD 42.5%  new  5.4%  | req w/ DRAM 97.3%  w/ SSD 71.0%
+                HBM  0.0%  DRAM 52.5%  SSD 42.0%  new  5.4%  | req w/ DRAM 88.3%  w/ SSD 47.7%
+    4112-4625   HBM  0.0%  DRAM 46.6%  SSD 48.2%  new  5.2%  | req w/ DRAM 96.3%  w/ SSD 77.4%
+                HBM  0.0%  DRAM 50.2%  SSD 44.7%  new  5.2%  | req w/ DRAM 93.8%  w/ SSD 50.6%
+    4626-5139   HBM  0.0%  DRAM 34.1%  SSD 59.0%  new  6.9%  | req w/ DRAM 91.1%  w/ SSD 87.0%
+                HBM  0.0%  DRAM 36.5%  SSD 56.6%  new  6.9%  | req w/ DRAM 74.9%  w/ SSD 64.8%

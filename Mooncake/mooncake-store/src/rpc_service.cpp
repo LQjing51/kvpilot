@@ -1390,6 +1390,29 @@ WrappedMasterService::GetSharedMemorySegments(
         [] {}, [] {});
 }
 
+tl::expected<int64_t, ErrorCode> WrappedMasterService::SetGroupPlacement(
+    const std::vector<std::string>& groups, const std::vector<int32_t>& tiers,
+    const std::vector<double>& penalties_ms) {
+    return execute_rpc(
+        "SetGroupPlacement",
+        [&] {
+            return master_service_.SetGroupPlacement(groups, tiers,
+                                                     penalties_ms);
+        },
+        [&](auto& timer) { timer.LogRequest("groups_count=", groups.size()); },
+        [] {}, [] {});
+}
+
+tl::expected<int64_t, ErrorCode>
+WrappedMasterService::BatchUnpinMemoryReplicas(
+    const std::vector<std::string>& keys) {
+    return execute_rpc(
+        "BatchUnpinMemoryReplicas",
+        [&] { return master_service_.BatchUnpinMemoryReplicas(keys); },
+        [&](auto& timer) { timer.LogRequest("keys_count=", keys.size()); },
+        [] {}, [] {});
+}
+
 tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment,
@@ -1755,6 +1778,11 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetSharedMemorySegments>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::SetGroupPlacement>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchUnpinMemoryReplicas>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
         &wrapped_master_service);

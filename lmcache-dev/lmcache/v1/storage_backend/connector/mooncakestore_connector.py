@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from pathlib import Path
-from typing import Any, Dict, List, Optional, no_type_check
+from typing import Any, Dict, List, Optional, Tuple, no_type_check
 import asyncio
 import ctypes
 import hashlib
@@ -18,6 +18,7 @@ from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.kvpilot_cache_use import ReplicaLocation, endpoint_host
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
@@ -191,22 +192,9 @@ _SETUP_DEFAULTS: Dict[str, str] = {
     "device_name": "",
 }
 
-ENABLE_MOONCAKE_CPU_BACKEND_ENV = "ENABLE_MOONCAKE_CPU_BACKEND"
-ENABLE_LOCAL_MOONCAKE_HBM_ENV = "ENABLE_LOCAL_MOONCAKE_HBM"
-ENABLE_SHM_MOONCAKE_HBM_ENV = "ENABLE_SHM_MOONCAKE_HBM"
 MOONCAKE_PRELOAD_EXPECTED_ENGINES_ENV = "MOONCAKE_PRELOAD_EXPECTED_ENGINES"
-TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
-
 MOONCAKE_PRELOAD_DIR = "/tmp/mooncake-shm-preload"
 MOONCAKE_PRELOAD_TIMEOUT_SEC = 600
-
-
-def _truthy(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).lower() in TRUE_ENV_VALUES
 
 
 def _int_value(value, default: int) -> int:
@@ -428,6 +416,7 @@ class MooncakestoreConnector(RemoteConnector):
 
             logger.info("Mooncake Configuration loaded. config: %s", self.config)
             self._configure_mooncake_feature_flags()
+            self._configure_ssd_offload()
 
             # Check if storage_root_dir exists and set env var
             if self.config.storage_root_dir:
@@ -536,33 +525,29 @@ class MooncakestoreConnector(RemoteConnector):
 
 
     def _configure_mooncake_feature_flags(self) -> None:
-        self.enable_mooncake_cpu_backend = _truthy(
-            os.getenv(ENABLE_MOONCAKE_CPU_BACKEND_ENV, "0")
-        )
-        self.enable_local_mooncake_hbm = _truthy(
-            os.getenv(ENABLE_LOCAL_MOONCAKE_HBM_ENV, "0")
-        )
-        self.enable_shm_mooncake_hbm = _truthy(os.getenv(ENABLE_SHM_MOONCAKE_HBM_ENV, "0"))
-        if self.enable_local_mooncake_hbm and not self.enable_mooncake_cpu_backend:
-            raise RuntimeError(
-                f"{ENABLE_LOCAL_MOONCAKE_HBM_ENV}=true requires "
-                f"{ENABLE_MOONCAKE_CPU_BACKEND_ENV}=true"
-            )
-        if self.enable_shm_mooncake_hbm and not self.enable_local_mooncake_hbm:
-            raise RuntimeError(
-                f"{ENABLE_SHM_MOONCAKE_HBM_ENV}=true requires "
-                f"{ENABLE_MOONCAKE_CPU_BACKEND_ENV}=true and "
-                f"{ENABLE_LOCAL_MOONCAKE_HBM_ENV}=true"
-            )
-        logger.info(
-            "Mooncake feature flags: %s=%s %s=%s %s=%s",
-            ENABLE_MOONCAKE_CPU_BACKEND_ENV,
-            self.enable_mooncake_cpu_backend,
-            ENABLE_LOCAL_MOONCAKE_HBM_ENV,
-            self.enable_local_mooncake_hbm,
-            ENABLE_SHM_MOONCAKE_HBM_ENV,
-            self.enable_shm_mooncake_hbm,
-        )
+        # KVPilot always runs the zero-copy path: values stored raw (no chunk
+        # meta), read in place from this process's segment, and segments in
+        # shared memory so same-host peers' replicas are readable too.
+        self.enable_mooncake_cpu_backend = True
+        self.enable_local_mooncake_hbm = True
+        self.enable_shm_mooncake_hbm = True
+
+    def _configure_ssd_offload(self) -> None:
+        # KVPilot: KVPILOT_SSD_OFFLOAD_PATH turns on Mooncake's SSD offload in
+        # a directory of its own per process. Bucket files are named by
+        # millisecond timestamp + sequence, so two clients in one directory can
+        # overwrite each other, and a directory left by an earlier run would be
+        # scanned back in at startup.
+        self.ssd_offload_path = ""
+        root = os.getenv("KVPILOT_SSD_OFFLOAD_PATH", "")
+        if not root:
+            return
+        path = os.path.join(root, f"pid{os.getpid()}")
+        os.makedirs(path, exist_ok=True)
+        self.config.setup_config["enable_ssd_offload"] = "true"
+        self.config.setup_config["ssd_offload_path"] = path
+        self.ssd_offload_path = path
+        logger.info("KVPilot: Mooncake SSD offload enabled at %s", path)
 
     def _preload_extra_config(self) -> dict:
         if self.lmcache_config is None or self.lmcache_config.extra_config is None:
@@ -700,12 +685,14 @@ class MooncakestoreConnector(RemoteConnector):
                 )
             time.sleep(0.2)
 
+        # Every other worker on this host, whatever its TP / PP rank: once a
+        # worker's own segment is full, Mooncake places its keys in any segment
+        # with room, another rank's included, and an unmapped one fails the
+        # whole lookup.
         peer_endpoints = sorted(
             item["endpoint"]
             for item in records
             if item.get("endpoint") != record["endpoint"]
-            and item.get("tp_rank") == record["tp_rank"]
-            and item.get("pp_rank") == record["pp_rank"]
         )
         mapped = self.store.preload_shared_memory_segments(peer_endpoints)
         if mapped < 0:
@@ -798,6 +785,198 @@ class MooncakestoreConnector(RemoteConnector):
 
     def support_batched_async_contains(self) -> bool:
         return True
+
+    def support_batched_contains(self) -> bool:
+        return True
+
+    def batched_contains(self, keys: List[CacheEngineKey]) -> int:
+        """Prefix of keys present, in one master RPC (1 = found)."""
+        if not keys:
+            return 0
+        rets = self.store.batch_is_exist([key.to_string() for key in keys])
+        hit = 0
+        for ret in rets:
+            if ret != 1:
+                break
+            hit += 1
+        return hit
+
+    def batched_local_raw_views(
+        self, keys: List[CacheEngineKey]
+    ) -> Optional[List[MemoryObj]]:
+        """Zero-copy views of the keys' host replicas, in one master RPC.
+
+        The same query a layerwise retrieve would issue per layer, done once for
+        every layer up front (the prelookup). The query pins each key's memory
+        replica (refcnt); call
+        batch_unpin_memory_replicas when the views are done.
+
+        Returns:
+            One view per key, or None if any key has no usable local replica.
+        """
+        return self._try_batch_get_local_raw_views(keys)
+
+    def batch_unpin_memory_replicas(self, keys: List[str]) -> int:
+        """Drop GetReplicaList refcnt pins for keys (priority eviction)."""
+        fn = getattr(self.store, "batch_unpin_memory_replicas", None)
+        if fn is None or not keys:
+            return 0
+        return int(fn(keys))
+
+    def batched_local_sources(
+        self, keys: List[CacheEngineKey]
+    ) -> Tuple[List[int], List[Tuple[str, int, int]]]:
+        """Where each key can be loaded from on this host, in one master RPC.
+
+        Same query as `batched_local_raw_views`; under priority eviction it
+        also pins memory replicas (refcnt) until batch_unpin_memory_replicas.
+
+        Returns:
+            (ptrs, ssd, key_strs): ptrs[i] is the host address of key i's DRAM
+            replica in this process, 0 if none; ssd[i] is (bucket file, value
+            offset, value size) of a complete SSD replica written by any client
+            on this host -- the files sit on the same disks, so another prefill
+            worker's are read as fast as our own -- or ("", 0, 0) if none;
+            key_strs[i] is the key's store name.
+        """
+        if not keys:
+            return [], [], []
+        empty = ("", 0, 0)
+        key_strs = [key.to_string() for key in keys]
+        if self.save_chunk_meta:
+            return [0] * len(keys), [empty] * len(keys), key_strs
+        replica_map = self.store.batch_get_replica_desc(key_strs)
+        local_endpoint = self.store.get_hostname()
+        local_host = endpoint_host(local_endpoint)
+        min_size: dict = {}
+        ptrs, ssd = [], []
+        for key, key_str in zip(keys, key_strs, strict=True):
+            ptr, loc = 0, empty
+            same_host = False
+            for replica in replica_map.get(key_str, []):
+                if replica.status != self.complete_replica_status:
+                    continue
+                if replica.is_local_disk_replica():
+                    disk = replica.get_local_disk_descriptor()
+                    if (
+                        loc is empty
+                        and disk.file_path
+                        and endpoint_host(disk.transport_endpoint) == local_host
+                    ):
+                        loc = (disk.file_path, disk.value_offset, disk.object_size)
+                    continue
+                if ptr or not self.enable_local_mooncake_hbm:
+                    continue
+                if not replica.is_memory_replica():
+                    continue
+                buffer = replica.get_memory_descriptor().buffer_descriptor
+                if buffer.transport_endpoint == local_endpoint:
+                    layer = getattr(key, "layer_id", None)
+                    if layer not in min_size:
+                        shapes, dtypes, _ = self._metadata_for_batch_get_into_key(key)
+                        min_size[layer] = self._logical_size_bytes(shapes, dtypes)
+                    if int(buffer.size) >= min_size[layer]:
+                        ptr = int(buffer.buffer_address)
+                    continue
+                same_host |= endpoint_host(buffer.transport_endpoint) == local_host
+            if not ptr and same_host and self.enable_shm_mooncake_hbm:
+                raise RuntimeError(
+                    "Mooncake shared-memory replica was not preloaded or rewritten "
+                    f"for key {key_str}"
+                )
+            ptrs.append(ptr)
+            ssd.append(loc)
+        return ptrs, ssd, key_strs
+
+    def batched_locate_local_ssd(
+        self, keys: List[CacheEngineKey]
+    ) -> List[Tuple[str, int, int]]:
+        """Where each key's value sits on this client's SSD, if offload is on.
+
+        Returns per key (bucket file path, byte offset of the value, value
+        size); the path is empty for keys not on this client's SSD. Local map
+        lookup in the Mooncake client, no RPC.
+        """
+        if not self.ssd_offload_path or not keys:
+            return [("", 0, 0)] * len(keys)
+        return self.store.batch_locate_local_ssd([key.to_string() for key in keys])
+
+    def kvpilot_put_start_local(self, keys: List[str], sizes: List[int]) -> List[int]:
+        """Allocate a memory replica per key (sizes in bytes) in this client's
+        own segment, to be written in place and completed with
+        kvpilot_put_end. Per key, the host address to write the value to, or 0
+        (already stored, or not in this segment; revoked)."""
+        return self.store.batch_put_start_local(keys, sizes, self.replica_config)
+
+    def kvpilot_put_end(self, keys: List[str]) -> List[int]:
+        """Complete write-back puts once their buffers hold the values."""
+        return self.store.batch_put_end(keys)
+
+    def kvpilot_put_revoke(self, keys: List[str]) -> List[int]:
+        """Drop write-back puts that will not be written."""
+        return self.store.batch_put_revoke(keys)
+
+    def kvpilot_exist(self, keys: List[str]) -> List[int]:
+        """Per key 1 if a completed replica exists, else 0 (one master RPC)."""
+        return list(self.store.batch_is_exist(keys))
+
+    def kvpilot_remove(self, keys: List[str]) -> List[int]:
+        """Remove objects whatever replicas they have (exclusive placement:
+        a chunk leaving its tier). Per key 0, or a negative error code
+        (missing keys included)."""
+        return list(self.store.batch_remove(keys, True))
+
+    def kvpilot_remove_local_disk(self, keys: List[str]) -> int:
+        """Drop keys from this client's SSD and free their space once a
+        bucket has none left (exclusive placement: a chunk leaving SSD).
+        Returns how many keys this client held."""
+        return int(self.store.batch_remove_local_disk(keys))
+
+    def kvpilot_offload_local(
+        self, keys: List[str], ptrs: List[int], sizes: List[int]
+    ) -> int:
+        """Write values from host memory (the caller's staging buffer, not the
+        segment) to this client's SSD as one bucket and register them with
+        the master (exclusive placement). Returns how many were written."""
+        return int(self.store.batch_offload_local(keys, ptrs, sizes))
+
+    def kvpilot_set_group_placement(
+        self, groups: List[str], tiers: List[int], penalties_ms: List[float]
+    ) -> int:
+        """Set chunk groups' tier and penalty on the master.
+
+        Args:
+            groups: Chunk-hash fields of the keys (one per chunk).
+            tiers: Tier code per group (kvpilot_placement.TIER_CODE).
+            penalties_ms: Penalty per group, same order.
+
+        Returns:
+            Groups updated.
+        """
+        return int(self.store.batch_set_group_placement(groups, tiers, penalties_ms))
+
+    def batched_replica_location(self, keys: List[CacheEngineKey]) -> list:
+        # Same-host peers' shm replicas come back rewritten to our own
+        # endpoint, so comparing hosts covers both them and our own segment.
+        key_strs = [key.to_string() for key in keys]
+        replica_map = self.store.batch_get_replica_desc(key_strs)
+        host = endpoint_host(self.store.get_hostname())
+        locations = []
+        for key_str in key_strs:
+            loc = ReplicaLocation.MISSING
+            for replica in replica_map.get(key_str, []):
+                if (
+                    replica.status != self.complete_replica_status
+                    or not replica.is_memory_replica()
+                ):
+                    continue
+                buffer = replica.get_memory_descriptor().buffer_descriptor
+                if endpoint_host(buffer.transport_endpoint) == host:
+                    loc = ReplicaLocation.LOCAL
+                    break
+                loc = ReplicaLocation.REMOTE
+            locations.append(loc)
+        return locations
 
     async def batched_async_contains(
         self,
@@ -938,6 +1117,8 @@ class MooncakestoreConnector(RemoteConnector):
                 return None
 
             selected_buffer = None
+            any_same_host = False
+            local_host = endpoint_host(local_endpoint)
             for replica in replica_map.get(key_str, []):
                 if replica.status != self.complete_replica_status:
                     continue
@@ -947,9 +1128,12 @@ class MooncakestoreConnector(RemoteConnector):
                 if buffer.transport_endpoint == local_endpoint:
                     selected_buffer = buffer
                     break
+                any_same_host |= endpoint_host(buffer.transport_endpoint) == local_host
 
             if selected_buffer is None:
-                if self.enable_shm_mooncake_hbm:
+                # Only another host has it: fetch the whole batch over the
+                # network (cache_use_control can admit remote DRAM).
+                if self.enable_shm_mooncake_hbm and any_same_host:
                     raise RuntimeError(
                         "Mooncake shared-memory replica was not preloaded or rewritten "
                         f"for key {key_str}"

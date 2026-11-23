@@ -258,9 +258,19 @@ TEST_F(FileStorageTest,
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
+    ASSERT_EQ(buckets_keys.size(), 0);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 1);
+    // A heartbeat with no new keys writes the leftover as its own bucket.
     offloading_objects.clear();
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
+    ASSERT_EQ(buckets_keys.size(), 1);
+    ASSERT_EQ(buckets_keys[0], std::vector<std::string>{"test0"});
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
+    buckets_keys.clear();
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_EQ(buckets_keys.size(), 0);
     for (size_t i = 0; i < 7; i++) {
         offloading_objects.emplace("test" + std::to_string(i), 1);
     }
@@ -307,6 +317,8 @@ TEST_F(FileStorageTest, ReadUint32FromEnv) {
 
     auto config = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(config.heartbeat_interval_seconds, 5u);
+    // KVPilot: the 100 ms interval overrides the seconds.
+    EXPECT_EQ(config.HeartbeatInterval(), std::chrono::milliseconds(100));
 }
 
 TEST_F(FileStorageTest, InvalidIntValueUsesDefault) {

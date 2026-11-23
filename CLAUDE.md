@@ -16,11 +16,13 @@
 | [docs/README.md](docs/README.md) | 文档索引、仓库结构、utils/ 里有什么 |
 | [docs/concepts.md](docs/concepts.md) | 项目概念：问题背景、两个 Insight、三个 Challenge、成本模型 |
 | [docs/benchmark.md](docs/benchmark.md) | 起服务、跑压测、压力参数、nsys、时区、同步代码到 GPU |
+| [docs/gpu-restore.md](docs/gpu-restore.md) | GPU 机器重新分配后：同步代码、判断并编译 Mooncake / dynamo / LMCache c_ops |
 | [docs/request-paths.md](docs/request-paths.md) | 三条打请求的路线、chat template 归属、Dynamo 的约束 |
 | [docs/datasets.md](docs/datasets.md) | agent trace 处理链路、预处理四件事、离线验证 |
 | [docs/kv-placement.md](docs/kv-placement.md) | KV placement / eviction 的开关、代码位置与调用链 |
-| [docs/observability.md](docs/observability.md) | HBM 分布图、load 阻塞计量、TTFT 拆解 |
+| [docs/observability.md](docs/observability.md) | HBM 分布图、load 阻塞计量（exposed load 唯一测法：`gpu_stall`） |
 | [docs/pitfalls.md](docs/pitfalls.md) | 易错点合集 |
+| [docs/evalution/figure-guidelines.md](docs/evalution/figure-guidelines.md) | 论文图：`paper-figure/<name>/` 复现规范 + OSDI 画图风格 |
 | [docs/references.md](docs/references.md) | 飞书文档索引 |
 
 **环境变量不单独成篇**，每个开关写在它所控制的功能那一篇里——开关的含义离开功能上下文
@@ -36,8 +38,11 @@ kvpilot/
 ├── dynamo-dev/       Dynamo fork，分支 1.3.1   ← PD 分离编排、KV router
 ├── datasets/
 │   ├── mooncake-trace/           conversation_trace_turn4_half.jsonl
-│   └── agent-traces/
-│       └── swe-smith-trajectories/   SWE-smith agent 轨迹 + 预处理与验证脚本
+│   ├── agent-traces/             每个子目录：原始 trace + 预处理脚本 + Mooncake 格式 trace
+│   │   ├── tracelab/
+│   │   └── swe-smith-trajectories/
+│   ├── req-priority-trace/       请求粒度优先级 A/B 用的 30 分钟 trace 与生成脚本
+│   └── block-priority-trace/     按块放置 / exclusive 的 A/B trace（blockwise 下 HBM、DRAM 也满）与生成脚本
 ├── utils/            作图脚本与产出的图
 └── docs/             项目文档
 ```
@@ -54,13 +59,16 @@ cd vllm-dev/examples/disaggregated/lmcache/disagg_prefill_lmcache_v1
 bash dynamo_script.sh setup <name> && bash dynamo_script.sh benchmark <name>
 
 # 同步代码到 GPU
-bash ~/Desktop/code/sync_to_devcloud.sh local:$HOME/Desktop/code/kvpilot Taiji-GPU:/root
+bash ~/Desktop/code/utils/sync_to_devcloud.sh local:$HOME/Desktop/code/kvpilot Taiji-GPU:/root
 
 # 确认 GPU 上跑的真是仓库代码而不是 stock vLLM（0 就是没生效）
-grep -c 'Free blocks distribution' dynamo-log/<name>-logs/prefill-0.log
+grep -c 'KVPilot placement=' dynamo-log/<name>-logs/prefill-0.log
 ```
 
 ## 注意事项
 
 - 除非我要求，否则**不要在 GPU 机器上起服务、跑测试**。
+- **一台 GPU 机器同一时间只跑一个实验**：服务之间共用 DRAM / SSD，会互相干扰（见 docs/benchmark.md）。
 - 除非我要求，**不要将修改后的代码同步到 GPU 机器**。
+- 除非我要求，**不要 git commit**。改完代码、跑完实验都保持 unstaged，我说提交再提交。
+- 代码修改原则：这是实验代码，不需要保证极端情况/努棒性。只处理测试里真会出现的情况。查不到、对不上就直接报错退出，不做 fallback。保护逻辑要么有过真实事故，要么是策略语义本身要求的。

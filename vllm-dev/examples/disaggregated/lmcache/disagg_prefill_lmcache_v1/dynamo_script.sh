@@ -26,7 +26,7 @@ if [[ -n "$LOG_NAME" ]]; then
 else
     LOG_DIR="${DYNAMO_LOG_ROOT}/logs"
 fi
-MODEL="/cfs_cloud_code/kiry/model/Qwen/Qwen3-30B-A3B-Instruct-2507"
+MODEL="${MODEL:-/cfs_cloud_code/kiry/model/Qwen/Qwen3-30B-A3B-Instruct-2507}"
 
 PROXY_PORT=8000
 
@@ -50,8 +50,7 @@ export LMCACHE_LOG_LEVEL=INFO # DEBUG/INFO/WARNING/ERROR/CRITICAL
 # Force UTC so every log in a run shares one clock. LMCache, vLLM, mooncake and
 # the benchmark all render timestamps via localtime while dynamo emits ISO-8601
 # UTC, so on this UTC+8 container they disagreed by 8 hours and cross-log timing
-# broke silently (queue wait came out 0 for all 4000 requests, and the nsys
-# correlation in analyze_lp_ttft_breakdown.py was off by the same amount).
+# broke silently (queue wait came out 0 for all 4000 requests).
 # This is the only place TZ is set: every worker, mooncake_master and benchmark
 # process is started from here and inherits it.
 #
@@ -100,6 +99,16 @@ cleanup_orphaned_mooncake_shm() {
     echo "Mooncake SHM cleanup: removed=${removed}, reclaimed_bytes=${reclaimed_bytes}"
 }
 
+# KVPilot L4: each prefill process keeps its Mooncake SSD offload files in
+# ${KVPILOT_SSD_OFFLOAD_PATH}/pid<pid>/. A directory left behind would be
+# scanned back into the master at the next startup, so clear them between runs.
+cleanup_ssd_offload() {
+    [[ -n "${KVPILOT_SSD_OFFLOAD_PATH:-}" && -d "$KVPILOT_SSD_OFFLOAD_PATH" ]] || return 0
+    echo "Removing Mooncake SSD offload dirs under ${KVPILOT_SSD_OFFLOAD_PATH}"
+    find "$KVPILOT_SSD_OFFLOAD_PATH" -mindepth 1 -maxdepth 1 -type d -name 'pid*' \
+        -exec rm -rf -- {} + 2>/dev/null || true
+}
+
 
 warm_all_nixl_pairs() {
     python3 "${SCRIPT_DIR}/discover_dynamo_workers.py" \
@@ -135,6 +144,7 @@ if [[ "$MODE" == "clean" || "$MODE" == "cleanforce" ]]; then
         sleep 1
         echo "Cleaning orphaned Mooncake shared-memory segments..."
         cleanup_orphaned_mooncake_shm
+        cleanup_ssd_offload
         df -h /dev/shm
         nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits || true
         echo "Done."
@@ -204,6 +214,7 @@ if [[ "$MODE" == "clean" || "$MODE" == "cleanforce" ]]; then
     # after GPU teardown so those newly orphaned segments are reclaimed.
     echo "Final Mooncake shared-memory cleanup..."
     cleanup_orphaned_mooncake_shm
+    cleanup_ssd_offload
     df -h /dev/shm
 
     echo "Done."
@@ -227,17 +238,17 @@ if [[ "$MODE" == "benchmark" ]]; then
     #   --session-arrival-rate 每秒新开会话数，按泊松过程抽起点。这是开环到达：会话到点就发，不看服务端忙不忙，所以调高它就能把队列压起来。
     #      0 = 所有会话 t=0 就绪，节奏只由 --max-inflight-req 决定。同时活跃的会话数约等于 rate × 会话平均时长。
     #   --tool-time 两轮之间的工具耗时 Z，即 下一轮到达 = 上一轮完成 + Z。可填 0、常量（1s / 250ms）、或 lognormal[:mu,sigma]（默认 mu=0 sigma=1，p50 0.97s、p99 10.3s）。
-    python3 "${KVPILOT_ROOT}/vllm-dev/benchmarks/multi_turn/benchmark_serving_multi_turn.py" \
-        -i "${KVPILOT_ROOT}/datasets/agent-traces/swe-smith-trajectories/swe_trace.json"  \
-        -m "$MODEL" \
-        -u "http://localhost:${PROXY_PORT}" \
-        --max-inflight-req "${BM_MAX_INFLIGHT_REQ:-0}" \
-        --max-inflight-session "${BM_MAX_INFLIGHT_SESSION:-0}" \
-        -n "${BM_NUM_REQUESTS:-4000}" \
-        --session-arrival-rate "${BM_SESSION_ARRIVAL_RATE:-0.1}" \
-        --tool-time "${BM_TOOL_TIME:-lognormal:0,1}" \
-        --forced-output \
-        2>&1 | tee "${LOG_DIR}/benchmark.log"
+    # python3 "${KVPILOT_ROOT}/vllm-dev/benchmarks/multi_turn/benchmark_serving_multi_turn.py" \
+    #     -i "${KVPILOT_ROOT}/datasets/agent-traces/swe-smith-trajectories/swe_trace.json"  \
+    #     -m "$MODEL" \
+    #     -u "http://localhost:${PROXY_PORT}" \
+    #     --max-inflight-req "${BM_MAX_INFLIGHT_REQ:-1}" \
+    #     --max-inflight-session "${BM_MAX_INFLIGHT_SESSION:-400}" \
+    #     -n "${BM_NUM_REQUESTS:-4000}" \
+    #     --session-arrival-rate "${BM_SESSION_ARRIVAL_RATE:-4.0}" \
+    #     --tool-time "${BM_TOOL_TIME:-lognormal:0,1}" \
+    #     --forced-output \
+    #     2>&1 | tee "${LOG_DIR}/benchmark.log"
 
     # TraceLab 回放（只有长度，没有 prompt 文本，走 /v1/completions）。
     # session 起点按 --session-arrival-rate 重排成泊松到达，session 内部保留 trace 的真实轮间隔并按 --time-scale 缩放；
@@ -253,14 +264,16 @@ if [[ "$MODE" == "benchmark" ]]; then
     #     2>&1 | tee "${LOG_DIR}/benchmark.log"
 
     # Qwen3-30B-A3B-Instruct-2507 vocab_size = 151936 (from HF config.json).
-    # python3 "${KVPILOT_ROOT}/vllm-dev/benchmarks/multi_turn/mooncake_trace_replay.py" \
-    #     -i "${KVPILOT_ROOT}/datasets/mooncake-trace/conversation_trace_turn4_half.jsonl" \
-    #     -m "$MODEL" \
-    #     -u "http://localhost:${PROXY_PORT}" \
-    #     -p 32 \
-    #     --vocab-size 151936 \
-    #     --time-scale 1 \
-    #     2>&1 | tee "${LOG_DIR}/benchmark.log"
+    # conversation_trace_turn4_half.jsonl
+    # toolagent_trace.jsonl
+    python3 "${KVPILOT_ROOT}/vllm-dev/benchmarks/multi_turn/mooncake_trace_replay.py" \
+        -i "${KVPILOT_ROOT}/datasets/mooncake-trace/toolagent_trace.jsonl" \
+        -m "$MODEL" \
+        -u "http://localhost:${PROXY_PORT}" \
+        -p 32 \
+        --vocab-size 151936 \
+        --time-scale 1 \
+        2>&1 | tee "${LOG_DIR}/benchmark.log"
 fi
 
 # ============================================================
@@ -281,11 +294,18 @@ if [[ "$MODE" == "setup" ]]; then
     # Prepare logs directory
     rm -rf "$LOG_DIR"
     mkdir -p "$LOG_DIR"
+    if [[ -n "${KVPILOT_SSD_OFFLOAD_PATH:-}" ]]; then
+        cleanup_ssd_offload
+        mkdir -p "$KVPILOT_SSD_OFFLOAD_PATH"
+    fi
 
     # Start mooncake_master. Address/ports must match the
     # master_server_address and metadata_server fields in
     # configs/mooncake-{prefiller,decoder}-config.yaml.
     echo "Starting mooncake_master on port ${MOONCAKE_PORT}..."
+    # The master reads KVPILOT_PLACEMENT from this environment.
+    echo "  KVPILOT_PLACEMENT=${KVPILOT_PLACEMENT:-lru}" \
+        "high_watermark=${MOONCAKE_EVICTION_HIGH_WATERMARK:-0.9}"
     mooncake_master \
         -rpc_port "$MOONCAKE_PORT" \
         -rpc_thread_num 64 \
@@ -293,8 +313,9 @@ if [[ "$MODE" == "setup" ]]; then
         --enable_http_metadata_server=true \
         --http_metadata_server_host=0.0.0.0 \
         --http_metadata_server_port=8081 \
-        -eviction_high_watermark_ratio=0.9 \
+        -eviction_high_watermark_ratio="${MOONCAKE_EVICTION_HIGH_WATERMARK:-0.9}" \
         -eviction_ratio=0.1 \
+        ${KVPILOT_SSD_OFFLOAD_PATH:+--enable_offload=true} \
         > "${LOG_DIR}/mooncake_master.log" 2>&1 &
     sleep 2
 
@@ -312,7 +333,9 @@ if [[ "$MODE" == "setup" ]]; then
     echo "Waiting for frontend /v1/models to list registered workers..."
     waited=0
     models_ready=0
-    while [ $waited -lt 600 ]; do
+    # FP8 cold start on CFS can exceed 10 min before /v1/models populates.
+    SETUP_MODELS_WAIT_S=${SETUP_MODELS_WAIT_S:-900}
+    while [ $waited -lt "$SETUP_MODELS_WAIT_S" ]; do
         if curl -s "http://localhost:${PROXY_PORT}/v1/models" | grep -q '"id"'; then
             echo "  /v1/models is populated. (${waited}s)"
             curl -s "http://localhost:${PROXY_PORT}/v1/models"

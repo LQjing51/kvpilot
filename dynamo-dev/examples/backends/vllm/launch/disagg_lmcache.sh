@@ -39,76 +39,76 @@ export DYN_LOG="info"
 export DYN_TCP_RESPONSE_STREAM_HOST=lo
 HTTP_PORT="${DYN_HTTP_PORT:-8000}"
 
-MODEL="/cfs_cloud_code/kiry/model/Qwen/Qwen3-30B-A3B-Instruct-2507"
+MODEL="${MODEL:-/cfs_cloud_code/kiry/model/Qwen/Qwen3-30B-A3B-Instruct-2507}"
 BLOCK_SIZE=512
-GPU_MEM_UTIL=0.95
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
 export UCX_TLS=self,tcp,cuda_copy,cuda_ipc
 export LMCACHE_TRACK_USAGE=false
 export MC_TCP_ENABLE_CONNECTION_POOL=1
 
-export DISABLE_LOCAL_PREFIX_CACHE_LOOKUP="${DISABLE_LOCAL_PREFIX_CACHE_LOOKUP:-false}"
-export LMCACHE_FIRST_LAYER_LOOKUP="${LMCACHE_FIRST_LAYER_LOOKUP:-true}"
-# Offline dram-safe: label blocks from a pre-annotated trace.
-export KVPILOT_OFFLINE_DRAM_SAFE="${KVPILOT_OFFLINE_DRAM_SAFE:-false}"
-export KVPILOT_TRACE_METADATA_PATH="${KVPILOT_TRACE_METADATA_PATH:-${KVPILOT_ROOT}/datasets/mooncake-trace/conversation_trace_turn4_half.jsonl}"
-
-# Online dram-safe: the decode worker judges each turn and reports the verdict
-# to the prefill worker, which re-tiers the blocks. Independent of the offline
-# switch above; enable exactly one of the two for a meaningful A/B.
-export KVPILOT_ONLINE_DRAM_SAFE="${KVPILOT_ONLINE_DRAM_SAFE:-false}"
-export KVPILOT_MACHINE="${KVPILOT_MACHINE:-h20}"
-# The tool-response-length lookup table, produced by the validator of whichever
-# trace will be replayed. Its values take the percentile that validator was run
-# with (--predict-percentile), recorded inside the file. It is required and has
-# no default: label namespaces do not carry across traces (SWE-smith emits
-# `bash:python`, TraceLab emits `Read` — measured overlap is exactly zero), so
-# the wrong table matches nothing, every lookup falls back to the global figure,
-# and the verdict silently degrades to a constant while the logs still look
-# healthy. The workers read this at startup, so the trace has to be chosen here,
-# not at benchmark time — switching traces means restarting the service.
-KVPILOT_TOOL_RESP_LEN_PATH="${KVPILOT_TOOL_RESP_LEN_PATH:-${KVPILOT_ROOT}/datasets/agent-traces/swe-smith-trajectories/tool_resp_len.json}"
-if [[ "$KVPILOT_ONLINE_DRAM_SAFE" == "true" && ! -f "$KVPILOT_TOOL_RESP_LEN_PATH" ]]; then
-    echo "ERROR: KVPILOT_TOOL_RESP_LEN_PATH not found: ${KVPILOT_TOOL_RESP_LEN_PATH}" >&2
-    echo "       Generate it by running the validator for the trace you plan" >&2
-    echo "       to replay (validate_premises.py / validate_tracelab.py)." >&2
-    exit 1
+# KVPilot placement (vllm/v1/core/kvpilot_placement.py): empty = LRU, belady
+# (needs KVPILOT_BELADY_TRACE, the replayed trace, and no signal),
+# inclusive-safe-reqwise, inclusive-penalty-reqwise, exclusive-penalty-reqwise,
+# exclusive-penalty-reqwise-unblocking or exclusive-penalty-blockwise-unblocking
+# (all but LRU need KVPILOT_TIME_COEFFS_PATH on the prefill side too: tiers
+# and penalties come from the time model). The prefill engine,
+# LMCache and mooncake_master (dynamo_script.sh starts it with this env) all
+# read it. With a strategy set, the decode side reports each finished turn's
+# signal {tier, time: [t_hbm, t_dram, t_ssd]} (vllm/v1/core/kvpilot_signal.py):
+# looked up in KVPILOT_OFFLINE_TABLE (utils/placement_ab/make_req_table.py),
+# or with KVPILOT_ONLINE_PREDICT=1 predicted from the turn's tool calls with
+# KVPILOT_TOOL_RESP_DISTRIBUTION_PATH and KVPILOT_TIME_COEFFS_PATH.
+export KVPILOT_PLACEMENT="${KVPILOT_PLACEMENT:-}"
+case "$KVPILOT_PLACEMENT" in
+    ""|belady|inclusive-safe-reqwise) ;;
+    inclusive-penalty-reqwise|exclusive-penalty-reqwise) ;;
+    exclusive-penalty-reqwise-unblocking|exclusive-penalty-blockwise-unblocking) ;;
+    *) echo "ERROR: unknown KVPILOT_PLACEMENT=$KVPILOT_PLACEMENT" >&2; exit 1 ;;
+esac
+export KVPILOT_ONLINE_PREDICT="${KVPILOT_ONLINE_PREDICT:-0}"
+case "$KVPILOT_ONLINE_PREDICT" in
+    0) kvpilot_inputs=(KVPILOT_OFFLINE_TABLE) ;;
+    1) kvpilot_inputs=(KVPILOT_TOOL_RESP_DISTRIBUTION_PATH KVPILOT_TIME_COEFFS_PATH) ;;
+    *) echo "ERROR: KVPILOT_ONLINE_PREDICT must be 0 or 1" >&2; exit 1 ;;
+esac
+if [[ -n "$KVPILOT_PLACEMENT" && "$KVPILOT_ONLINE_PREDICT" == 0 ]]; then
+    kvpilot_inputs+=(KVPILOT_TIME_COEFFS_PATH)
 fi
-export KVPILOT_TOOL_RESP_LEN_PATH
-
-# Oracle arm of the online experiment: take each turn's dram-safe verdict from a
-# table of what a prior run measured, keyed by the trace line in the request id,
-# instead of from the cost model. The feedback link and re-tiering are unchanged,
-# so comparing this against the predicted arm separates a wrong prediction from a
-# mechanism that does not pay off. Unset (the default) keeps the prediction.
-export KVPILOT_MEASURED_DRAM_SAFE_PATH="${KVPILOT_MEASURED_DRAM_SAFE_PATH:-}"
-if [[ -n "$KVPILOT_MEASURED_DRAM_SAFE_PATH" && ! -f "$KVPILOT_MEASURED_DRAM_SAFE_PATH" ]]; then
-    echo "ERROR: KVPILOT_MEASURED_DRAM_SAFE_PATH not found: ${KVPILOT_MEASURED_DRAM_SAFE_PATH}" >&2
-    exit 1
+if [[ "$KVPILOT_PLACEMENT" == belady ]]; then
+    kvpilot_inputs=(KVPILOT_BELADY_TRACE)
+fi
+if [[ -n "$KVPILOT_PLACEMENT" ]]; then
+    for v in "${kvpilot_inputs[@]}"; do
+        if [[ ! -f "${!v:-}" ]]; then
+            echo "ERROR: KVPILOT_PLACEMENT=$KVPILOT_PLACEMENT needs $v (not found: '${!v:-}')" >&2
+            exit 1
+        fi
+        export "$v"
+    done
 fi
 
-export ENABLE_MOONCAKE_CPU_BACKEND="${ENABLE_MOONCAKE_CPU_BACKEND:-false}"
-export ENABLE_LOCAL_MOONCAKE_HBM="${ENABLE_LOCAL_MOONCAKE_HBM:-false}"
-export ENABLE_SHM_MOONCAKE_HBM="${ENABLE_SHM_MOONCAKE_HBM:-false}"
-export MOONCAKE_PRELOAD_EXPECTED_ENGINES="${MOONCAKE_PRELOAD_EXPECTED_ENGINES:-2}"
+# KVPilot L4: Mooncake SSD offload (empty = off). Each prefill process keeps
+# its bucket files in a pid<pid>/ directory under this path; dynamo_script.sh
+# starts mooncake_master with --enable_offload and clears the directory.
+# LRU and inclusive write through (every put is queued for SSD); exclusive
+# writes only the chunks placed on SSD.
+export KVPILOT_SSD_OFFLOAD_PATH="${KVPILOT_SSD_OFFLOAD_PATH:-}"
+if [[ -n "$KVPILOT_SSD_OFFLOAD_PATH" ]]; then
+    # The Mooncake fork runs the offload heartbeat every 100 ms; this upstream
+    # knob only sets the client buffer GC interval now. A bucket is written
+    # once it holds this many keys; one chunk's layers (48 for Qwen3-30B-A3B)
+    # fills it exactly while a chunk stays in one segment, and the Mooncake
+    # fork writes any leftover on the next heartbeat without new keys.
+    # MOONCAKE_OFFLOAD_USE_URING must stay off: Mooncake's io_uring path uses
+    # IORING_OP_READ, which kernel 5.4 lacks.
+    export MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS="${MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS:-1}"
+    export MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT="${MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT:-48}"
+fi
 
 
-# Per-block census of the HBM pool, for the placement distribution plot. Purely
-# observational and independent of the dram-safe switches above: it records only
-# each block's idle time and last holder, so the same run can be compared
-# against a plain-LRU baseline. Lands as hbm-pool-<role>-<pid>.jsonl in LOG_DIR,
-# about 100 KB per second per worker. Sampling interval is fixed in
-# kvpilot_hbm_snapshot.py so two runs are always comparable.
 export GET_HBM_POOL_DISTRIBUTION="${GET_HBM_POOL_DISTRIBUTION:-false}"
 
-# Per-prefill load-stall accounting: how much of each prefill was spent blocked
-# waiting for KV to load rather than computing. With layerwise loading each
-# attention layer blocks until its own KV is resident, and the sum of those
-# waits over one forward is the extent to which loading failed to hide behind
-# computation -- the quantity this project exists to drive to zero. Writes
-# load-stall-<role>-<pid>.jsonl into LOG_DIR, one line per finished prefill.
-# Independent of the dram-safe switches, so a KVPilot run and an LRU baseline
-# can be compared on it.
-export KVPILOT_LOAD_STALL="${KVPILOT_LOAD_STALL:-false}"
+export KVPILOT_LOAD_STALL="${KVPILOT_LOAD_STALL:-true}"
 
 # Per-worker log directory. Defaults to current dir so the script remains
 # usable standalone; callers (e.g. dynamo_script.sh) can override LOG_DIR.
@@ -118,7 +118,7 @@ mkdir -p "$LOG_DIR"
 # it has to reach the workers as an env var, not just as a shell local.
 export LOG_DIR
 
-NSYS_PROFILE="${NSYS_PROFILE:-1}"
+NSYS_PROFILE="${NSYS_PROFILE:-0}"
 # Skip startup (model load + cudagraph capture, ~40-90s) before sampling so the
 # report isn't dominated by startup noise. Tune to your warmup time.
 NSYS_DELAY="${NSYS_DELAY:-0}"
@@ -127,6 +127,17 @@ NSYS_DELAY="${NSYS_DELAY:-0}"
 NSYS_DURATION="${NSYS_DURATION:-5000}"
 # vLLM env units differ: RPC timeout is milliseconds; execute_model timeout is seconds.
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
+
+# vLLM sizes cudagraphs from max_num_seqs (min(2 * max_num_seqs, 512)), which
+# with --max-num-seqs 1 is 2: every prefill then runs eager. Set e.g.
+# '{"cudagraph_capture_sizes":[64,128,256,512,1024]}' to let suffix-sized
+# prefills replay PIECEWISE graphs. Prefill workers only.
+PREFILL_COMPILATION_CONFIG="${PREFILL_COMPILATION_CONFIG:-}"
+# Extra vLLM args for prefill workers only, word-split, e.g.
+# "--num-gpu-blocks-override 768" to shrink the HBM prefix cache.
+PREFILL_EXTRA_ARGS="${PREFILL_EXTRA_ARGS:-}"
+# Extra vLLM args for decode workers only, word-split (same rules as prefill).
+DECODE_EXTRA_ARGS="${DECODE_EXTRA_ARGS:-}"
 
 nsys_prefix() {
     [[ "$NSYS_PROFILE" == "1" ]] || return 0
@@ -161,6 +172,8 @@ for cfg in "$LMCACHE_PREFILL_CFG" "$LMCACHE_DECODE_CFG"; do
 done
 
 NUM_PREFILL_WORKERS="${NUM_PREFILL_WORKERS:-2}"
+# Mooncake shm preload waits for every prefill engine's workers.
+export MOONCAKE_PRELOAD_EXPECTED_ENGINES="$NUM_PREFILL_WORKERS"
 NUM_DECODE_WORKERS="${NUM_DECODE_WORKERS:-2}"
 TP_SIZE="${TP_SIZE:-2}"
 
@@ -202,6 +215,7 @@ for ((i=0; i<NUM_DECODE_WORKERS; i++)); do
         --disable-hybrid-kv-cache-manager \
         --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}' \
         --kv-events-config "{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:$((20082 + i))\",\"enable_kv_cache_events\":true}" \
+        $DECODE_EXTRA_ARGS \
         > "$LOG_DIR/decode-${i}.log" 2>&1 &
 done
 
@@ -219,6 +233,9 @@ for ((i=0; i<NUM_PREFILL_WORKERS; i++)); do
         --disaggregation-mode prefill \
         --kv-transfer-config '{"kv_connector":"PdConnector","kv_role":"kv_both","kv_connector_extra_config":{"connectors":[{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both","kv_connector_extra_config":{"use_layerwise":true}},{"kv_connector":"NixlConnector","kv_role":"kv_both"}]},"kv_connector_module_path":"kvbm.vllm_integration.connector"}' \
         --kv-events-config "{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:$((20090 + i))\",\"enable_kv_cache_events\":true}" \
+        --max-num-seqs 1 \
+        ${PREFILL_COMPILATION_CONFIG:+--compilation-config "$PREFILL_COMPILATION_CONFIG"} \
+        $PREFILL_EXTRA_ARGS \
         > "$LOG_DIR/prefill-${i}.log" 2>&1 &
 done
 

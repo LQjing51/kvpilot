@@ -2,6 +2,7 @@
 # Standard
 from collections import defaultdict
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
     from lmcache.v1.health_monitor.base import HealthMonitor
 
 # Standard
+from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import gc
 import multiprocessing
@@ -26,6 +28,7 @@ import os
 import time
 
 # Third Party
+import numpy as np
 import torch
 
 # First Party
@@ -44,6 +47,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
+from lmcache.v1 import kvpilot_cache_use, kvpilot_load_time, kvpilot_placement
 from lmcache.v1.memory_management import CuFileMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import (  # noqa: E501
     MemoryAllocatorInterface,
@@ -66,18 +70,33 @@ from lmcache.v1.token_database import (
 
 logger = init_logger(__name__)
 
+@dataclass
+class PrelookupPlan:
+    """Where each value (one layer of one chunk) of a prelookup hit loads from.
 
-def _env_flag_enabled(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
+    ptrs: int64 [layers, chunks], host address of the value's DRAM replica in
+        this process, 0 where it loads from SSD.
+    file_idx: int32 [layers, chunks], index into `paths` of the bucket file
+        holding the value, -1 where it loads from DRAM. None when every value
+        loads from DRAM.
+    ssd_off: int64 [layers, chunks], byte offset of the value in its file.
+    num_dram_chunks / num_ssd_chunks: hit chunks with no / some SSD value.
+    key_strs: store name per value, chunk-major (chunk * layers + layer); used
+        for SSD write-back and to BatchUnpinMemoryReplicas after the load
+        (priority eviction pins DRAM replicas on batch_get_replica_desc).
+    location: the storage backend the plan came from.
+    wb: future of the SSD-hit write-back allocation (_kvpilot_wb_prepare).
+    """
 
-    normalized = value.strip().lower()
-    if normalized in ("0", "false", "no", "off", ""):
-        return False
-    if normalized in ("1", "true", "yes", "on"):
-        return True
-    return default
+    ptrs: torch.Tensor
+    file_idx: Optional[torch.Tensor]
+    ssd_off: Optional[torch.Tensor]
+    paths: List[str]
+    num_dram_chunks: int
+    num_ssd_chunks: int
+    key_strs: Optional[List[str]] = None
+    location: Optional[str] = None
+    wb: Any = None
 
 
 # Type aliases for processed chunks
@@ -220,6 +239,14 @@ class LMCacheEngine:
         self.lookup_pins: dict[str, dict[str, list]] = defaultdict(
             lambda: defaultdict(list)
         )
+        # KVPilot: lookup_id -> where each value of the hit loads from (DRAM
+        # host address or SSD file offset), taken at lookup, so retrieve_layer
+        # issues no per-layer fetch.
+        self.lookup_views: dict[str, PrelookupPlan] = {}
+        # KVPilot exclusive placement: chunks the HBM prefix covers are hits
+        # without a DRAM / SSD copy (lookup gets the HBM length per request),
+        # and an SSD hit is not written back to DRAM (that would be a copy).
+        self._kvpilot_exclusive = kvpilot_placement.exclusive()
 
         InitializeUsageContext(config, metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
@@ -649,7 +676,7 @@ class LMCacheEngine:
         starts = []
         ends = []
         keys = []
-        memory_objs = []
+        sizes = []
         tot_token_num = 0
         kv_dtype = self.metadata.kv_dtype
         request_configs = kwargs.get("request_configs")
@@ -663,35 +690,24 @@ class LMCacheEngine:
             assert isinstance(key, CacheEngineKey)
 
             keys_multi_layer = key.split_layers(self.num_layers)
-            # Only check the first layer
-            if self.storage_manager.contains(
-                keys_multi_layer[0], self.retrieve_locations
-            ):
+            # A chunk counts as stored only when every layer is present in one
+            # location -- the same rule the layerwise lookup applies. Checking
+            # layer 0 alone skipped chunks whose other layers a remote store
+            # had evicted per key, and those could then never be restored.
+            hit_layers, block_mapping = self.storage_manager.batched_contains(
+                keys_multi_layer,  # type: ignore
+                self.retrieve_locations,
+            )
+            if hit_layers == self.num_layers and len(block_mapping) == 1:
                 continue
 
-            # Allocate the memory object
             num_tokens = end - start
-            kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
-
-            memory_objs_multi_layer = self.storage_manager.batched_allocate(
-                kv_shape_single_layer,
-                kv_dtype,
-                batch_size=self.num_layers,
-                fmt=self.fmt,
-                busy_loop=self.config.get_extra_config_value("force_store_wait", False),
-            )
-
-            if memory_objs_multi_layer is None:
-                logger.warning(
-                    "Local cpu memory under pressure so"
-                    " choosing to not store the KV cache."
-                )
-                break
-
             starts.append(start)
             ends.append(end)
             keys.append(keys_multi_layer)
-            memory_objs.append(memory_objs_multi_layer)
+            sizes.append(
+                self.gpu_connector.get_shape(num_tokens).numel() * kv_dtype.itemsize
+            )
             tot_token_num += num_tokens
 
             # Create KV event
@@ -720,29 +736,37 @@ class LMCacheEngine:
                 prev_key = key.chunk_hash
 
         if keys:
-            # Transpose the keys and memory objects into layer major format
-            memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
-            keys = [list(row) for row in zip(*keys, strict=False)]
-
-            # Calculate total KV size for logging
-            tot_kv_size = sum(
-                mo.get_size() for layer_objs in memory_objs for mo in layer_objs
+            # The KV goes from the GPU straight into Mooncake replicas: one
+            # PutStart for every (chunk, layer) value, per layer one batched
+            # D2H into them, PutEnd off the forward thread once all are copied.
+            # No host buffer and no host-side copy in between.
+            backend = dict(self.storage_manager.get_active_storage_backends())[
+                "RemoteBackend"
+            ]
+            names = [key.to_string() for chunk_keys in keys for key in chunk_keys]
+            addrs = backend.kvpilot_put_start_local(
+                names, [size for size in sizes for _ in range(self.num_layers)]
             )
+            addrs_layer_major = [
+                [addrs[c * self.num_layers + layer] for c in range(len(keys))]
+                for layer in range(self.num_layers)
+            ]
+            tot_kv_size = sum(sizes) * self.num_layers
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
             t_start = time.perf_counter()
-            mem_obj_generator = self.gpu_connector.batched_from_gpu(
-                memory_objs, starts, ends, **kwargs
+            copier = self.gpu_connector.batched_from_gpu_to_addrs(
+                addrs_layer_major, sizes, starts, ends, **kwargs
             )
-
-            next(mem_obj_generator)
-
+            next(copier)
             for layer_id in range(self.num_layers):
                 yield
-                next(mem_obj_generator)
-                self.storage_manager.batched_put(
-                    keys[layer_id], memory_objs[layer_id], location=self.store_location
+                next(copier)
+            stored = [name for name, addr in zip(names, addrs, strict=True) if addr]
+            if stored:
+                self._kvpilot_wb_thread("store").submit(
+                    self._put_end_stored, backend, stored
                 )
 
             tot_time = time.perf_counter() - t_start
@@ -764,6 +788,19 @@ class LMCacheEngine:
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
         yield
+
+    @staticmethod
+    def _put_end_stored(backend, names: list[str]) -> None:
+        """Complete the replicas a layerwise store copied into (runs on an
+        executor, which would swallow an exception unlogged)."""
+        try:
+            codes = backend.kvpilot_put_end(names)
+        except Exception:
+            logger.exception("Store PutEnd of %d values raised", len(names))
+            raise
+        bad = sum(1 for code in codes if code != 0)
+        if bad:
+            logger.warning("Store PutEnd failed for %d of %d values", bad, len(names))
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -979,6 +1016,20 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         location = None
+        # KVPilot exclusive unblocking: HBM blocks lent to this load, whose KV
+        # goes to DRAM first (kvpilot_exclusive.Eviction).
+        evict = kwargs.pop("kvpilot_evict", None)
+        # KVPilot: the PrelookupPlan this request's lookup made; None (no
+        # lookup for it) -> the per-layer fetch path below.
+        pre = self.lookup_views.pop(req_id, None)
+        if pre is not None:
+            yield from self._retrieve_prelookup(
+                pre, tokens, mask, monitor_req_id, num_required_tokens, req_id, kwargs,
+                evict,
+            )
+            return
+        if evict is not None:
+            raise RuntimeError(f"KVPilot: {req_id} lent HBM blocks but has no prelookup")
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
             mask=mask,
@@ -1014,13 +1065,21 @@ class LMCacheEngine:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
+            load_timer = (
+                kvpilot_load_time.LoadTimer(req_id, sum(ends) - sum(starts), self.num_layers)
+                if kvpilot_load_time.ENABLED
+                else None
+            )
             get_generator = self.storage_manager.layerwise_batched_get(
                 keys_layer_major,
                 location=location,
+                fetch_ns=load_timer.fetch_ns if load_timer is not None else None,
             )
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
+            if load_timer is not None:
+                kwargs["load_timer"] = load_timer
             mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
             next(mem_obj_consumer)
 
@@ -1153,69 +1212,49 @@ class LMCacheEngine:
             )
 
             if self.use_layerwise:
-                first_layer_lookup = _env_flag_enabled(
-                    "LMCACHE_FIRST_LAYER_LOOKUP", default=True
-                )
-                if first_layer_lookup:
-                    # Probe only layer 0 of each chunk in a single batched_contains.
-                    chunk_info_list = []
-                    first_layer_keys = []
-                    for start, end, key in chunk_info_iterator:
-                        assert isinstance(key, CacheEngineKey)
-                        chunk_info_list.append((start, end, key))
-                        first_layer_keys.append(key.get_first_layer())
-
-                    # block_mapping: backend_name -> prefix of hit layer-0 keys
-                    hit_chunks, block_mapping = self.storage_manager.batched_contains(
-                        first_layer_keys,  # type: ignore
-                        search_range,
-                        pin,
-                    )
-                    if pin and block_mapping:
+                chunk_list = list(chunk_info_iterator)
+                if pin and chunk_list:
+                    # One replica query for every layer of every chunk:
+                    # it decides the hit and where each value loads from,
+                    # which the retrieve would otherwise fetch per layer.
+                    hit, plan = self._lookup_views(chunk_list, request_configs)
+                    if hit:
                         assert lookup_id is not None, (
                             "lookup_id is required when pin is True"
                         )
-                        # Record all layer keys per hit chunk so downstream
-                        # batched_get sees every layer, not just layer 0.
-                        idx = 0
-                        for location, hit_first_keys in block_mapping.items():
-                            for _ in hit_first_keys:
-                                chunk_key = chunk_info_list[idx][2]
-                                self.lookup_pins[lookup_id][location].extend(
-                                    chunk_key.split_layers(self.num_layers)
-                                )
-                                idx += 1
-                    for idx, (start, end, key) in enumerate(chunk_info_list):
-                        if idx >= hit_chunks:
-                            return res
-                        res = end
-                else:
-                    for start, end, key in chunk_info_iterator:
-                        assert isinstance(key, CacheEngineKey)
-                        key_all_layers = key.split_layers(self.num_layers)
+                        old = self.lookup_views.get(lookup_id)
+                        if old is not None:
+                            self._kvpilot_wb_discard(old)
+                            self._kvpilot_unpin_plan(old)
+                        self.lookup_views[lookup_id] = plan
+                        self._kvpilot_wb_prepare(lookup_id, plan, chunk_list)
+                    return chunk_list[hit - 1][1] if hit else 0
+                for start, end, key in chunk_list:
+                    assert isinstance(key, CacheEngineKey)
+                    key_all_layers = key.split_layers(self.num_layers)
 
-                        (
-                            hit_layers,
-                            block_mapping,
-                        ) = self.storage_manager.batched_contains(
-                            key_all_layers,  # type: ignore
-                            search_range,
-                            pin,
-                        )
-                        # A layerwise chunk is counted as a hit only when all
-                        # layers are present in one location.
-                        if hit_layers == self.num_layers and len(block_mapping) == 1:
-                            if pin:
-                                assert lookup_id is not None, (
-                                    "lookup_id is required when pin is True"
-                                )
-                                location = next(iter(block_mapping.keys()))
-                                self.lookup_pins[lookup_id][location].extend(
-                                    key_all_layers
-                                )
-                            res = end
-                            continue
-                        return res
+                    (
+                        hit_layers,
+                        block_mapping,
+                    ) = self.storage_manager.batched_contains(
+                        key_all_layers,  # type: ignore
+                        search_range,
+                        pin,
+                    )
+                    # A layerwise chunk is counted as a hit only when all
+                    # layers are present in one location.
+                    if hit_layers == self.num_layers and len(block_mapping) == 1:
+                        if pin:
+                            assert lookup_id is not None, (
+                                "lookup_id is required when pin is True"
+                            )
+                            location = next(iter(block_mapping.keys()))
+                            self.lookup_pins[lookup_id][location].extend(
+                                key_all_layers
+                            )
+                        res = end
+                        continue
+                    return res
             else:
                 chunk_info_list = []
                 keys = []
@@ -1249,6 +1288,447 @@ class LMCacheEngine:
             if pin:
                 # touch_cache is tightly coupled with batched_contains
                 self.storage_manager.touch_cache()
+
+    def _lookup_views(
+        self, chunk_list: list, request_configs: Optional[dict]
+    ) -> tuple[int, Optional[PrelookupPlan]]:
+        """Hit prefix and where each of its values loads from, without a fetch.
+
+        Per value (one layer of one chunk): the host address of its DRAM
+        replica when DRAM is allowed, else its place in a bucket file on this
+        host's SSD when SSD is allowed (cache_use_control 2 / 4; no control
+        allows both). Both come from one master query; a bucket written by
+        another prefill worker on this host is read like our own. The file is
+        opened here, so a later eviction of the bucket cannot take it away. A
+        chunk hits when every layer has a source, and the hit stops at the
+        first chunk that does not -- the same rule as the per-chunk layerwise
+        lookup. Chunks inside the part the HBM prefix cache covers are not
+        loaded and may use either tier.
+
+        Returns (hit chunks, plan); the plan is None when nothing hits.
+        """
+        assert self.storage_manager is not None
+        tier_at, hbm = kvpilot_cache_use.local_tiers(request_configs)
+        n = self.num_layers
+        for name, backend in self.storage_manager.get_active_storage_backends(
+            search_range=self.retrieve_locations
+        ):
+            src_fn = getattr(backend, "batched_local_sources", None)
+            if src_fn is None:
+                continue
+            keys = [k for _, _, key in chunk_list for k in key.split_layers(n)]
+            # The query also grants each key a lease, which -- not a Python
+            # reference -- keeps the DRAM replicas in place until the retrieve.
+            sources = src_fn(keys)
+            if sources is None:
+                return 0, None
+            ptrs, master_ssd = sources[0], sources[1]
+            key_strs = sources[2] if len(sources) > 2 else None
+
+            # Values that cannot load from DRAM; the hit ends at the first
+            # chunk where such a value cannot use SSD either.
+            hit = len(chunk_list)
+            need: list[int] = []
+            for i, ptr in enumerate(ptrs):
+                c = i // n
+                if c >= hit:
+                    break
+                start, end, _ = chunk_list[c]
+                in_hbm = end <= hbm
+                if in_hbm and self._kvpilot_exclusive:
+                    # Exclusive placement: what HBM holds has no copy below,
+                    # and the retrieve never loads it anyway.
+                    continue
+                dram_ok, ssd_ok = tier_at(start)
+                if ptr and (dram_ok or in_hbm):
+                    continue
+                if not (ssd_ok or in_hbm):
+                    hit = c
+                    break
+                need.append(i)
+            # SSD sources for those values, in order; the first value without
+            # one (absent, file gone, or shorter than its chunk) ends the hit.
+            ssd: dict[int, tuple[str, int]] = {}
+            if need:
+                locs = [master_ssd[i] for i in need]
+                # The master forgets locations across a snapshot restore; our
+                # own buckets can still be found in this client's index.
+                missing = [j for j, (path, _, _) in enumerate(locs) if not path]
+                locate_fn = getattr(backend, "batched_locate_local_ssd", None)
+                if missing and locate_fn is not None:
+                    own = locate_fn([keys[need[j]] for j in missing]) or []
+                    for j, loc in zip(missing, own, strict=False):
+                        locs[j] = loc
+                paths = sorted({path for path, _, _ in locs if path})
+                opened = (
+                    dict(zip(paths, self.gpu_connector.open_ssd_files(paths), strict=True))
+                    if paths
+                    else {}
+                )
+                token_bytes = self.gpu_connector.token_bytes() if paths else 0
+                for i, (path, offset, size) in zip(need, locs, strict=True):
+                    c = i // n
+                    if c >= hit:
+                        break
+                    start, end, _ = chunk_list[c]
+                    if not opened.get(path) or size < (end - start) * token_bytes:
+                        hit = c
+                        break
+                    ssd[i] = (path, offset)
+            if not hit:
+                return 0, None
+
+            count = hit * n
+            # [chunk][layer] -> [layer][chunk], the shape the loaders consume.
+            def layer_major(values: list, dtype: torch.dtype) -> torch.Tensor:
+                return torch.tensor(values, dtype=dtype).view(hit, n).t().contiguous()
+
+            ptr_t = layer_major(ptrs[:count], torch.int64)
+            ssd = {i: v for i, v in ssd.items() if i < count}
+            pinned = key_strs[:count] if key_strs else None
+            if not ssd:
+                return hit, PrelookupPlan(
+                    ptr_t, None, None, [], hit, 0, pinned, name
+                )
+            paths = sorted({path for path, _ in ssd.values()})
+            path_idx = {path: j for j, path in enumerate(paths)}
+            fidx = [-1] * count
+            offs = [0] * count
+            for i, (path, offset) in ssd.items():
+                fidx[i] = path_idx[path]
+                offs[i] = offset
+            num_ssd_chunks = len({i // n for i in ssd})
+            return hit, PrelookupPlan(
+                ptr_t,
+                layer_major(fidx, torch.int32),
+                layer_major(offs, torch.int64),
+                paths,
+                hit - num_ssd_chunks,
+                num_ssd_chunks,
+                pinned,
+                name,
+            )
+        return 0, None
+
+    def _retrieve_prelookup(
+        self,
+        pre: PrelookupPlan,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor],
+        monitor_req_id: int,
+        num_required_tokens: int,
+        req_id: str,
+        kwargs: dict,
+        evict=None,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        """`retrieve_layer` for a request whose host addresses lookup found.
+
+        Chunks are fixed-size from the start of the prompt, so the loaded
+        range is arithmetic: skip the masked-out prefix (whole chunks), stop
+        at the hit chunks or the end of the tokens. Keys are never built.
+
+        Same yield protocol as the per-layer path: start_load_kv takes two
+        steps, then wait_for_layer_load(i) takes step i + 2. For a pure-DRAM
+        hit, every layer's H2D is enqueued on the load stream at start; each
+        later step only waits. Each step is one call into the connector's C++
+        loader (copy / scatter / event with the GIL released).
+
+        When some loaded value is on SSD the SSD loader runs instead: its I/O
+        threads read ahead and enqueue each layer as its reads finish, and a
+        step only waits for its layer.
+
+        `evict` (exclusive unblocking): HBM blocks the scheduler lent to this
+        load. Their KV is copied out to DRAM first, every layer queued before
+        the load starts; a layer's scatter waits for that layer's copy.
+        """
+        chunk_size = self.config.chunk_size
+        n_tokens = len(tokens)
+        skip = 0 if mask is None else int(mask.numel() - mask.long().sum().item())
+        first = skip // chunk_size
+        last = min(pre.ptrs.shape[1], -(-n_tokens // chunk_size))
+        ret_mask = torch.zeros(n_tokens, dtype=torch.bool, device="cpu")
+        if last <= first and evict is not None:
+            raise RuntimeError(f"KVPilot: {req_id} lent HBM blocks to an empty load")
+        if last <= first:
+            self._kvpilot_wb_discard(pre)
+            self._kvpilot_unpin_plan(pre)
+            yield torch.sum(ret_mask)
+            for _ in range(self.num_layers):
+                yield None
+            yield ret_mask
+            return
+        start, end = first * chunk_size, min(last * chunk_size, n_tokens)
+        ret_mask[start:end] = True
+        sizes = [chunk_size] * (last - first)
+        sizes[-1] = end - (last - 1) * chunk_size
+        fidx = None if pre.file_idx is None else pre.file_idx[:, first:last]
+        num_ssd = 0 if fidx is None else int((fidx >= 0).sum())
+        # Tokens loaded from SSD (a chunk counts by the share of its layers on
+        # SSD), and which client directories (pid<pid>) they come from: ours,
+        # or another prefill worker's on this host.
+        ssd_tokens = 0
+        if num_ssd:
+            per_chunk = (fidx >= 0).sum(dim=0).tolist()
+            ssd_tokens = sum(n * t for n, t in zip(per_chunk, sizes, strict=True))
+            ssd_tokens //= self.num_layers
+        ssd_dirs = sorted({os.path.basename(os.path.dirname(p)) for p in pre.paths})
+        logger.info(
+            "KVPilot prelookup retrieve req=%s chunks=%d ssd_values=%d "
+            "(no per-layer fetch) ssd_dirs=%s ssd_tokens=%d tokens=%d",
+            req_id,
+            last - first,
+            num_ssd,
+            ",".join(ssd_dirs) or "-",
+            ssd_tokens,
+            end - start,
+        )
+        t_start = time.perf_counter()
+        # Write-back destinations: ready -> to the loader now; still being
+        # allocated -> handed over late, for the reads not yet started.
+        wb_table, wb_late = None, False
+        if num_ssd and pre.wb is not None:
+            if pre.wb.done():
+                wb_table = self._kvpilot_wb_table(pre, req_id, first, last)
+            else:
+                wb_late = True
+        if wb_table is None and not wb_late:
+            self._kvpilot_wb_discard(pre)
+        evict_events = None
+        if evict is not None:
+            evict_events, evict.done = self.gpu_connector.start_evict(
+                evict.slots, evict.ptrs, **kwargs
+            )
+        if num_ssd == 0:
+            # Enqueue every layer's H2D on the load stream now; step() only waits.
+            timing = self.gpu_connector.start_layers(
+                start, end, sizes, pre.ptrs[:, first:last], self.num_layers,
+                kvpilot_load_time.ENABLED, evict_events=evict_events, **kwargs
+            )
+            step = self.gpu_connector.step_layer
+        else:
+            assert fidx is not None and pre.ssd_off is not None
+            fidx = fidx.contiguous()
+            offsets = torch.where(
+                fidx >= 0, pre.ssd_off[:, first:last], pre.ptrs[:, first:last]
+            ).contiguous()
+            try:
+                timing = self.gpu_connector.start_layers_ssd(
+                    start, end, sizes, pre.paths, fidx, offsets,
+                    kvpilot_load_time.ENABLED, writeback=wb_table,
+                    evict_events=evict_events, **kwargs
+                )
+            except BaseException:
+                self._kvpilot_wb_discard(pre)
+                self._kvpilot_unpin_plan(pre)
+                raise
+            if wb_table is not None or wb_late:
+                # Now, not after the forward: a late table is armed while the
+                # reads are still going. The loader runs on whether or not the
+                # forward goes on, so the job never depends on it.
+                self._kvpilot_submit_writeback(
+                    req_id, self.gpu_connector.ssd_generation(), pre, first, last,
+                    wb_late)
+            step = self.gpu_connector.step_layer_ssd
+        start_ms = (time.perf_counter() - t_start) * 1e3
+        sync = kwargs.get("sync", False)
+        yield torch.sum(ret_mask)
+        yield None
+        for layer_id in range(self.num_layers):
+            step(layer_id, sync)
+            if layer_id < self.num_layers - 1:
+                yield None
+        if timing is not None:
+            kvpilot_load_time.report(
+                req_id, end - start, self.num_layers, timing, ssd_values=num_ssd,
+                start_ms=start_ms,
+            )
+        self.stats_monitor.on_retrieve_finished(monitor_req_id, torch.sum(ret_mask))
+        if not self._is_passive():
+            logger.info(
+                "[req_id=%s] Retrieved %d out of %d out of total %d tokens",
+                req_id,
+                torch.sum(ret_mask),
+                num_required_tokens,
+                n_tokens,
+            )
+        # DRAM views are fully consumed; drop GetReplicaList refcnt pins.
+        self._kvpilot_unpin_plan(pre)
+        yield ret_mask
+
+    def _kvpilot_unpin_plan(self, plan: PrelookupPlan) -> None:
+        """BatchUnpinMemoryReplicas for keys pinned at prelookup."""
+        keys = plan.key_strs
+        if not keys:
+            return
+        backends = []
+        b = self._kvpilot_wb_backend(plan)
+        if b is not None:
+            backends.append(b)
+        # Fall back: location may not match storage_backends keys; any
+        # RemoteBackend that exposes unpin is enough (one Mooncake store).
+        assert self.storage_manager is not None
+        for name, backend in self.storage_manager.storage_backends.items():
+            if backend is b:
+                continue
+            if getattr(backend, "batch_unpin_memory_replicas", None) is not None:
+                backends.append(backend)
+        n = 0
+        for backend in backends:
+            fn = getattr(backend, "batch_unpin_memory_replicas", None)
+            if fn is None:
+                continue
+            try:
+                n = max(n, int(fn(keys) or 0))
+            except Exception as e:
+                logger.warning("KVPilot BatchUnpin failed on %s: %s", backend, e)
+        if not hasattr(self, "_kvpilot_unpin_log_n"):
+            self._kvpilot_unpin_log_n = 0
+        self._kvpilot_unpin_log_n += 1
+        if self._kvpilot_unpin_log_n <= 5 or self._kvpilot_unpin_log_n % 500 == 0:
+            logger.info(
+                "KVPilot BatchUnpin keys=%d unpinned=%d backends=%d (n=%d)",
+                len(keys), n, len(backends), self._kvpilot_unpin_log_n,
+            )
+
+    def _kvpilot_writeback_wanted(self, req_id: str) -> bool:
+        """Whether an SSD hit is written back to DRAM: always, except under
+        exclusive placement, where it would be a second copy."""
+        return not self._kvpilot_exclusive
+
+    def _kvpilot_wb_thread(self, name: str) -> ThreadPoolExecutor:
+        """One single-thread executor per stage: SSD-hit write-back "alloc"
+        (PutStart at lookup) and "finish" (PutEnd / PutRevoke), so a finish
+        waiting for its load never holds up the next request's allocation;
+        "store" for the PutEnd of layerwise stores."""
+        pools = self.__dict__.setdefault("_kvpilot_wb_pools", {})
+        if name not in pools:
+            pools[name] = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"kvpilot-wb-{name}"
+            )
+        return pools[name]
+
+    def _kvpilot_wb_backend(self, plan: PrelookupPlan):
+        assert self.storage_manager is not None
+        return self.storage_manager.storage_backends.get(plan.location or "")
+
+    def _kvpilot_wb_prepare(self, lookup_id: str, plan: PrelookupPlan, chunk_list) -> None:
+        """At lookup: start the write-back of the plan's SSD values off the
+        lookup and forward threads. A background PutStart gives each value of a
+        whole chunk a new memory replica in this client's Mooncake segment, and
+        the result becomes the loader's [layers, chunks] destination table, so
+        the I/O threads copy each value straight from its read into DRAM."""
+        if plan.file_idx is None or not plan.key_strs:
+            return
+        if not self._kvpilot_writeback_wanted(lookup_id):
+            return
+        start_fn = getattr(self._kvpilot_wb_backend(plan), "kvpilot_put_start_local", None)
+        if start_fn is None:
+            return
+        assert self.gpu_connector is not None
+        chunk_size = self.config.chunk_size
+        nbytes = chunk_size * self.gpu_connector.token_bytes()
+        n_layers = self.num_layers
+        file_idx, names_all = plan.file_idx, plan.key_strs
+        sizes = [end - start for start, end, _ in chunk_list[: file_idx.shape[1]]]
+
+        def alloc():
+            t0 = time.perf_counter()
+            full = torch.tensor([s == chunk_size for s in sizes], dtype=torch.bool)
+            table = torch.zeros(file_idx.shape, dtype=torch.int64)
+            cl = ((file_idx >= 0) & full.unsqueeze(0)).t().nonzero()
+            if cl.numel() == 0:
+                empty = torch.zeros(0, dtype=torch.int64)
+                return table, np.empty(0, dtype=object), empty, empty, 0.0
+            c_idx, l_idx = cl[:, 0], cl[:, 1]
+            # numpy indexing, not Python loops: this thread shares the GIL with
+            # the forward that is about to start.
+            names = np.asarray(names_all, dtype=object)[(c_idx * n_layers + l_idx).numpy()]
+            addrs = torch.tensor(start_fn(names.tolist(), [nbytes] * len(names)),
+                                 dtype=torch.int64)
+            got = addrs != 0
+            table[l_idx[got], c_idx[got]] = addrs[got]
+            return (table, names[got.numpy()], c_idx[got], l_idx[got],
+                    (time.perf_counter() - t0) * 1e3)
+
+        plan.wb = self._kvpilot_wb_thread("alloc").submit(alloc)
+
+    def _kvpilot_wb_table(self, plan: PrelookupPlan, req_id: str, first: int,
+                          last: int) -> Optional[torch.Tensor]:
+        """The loader's write-back destinations for loaded chunks [first, last),
+        a slice of the table the lookup prepared (whose allocation is back);
+        None when there is nothing to write."""
+        try:
+            table = plan.wb.result()[0][:, first:last]
+        except Exception as e:
+            logger.warning("KVPilot writeback req=%s allocation failed: %s", req_id, e)
+            return None
+        return table.contiguous() if bool(table.any()) else None
+
+    def _kvpilot_wb_discard(self, plan: PrelookupPlan) -> None:
+        """Revoke a plan's write-back allocation that will not be written."""
+        fut, plan.wb = plan.wb, None
+        if fut is None:
+            return
+        revoke = getattr(self._kvpilot_wb_backend(plan), "kvpilot_put_revoke", None)
+
+        def drop() -> None:
+            try:
+                names = fut.result()[1]
+            except Exception:
+                return
+            if len(names) and revoke is not None:
+                revoke(names.tolist())
+
+        self._kvpilot_wb_thread("finish").submit(drop)
+
+    def _kvpilot_submit_writeback(self, req_id: str, gen: int, plan: PrelookupPlan,
+                                  first: int, last: int, late: bool) -> None:
+        """Once load `gen` has copied the values into their replicas, complete
+        the puts of the values it wrote; revoke the rest (chunks HBM covered,
+        reads that started before a late table arrived, or everything if the
+        load failed). On the finish thread; the forward never waits for it."""
+        fut, plan.wb = plan.wb, None
+        backend = self._kvpilot_wb_backend(plan)
+        t0 = time.perf_counter()
+
+        def finish() -> None:
+            assert self.gpu_connector is not None
+            table, names, chunks, layers, alloc_ms = fut.result()
+            written = (chunks >= first) & (chunks < last)
+            if late:
+                sub = table[:, first:last].contiguous()
+                armed = self.gpu_connector.set_ssd_writeback(gen, sub)
+                if tuple(armed.shape) == tuple(sub.shape):
+                    rel = (chunks - first).clamp(0, max(last - first - 1, 0))
+                    written &= armed[layers, rel].bool()
+                else:
+                    written &= False
+            written = written.numpy()
+            done = names[written].tolist()
+            unused = names[~written].tolist()
+            if unused:
+                backend.kvpilot_put_revoke(unused)
+            try:
+                ok = self.gpu_connector.wait_ssd_writeback(gen)
+            except Exception as e:
+                logger.warning("KVPilot writeback req=%s wait failed: %s", req_id, e)
+                ok = False
+            copied_ms = (time.perf_counter() - t0) * 1e3
+            t1 = time.perf_counter()
+            if ok:
+                codes = backend.kvpilot_put_end(done) or []
+            else:
+                codes = []
+                backend.kvpilot_put_revoke(done)
+            logger.info(
+                "KVPilot writeback req=%s values=%d alloc_ms=%.1f copied_ms=%.1f "
+                "end_ms=%.1f failed=%d revoked=%d late=%d%s",
+                req_id, len(done), alloc_ms, copied_ms, (time.perf_counter() - t1) * 1e3,
+                sum(1 for x in codes if x != 0), len(unused), late,
+                "" if ok else " load-failed",
+            )
+
+        self._kvpilot_wb_thread("finish").submit(finish)
 
     @_lmcache_nvtx_annotate
     def move(
@@ -1538,6 +2018,10 @@ class LMCacheEngine:
 
     @_lmcache_nvtx_annotate
     def lookup_unpin(self, lookup_id: str) -> None:
+        plan = self.lookup_views.pop(lookup_id, None)
+        if plan is not None:
+            self._kvpilot_wb_discard(plan)
+            self._kvpilot_unpin_plan(plan)
         if lookup_id in self.lookup_pins:
             assert self.storage_manager is not None
             for location, keys in self.lookup_pins.pop(lookup_id).items():

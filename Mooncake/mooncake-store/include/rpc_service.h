@@ -127,6 +127,14 @@ class WrappedMasterService {
     tl::expected<std::vector<Segment>, ErrorCode> GetSharedMemorySegments(
         const std::vector<std::string>& segment_names);
 
+    tl::expected<int64_t, ErrorCode> SetGroupPlacement(
+        const std::vector<std::string>& groups,
+        const std::vector<int32_t>& tiers,
+        const std::vector<double>& penalties_ms);
+
+    tl::expected<int64_t, ErrorCode> BatchUnpinMemoryReplicas(
+        const std::vector<std::string>& keys);
+
     tl::expected<std::string, ErrorCode> GetFsdir();
 
     tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig();

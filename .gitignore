@@ -5,4 +5,13 @@ __pycache__/
 
 # Raw downloads, too large for GitHub; see docs/datasets.md for sources.
 datasets/agent-traces/swe-smith-trajectories/swe_smith_all.jsonl
+datasets/agent-traces/swe-smith-trajectories/swe_full.jsonl
+datasets/agent-traces/tracelab/tracelab_all.jsonl
 datasets/agent-traces/tracelab/syfi_coding_trace.jsonl.gz
+datasets/bailian-trace/
+
+# Paper figure raw logs (tens of GB, single files past GitHub's 100MB limit).
+paper-figure/*/raw/
+
+# Separate git repo, not part of this one.
+sglang/

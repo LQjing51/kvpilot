@@ -109,6 +109,8 @@ pub const PASSTHROUGH_EXTRA_FIELDS: &[&str] = &[
     "allowed_token_ids",
     "bad_words_token_ids",
     "forced_output_tokens",
+    "cache_use_control",
+    "cache_use_max_tokens",
 ];
 
 static IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS: LazyLock<bool> =
@@ -166,6 +168,29 @@ fn validate_no_unsupported_fields_with_ignore(
     if let Some(value) = unsupported_fields.get("forced_output_tokens") {
         serde_json::from_value::<Vec<crate::types::TokenIdType>>(value.clone())
             .map_err(|_| anyhow::anyhow!("`forced_output_tokens` must be an array of token IDs"))?;
+    }
+    if let Some(value) = unsupported_fields.get("cache_use_control") {
+        let tiers = serde_json::from_value::<Vec<u8>>(value.clone());
+        if !matches!(&tiers, Ok(t) if t.iter().all(|t| (1..=4).contains(t))) {
+            anyhow::bail!(
+                "`cache_use_control` must be an array drawn from 1 (HBM), 2 (local DRAM), 3 (remote DRAM), 4 (local SSD)"
+            );
+        }
+    }
+    if let Some(value) = unsupported_fields.get("cache_use_max_tokens") {
+        let num_tiers = unsupported_fields
+            .get("cache_use_control")
+            .and_then(|tiers| tiers.as_array())
+            .map(Vec::len);
+        let per_tier = matches!(
+            serde_json::from_value::<Vec<u64>>(value.clone()),
+            Ok(spans) if Some(spans.len()) == num_tiers
+        );
+        if !value.is_u64() && !per_tier {
+            anyhow::bail!(
+                "`cache_use_max_tokens` must be a non-negative integer, or an array of them with one entry per `cache_use_control` tier"
+            );
+        }
     }
     Ok(())
 }
@@ -855,5 +880,39 @@ mod tests {
         let fields = HashMap::from([("forced_output_tokens".to_string(), json!("nope"))]);
         let err = validate_no_unsupported_fields_with_ignore(&fields, false).unwrap_err();
         assert!(err.to_string().contains("forced_output_tokens"));
+    }
+
+    #[test]
+    fn validate_cache_use_control() {
+        for ok in [json!([]), json!([2]), json!([1, 3]), json!([1, 2, 3]), json!([4])] {
+            let fields = HashMap::from([("cache_use_control".to_string(), ok)]);
+            validate_no_unsupported_fields_with_ignore(&fields, false).unwrap();
+        }
+        for bad in [json!([0]), json!([5]), json!(2), json!(["1"])] {
+            let fields = HashMap::from([("cache_use_control".to_string(), bad)]);
+            let err = validate_no_unsupported_fields_with_ignore(&fields, false).unwrap_err();
+            assert!(err.to_string().contains("cache_use_control"));
+        }
+        let fields = HashMap::from([("cache_use_max_tokens".to_string(), json!(4096))]);
+        validate_no_unsupported_fields_with_ignore(&fields, false).unwrap();
+        let fields = HashMap::from([("cache_use_max_tokens".to_string(), json!(-1))]);
+        assert!(validate_no_unsupported_fields_with_ignore(&fields, false).is_err());
+        let fields = HashMap::from([
+            ("cache_use_control".to_string(), json!([2, 4])),
+            ("cache_use_max_tokens".to_string(), json!([4096, 2048])),
+        ]);
+        validate_no_unsupported_fields_with_ignore(&fields, false).unwrap();
+        for (tiers, spans) in [
+            (json!([2, 4]), json!([4096])),
+            (json!([2, 4]), json!([4096, -1])),
+            (json!(null), json!([4096])),
+        ] {
+            let mut fields = HashMap::from([("cache_use_max_tokens".to_string(), spans)]);
+            if !tiers.is_null() {
+                fields.insert("cache_use_control".to_string(), tiers);
+            }
+            let err = validate_no_unsupported_fields_with_ignore(&fields, false).unwrap_err();
+            assert!(err.to_string().contains("cache_use_max_tokens"));
+        }
     }
 }

@@ -417,8 +417,11 @@ struct StorageObjectMetadata {
     int64_t key_size;
     int64_t data_size;
     std::string transport_endpoint;
+    // KVPilot: the bucket file holding the object (bucket backend only), so
+    // the master can tell same-host clients where to read it directly.
+    std::string file_path{};
     YLT_REFL(StorageObjectMetadata, bucket_id, offset, key_size, data_size,
-             transport_endpoint);
+             transport_endpoint, file_path);
 };
 
 }  // namespace mooncake

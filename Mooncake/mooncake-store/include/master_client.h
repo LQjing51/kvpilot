@@ -307,6 +307,23 @@ class MasterClient {
     GetSharedMemorySegments(const std::vector<std::string>& segment_names);
 
     /**
+     * @brief KVPilot: set chunk groups' tier and penalty (ms) on the master.
+     * See MasterService::SetGroupPlacement.
+     * @return Number of groups updated.
+     */
+    [[nodiscard]] tl::expected<int64_t, ErrorCode> SetGroupPlacement(
+        const std::vector<std::string>& groups,
+        const std::vector<int32_t>& tiers,
+        const std::vector<double>& penalties_ms);
+
+    /**
+     * @brief KVPilot: drop refcnt pins taken by GetReplicaList under priority
+     * eviction. See MasterService::BatchUnpinMemoryReplicas.
+     */
+    [[nodiscard]] tl::expected<int64_t, ErrorCode> BatchUnpinMemoryReplicas(
+        const std::vector<std::string>& keys);
+
+    /**
      * @brief Re-mount segments, invoked when the client is the first time to
      * connect to the master or the client Ping TTL is expired and need
      * to remount. This function is idempotent. Client should retry if the

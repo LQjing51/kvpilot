@@ -1396,6 +1396,63 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
     return {};
 }
 
+std::vector<std::tuple<std::string, int64_t, int64_t>>
+BucketStorageBackend::BatchLocate(const std::vector<std::string>& keys) {
+    std::vector<std::tuple<std::string, int64_t, int64_t>> out;
+    out.reserve(keys.size());
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    for (const auto& key : keys) {
+        auto it = object_bucket_map_.find(key);
+        if (it == object_bucket_map_.end() ||
+            buckets_.find(it->second.bucket_id) == buckets_.end()) {
+            out.emplace_back(std::string(), 0, 0);
+            continue;
+        }
+        const auto& m = it->second;
+        auto path = GetBucketDataPath(m.bucket_id);
+        // The value follows its key within the bucket record.
+        out.emplace_back(path ? path.value() : std::string(),
+                         m.offset + m.key_size, m.data_size);
+    }
+    return out;
+}
+
+int64_t BucketStorageBackend::BatchRemoveKeys(
+    const std::vector<std::string>& keys) {
+    int64_t removed = 0;
+    std::set<int64_t> emptied;
+    {
+        SharedMutexLocker lock(&mutex_);
+        for (const auto& key : keys) {
+            auto it = object_bucket_map_.find(key);
+            if (it == object_bucket_map_.end()) continue;
+            const int64_t bucket_id = it->second.bucket_id;
+            total_size_ -= it->second.data_size + it->second.key_size;
+            object_bucket_map_.erase(it);
+            ++removed;
+            auto bucket_it = buckets_.find(bucket_id);
+            if (bucket_it == buckets_.end()) continue;
+            const auto& bucket_keys = bucket_it->second->keys;
+            const bool live = std::any_of(
+                bucket_keys.begin(), bucket_keys.end(),
+                [&](const std::string& k) {
+                    auto o = object_bucket_map_.find(k);
+                    return o != object_bucket_map_.end() &&
+                           o->second.bucket_id == bucket_id;
+                });
+            if (!live) emptied.insert(bucket_id);
+        }
+    }
+    for (const int64_t bucket_id : emptied) {
+        auto res = DeleteBucket(bucket_id);
+        if (!res) {
+            LOG(ERROR) << "BatchRemoveKeys: DeleteBucket failed, bucket_id="
+                       << bucket_id << ", error=" << res.error();
+        }
+    }
+    return removed;
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
     // Step 1: Build read plan by copying metadata under lock
@@ -1822,12 +1879,15 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
             return bucket_it->first;
         }
         buckets.emplace_back(bucket_it->first);
+        const auto data_path = GetBucketDataPath(bucket_it->first);
+        const std::string file_path =
+            data_path ? data_path.value() : std::string();
         for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
             keys.emplace_back(bucket_it->second->keys[i]);
             metadatas.emplace_back(StorageObjectMetadata{
                 bucket_it->first, bucket_it->second->metadatas[i].offset,
                 bucket_it->second->metadatas[i].key_size,
-                bucket_it->second->metadatas[i].data_size, ""});
+                bucket_it->second->metadatas[i].data_size, "", file_path});
         }
     }
     return 0;
@@ -1870,6 +1930,24 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         [this](const std::string& key) -> tl::expected<bool, ErrorCode> {
         return IsExist(key);
     };
+
+    // KVPilot: a heartbeat with no new keys writes the leftover partial bucket
+    // as is. Otherwise those keys wait for this client's next put, and a client
+    // that gets none never writes them, so their chunks never become complete
+    // on SSD. The leftovers already fit one bucket's key and size limits.
+    if (offloading_objects.empty() && !ungrouped_offloading_objects.empty()) {
+        std::vector<std::string> bucket_keys;
+        bucket_keys.reserve(ungrouped_offloading_objects.size());
+        for (const auto& ungrouped_it : ungrouped_offloading_objects) {
+            bucket_keys.push_back(ungrouped_it.first);
+        }
+        VLOG(1) << "Flush ungrouped offloading objects on an idle heartbeat; "
+                   "count="
+                << bucket_keys.size();
+        ungrouped_offloading_objects.clear();
+        buckets_keys.push_back(std::move(bucket_keys));
+        return {};
+    }
 
     while (it != offloading_objects.cend()) {
         std::vector<std::string> bucket_keys;
@@ -1956,6 +2034,8 @@ BucketStorageBackend::BuildBucket(
     std::vector<iovec>& iovs, std::vector<StorageObjectMetadata>& metadatas) {
     auto bucket = std::make_shared<BucketMetadata>();
     int64_t storage_offset = 0;
+    const auto data_path = GetBucketDataPath(bucket_id);
+    const std::string file_path = data_path ? data_path.value() : std::string();
     for (const auto& object : batch_object) {
         if (object.second.empty()) {
             LOG(ERROR) << "Failed to create bucket, object is empty";
@@ -1974,7 +2054,8 @@ BucketStorageBackend::BuildBucket(
             object_total_size});
         metadatas.emplace_back(StorageObjectMetadata{
             bucket_id, storage_offset,
-            static_cast<int64_t>(object.first.size()), object_total_size, ""});
+            static_cast<int64_t>(object.first.size()), object_total_size, "",
+            file_path});
         bucket->keys.push_back(object.first);
         storage_offset += object_total_size + object.first.size();
     }
@@ -2092,6 +2173,20 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << ", got: " << write_result.value();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
+
+        // KVPilot: flush before the bucket becomes visible, as the io_uring
+        // path does. Readers use O_DIRECT, which would otherwise first write
+        // the dirty pages back; the clean pages are then dropped from the
+        // page cache, since nothing reads this file through it.
+        int sync_fd = ::open(bucket_data_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (sync_fd < 0 || ::fdatasync(sync_fd) != 0) {
+            LOG(ERROR) << "fdatasync failed for bucket: " << bucket_data_path
+                       << ", error: " << strerror(errno);
+            if (sync_fd >= 0) ::close(sync_fd);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        ::posix_fadvise(sync_fd, 0, 0, POSIX_FADV_DONTNEED);
+        ::close(sync_fd);
 
         // Invalidate cache for this file since content changed
         {

@@ -718,6 +718,39 @@ Client::GetSharedMemorySegments(
     return master_client_.GetSharedMemorySegments(segment_names);
 }
 
+tl::expected<int64_t, ErrorCode> Client::SetGroupPlacement(
+    const std::vector<std::string>& groups, const std::vector<int32_t>& tiers,
+    const std::vector<double>& penalties_ms) {
+    return master_client_.SetGroupPlacement(groups, tiers, penalties_ms);
+}
+
+tl::expected<int64_t, ErrorCode> Client::BatchUnpinMemoryReplicas(
+    const std::vector<std::string>& keys) {
+    return master_client_.BatchUnpinMemoryReplicas(keys);
+}
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+Client::KvpBatchPutStart(const std::vector<std::string>& keys,
+                         const std::vector<uint64_t>& sizes,
+                         const ReplicateConfig& config) {
+    std::vector<std::vector<uint64_t>> slice_lengths;
+    slice_lengths.reserve(sizes.size());
+    for (uint64_t size : sizes) {
+        slice_lengths.push_back({size});
+    }
+    return master_client_.BatchPutStart(keys, slice_lengths, config);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::KvpBatchPutEnd(
+    const std::vector<std::string>& keys) {
+    return master_client_.BatchPutEnd(keys);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::KvpBatchPutRevoke(
+    const std::vector<std::string>& keys) {
+    return master_client_.BatchPutRevoke(keys);
+}
+
 tl::expected<QueryResult, ErrorCode> Client::Query(
     const std::string& object_key) {
     std::chrono::steady_clock::time_point start_time =
@@ -728,7 +761,8 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     }
     return QueryResult(
         std::move(result.value().replicas),
-        start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
+        start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
+        result.value().memory_pinned);
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
@@ -756,7 +790,8 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
             results.emplace_back(QueryResult(
                 std::move(response[i].value().replicas),
                 start_time + std::chrono::milliseconds(
-                                 response[i].value().lease_ttl_ms)));
+                                 response[i].value().lease_ttl_ms),
+                response[i].value().memory_pinned));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -778,10 +813,16 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     // Find the first complete replica
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
+    auto unpin = [&]() {
+        if (query_result.memory_pinned) {
+            (void)BatchUnpinMemoryReplicas({object_key});
+        }
+    };
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::INVALID_REPLICA) {
             LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
         }
+        unpin();
         return tl::unexpected(err);
     }
 
@@ -808,6 +849,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
+        unpin();
         return tl::unexpected(err);
     }
 
@@ -821,6 +863,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     if (query_result.IsLeaseExpired()) {
         LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
                      << object_key;
+        unpin();
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
     // Log cache hit statistics
@@ -829,6 +872,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                 << " cache_hit=" << (cache_used ? 1 : 0);
     }
 
+    unpin();
     return {};
 }
 
@@ -838,15 +882,22 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           uint64_t src_offset) {
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
+    auto unpin = [&]() {
+        if (query_result.memory_pinned) {
+            (void)BatchUnpinMemoryReplicas({object_key});
+        }
+    };
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::INVALID_REPLICA) {
             LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
         }
+        unpin();
         return tl::unexpected(err);
     }
     if (!replica.is_memory_replica()) {
         LOG(ERROR) << "Range read only supported for memory replicas, key="
                    << object_key;
+        unpin();
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
@@ -861,13 +912,16 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "transfer_read_range_failed key=" << object_key;
+        unpin();
         return tl::unexpected(err);
     }
     if (query_result.IsLeaseExpired()) {
         LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
                      << object_key;
+        unpin();
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
+    unpin();
     return {};
 }
 
@@ -1025,7 +1079,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         return results;
     }
     if (prefer_alloc_in_same_node) {
-        return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
+        auto results =
+            BatchGetWhenPreferSameNode(object_keys, query_results, slices);
+        std::vector<std::string> pinned;
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            if (query_results[i].memory_pinned) {
+                pinned.push_back(object_keys[i]);
+            }
+        }
+        if (!pinned.empty()) {
+            (void)BatchUnpinMemoryReplicas(pinned);
+        }
+        return results;
     }
 
     // Collect all transfer operations for parallel execution
@@ -1147,6 +1212,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << " total_cache_hits=" << total_cache_hits;
     } else {
         VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
+    }
+    // Drop GetReplicaList refcnt pins (priority-eviction path).
+    std::vector<std::string> pinned;
+    pinned.reserve(object_keys.size());
+    for (size_t i = 0; i < object_keys.size(); ++i) {
+        if (i < query_results.size() && query_results[i].memory_pinned) {
+            pinned.push_back(object_keys[i]);
+        }
+    }
+    if (!pinned.empty()) {
+        (void)BatchUnpinMemoryReplicas(pinned);
     }
     return results;
 }

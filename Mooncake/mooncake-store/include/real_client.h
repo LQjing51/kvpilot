@@ -654,6 +654,64 @@ class RealClient : public PyClient {
     int preload_shared_memory_segments(
         const std::vector<std::string> &peer_endpoints);
 
+    /**
+     * @brief KVPilot: where each key sits in this client's local SSD files,
+     * as (data file path, value offset, value size); empty path if absent or
+     * SSD offload is off. See FileStorage::BatchLocate.
+     */
+    std::vector<std::tuple<std::string, int64_t, int64_t>> batch_locate_local_ssd(
+        const std::vector<std::string> &keys);
+
+    /**
+     * @brief KVPilot exclusive placement: drop keys whose chunk left SSD from
+     * this client's SSD, freeing buckets left empty. See
+     * FileStorage::BatchRemoveKeys.
+     * @return Number of keys this client held, or -1 without SSD offload.
+     */
+    int64_t batch_remove_local_disk(const std::vector<std::string> &keys);
+
+    /**
+     * @brief KVPilot exclusive placement: write values from host memory (the
+     * caller's own staging buffer, not the segment) to this client's SSD as
+     * one bucket and register them with the master. See
+     * FileStorage::OffloadHostBuffers.
+     * @return Number of keys written, or -1 on failure.
+     */
+    int64_t batch_offload_local(const std::vector<std::string> &keys,
+                                const std::vector<uintptr_t> &ptrs,
+                                const std::vector<size_t> &sizes);
+
+    /**
+     * @brief KVPilot: set chunk groups' (the chunk-hash field of LMCache keys)
+     * tier and penalty (ms) on the master.
+     * @return Number of groups updated, or -1 on failure.
+     */
+    int64_t batch_set_group_placement(const std::vector<std::string> &groups,
+                                      const std::vector<int32_t> &tiers,
+                                      const std::vector<double> &penalties_ms);
+
+    /**
+     * @brief KVPilot: drop refcnt pins from GetReplicaList / batch_get_replica_desc
+     * under priority eviction. Call when zero-copy views are done.
+     * @return Number of keys unpinned, or -1 on failure.
+     */
+    int64_t batch_unpin_memory_replicas(const std::vector<std::string> &keys);
+
+    /**
+     * @brief KVPilot zero-copy write-back: PutStart for keys whose memory
+     * replica the caller fills itself. Per key, the host address of the new
+     * replica in this client's own segment, or 0 when the key already has a
+     * memory replica, allocation failed, or the replica landed outside this
+     * client's segment (those are revoked here). Follow with batch_put_end
+     * once the buffers are written, or batch_put_revoke.
+     */
+    std::vector<uint64_t> batch_put_start_local(
+        const std::vector<std::string> &keys,
+        const std::vector<uint64_t> &sizes, const ReplicateConfig &config);
+    /** Per key, 0 or the error code. */
+    std::vector<int> batch_put_end(const std::vector<std::string> &keys);
+    std::vector<int> batch_put_revoke(const std::vector<std::string> &keys);
+
     std::vector<std::string> batch_replica_clear(
         const std::vector<std::string> &keys,
         const std::string &segment_name = "") override;
@@ -808,9 +866,9 @@ class RealClient : public PyClient {
     std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
     int offload_rpc_port_ = 0;
     bool use_hugepage_ = false;
-    // Set from ENABLE_SHM_MOONCAKE_HBM: allocate global segments as POSIX
-    // shared memory so same-host peers can map them.
-    bool use_shm_segments_ = false;
+    // KVPilot: allocate global segments as POSIX shared memory so same-host
+    // peers can map them (always on).
+    bool use_shm_segments_ = true;
     // Distinguishes the segments this process owns.
     uint64_t shared_segment_index_ = 0;
     // Socket + thread serving shm fds to same-host peers.

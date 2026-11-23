@@ -643,8 +643,8 @@ class EngineCore:
 
         self.model_executor.reset_mm_cache()
 
-    def kvpilot_apply_label(self, request_id: str, dram_safe: bool) -> int:
-        return self.scheduler.kvpilot_apply_label(request_id, dram_safe)
+    def kvpilot_apply_placement(self, request_id: str, signal: dict) -> dict:
+        return self.scheduler.kvpilot_apply_placement(request_id, signal)
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

@@ -1,0 +1,34 @@
+[17:29:21] setup order-tracelab-end: trace tracelab_end.jsonl (2000 lines), clients 16, hbm_blocks default, dram 100 GiB/rank
+[17:31:31] repo-code check: 1
+[17:31:31] GPU KV cache size: 1,208,832 tokens, segment 'global_segment_size': '107374182400'
+[17:58:54] replay done (2000 ok, 0 err)
+[17:58:54] errors in prefill log: 0
+[17:58:54] mooncake: Mem Storage: 168.26 GB / 200.00 GB (84.1%)  Eviction: Success/Attempts=17/17
+[17:58:55] ssd used: 900G
+2000 prefills, prompt tokens 81,292,250
+measured   HBM 12.1%  DRAM 21.8%  SSD 53.4%  new 12.7%  | req w/ DRAM 50.6%  w/ SSD 55.8%
+simulation at hbm 2361 blocks, dram 4266 blocks
+simulated  HBM 12.3%  DRAM 22.7%  SSD 52.3%  new 12.7%  | req w/ DRAM 44.1%  w/ SSD 50.6%   (same 2000 lines)
+simulated  HBM 12.3%  DRAM 22.7%  SSD 52.3%  new 12.7%  | req w/ DRAM 44.1%  w/ SSD 50.6%   (whole trace)
+by trace window: measured | simulated
+       0-199    HBM 89.5%  DRAM  0.0%  SSD  0.0%  new 10.5%  | req w/ DRAM  0.0%  w/ SSD  0.0%
+                HBM 89.5%  DRAM  0.0%  SSD  0.0%  new 10.5%  | req w/ DRAM  0.0%  w/ SSD  0.0%
+     200-399    HBM 57.2%  DRAM 28.8%  SSD  0.0%  new 14.0%  | req w/ DRAM 31.0%  w/ SSD  0.0%
+                HBM 58.5%  DRAM 27.4%  SSD  0.0%  new 14.0%  | req w/ DRAM 28.0%  w/ SSD  0.0%
+     400-599    HBM  0.0%  DRAM 65.1%  SSD 18.3%  new 16.6%  | req w/ DRAM 74.0%  w/ SSD 24.5%
+                HBM  0.0%  DRAM 66.6%  SSD 16.8%  new 16.6%  | req w/ DRAM 73.5%  w/ SSD 19.0%
+     600-799    HBM  0.0%  DRAM 36.0%  SSD 47.3%  new 16.7%  | req w/ DRAM 72.0%  w/ SSD 58.0%
+                HBM  0.0%  DRAM 38.7%  SSD 44.5%  new 16.7%  | req w/ DRAM 63.0%  w/ SSD 53.5%
+     800-999    HBM  0.0%  DRAM 26.9%  SSD 60.4%  new 12.7%  | req w/ DRAM 75.5%  w/ SSD 79.0%
+                HBM  0.0%  DRAM 28.1%  SSD 59.3%  new 12.7%  | req w/ DRAM 58.5%  w/ SSD 68.5%
+    1000-1199   HBM  0.0%  DRAM 16.9%  SSD 70.7%  new 12.3%  | req w/ DRAM 69.5%  w/ SSD 83.0%
+                HBM  0.0%  DRAM 21.5%  SSD 66.2%  new 12.3%  | req w/ DRAM 56.5%  w/ SSD 71.0%
+    1200-1399   HBM  0.0%  DRAM 19.2%  SSD 70.7%  new 10.2%  | req w/ DRAM 76.5%  w/ SSD 86.5%
+                HBM  0.0%  DRAM 17.9%  SSD 72.0%  new 10.2%  | req w/ DRAM 54.0%  w/ SSD 82.5%
+    1400-1599   HBM  0.0%  DRAM 13.5%  SSD 77.3%  new  9.2%  | req w/ DRAM 37.0%  w/ SSD 87.5%
+                HBM  0.0%  DRAM 15.9%  SSD 74.9%  new  9.2%  | req w/ DRAM 50.0%  w/ SSD 79.5%
+    1600-1799   HBM  0.0%  DRAM 14.9%  SSD 74.2%  new 10.9%  | req w/ DRAM 47.5%  w/ SSD 74.0%
+                HBM  0.0%  DRAM 13.9%  SSD 75.2%  new 10.9%  | req w/ DRAM 50.0%  w/ SSD 71.0%
+    1800-1999   HBM  0.0%  DRAM  2.9%  SSD 81.2%  new 15.9%  | req w/ DRAM 23.0%  w/ SSD 65.0%
+                HBM  0.0%  DRAM  3.1%  SSD 80.9%  new 15.9%  | req w/ DRAM  8.0%  w/ SSD 61.5%
+[17:59:01] done order-tracelab-end

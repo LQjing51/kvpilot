@@ -212,6 +212,59 @@ __global__ void single_layer_kv_transfer_kernel(
   }
 }
 
+// KVPilot: one layer's H2D for every chunk in one launch, reading each chunk
+// straight from its pinned host buffer (no per-chunk copy, no staging buffer).
+// Chunk c holds tokens [c * chunk_size, (c + 1) * chunk_size) of slot_mapping,
+// token-major: [tokens, 2, NH * HS], or [tokens, HS] for MLA.
+template <typename scalar_t, GPUKVFormat format>
+__global__ void multi_chunk_kv_h2d_kernel(
+    const int64_t* __restrict__ chunk_ptrs,  // [num_chunks] host addresses
+    scalar_t* __restrict__ vllm_key_value_cache,
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    const int chunk_size, const int vllm_block_key_stride_in_64bit,
+    const int vllm_value_offset, const int num_heads,
+    const int head_size_in_64bit, const int block_size) {
+  constexpr bool USE_MLA = (format == GPUKVFormat::NL_X_NB_BS_HS);
+  constexpr bool HND_LAYOUT = (format == GPUKVFormat::NL_X_TWO_NB_NH_BS_HS ||
+                               format == GPUKVFormat::NL_X_NB_TWO_NH_BS_HS);
+
+  const int64_t token_idx = blockIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+
+  if (slot_idx < 0) {
+    return;
+  }
+
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  const int n = num_heads * head_size_in_64bit;
+  const int lmc_stride = USE_MLA ? n : 2 * n;
+  const scalar_t* src =
+      reinterpret_cast<const scalar_t*>(chunk_ptrs[token_idx / chunk_size]) +
+      (token_idx % chunk_size) * lmc_stride;
+
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const int head_idx = i / head_size_in_64bit;
+    const int head_offset = i % head_size_in_64bit;
+
+    int64_t vllm_key_idx;
+    if constexpr (HND_LAYOUT) {
+      vllm_key_idx = block_idx * vllm_block_key_stride_in_64bit +
+                     head_idx * block_size * head_size_in_64bit +
+                     block_offset * head_size_in_64bit + head_offset;
+    } else {
+      vllm_key_idx = block_idx * vllm_block_key_stride_in_64bit +
+                     block_offset * num_heads * head_size_in_64bit +
+                     head_idx * head_size_in_64bit + head_offset;
+    }
+
+    vllm_key_value_cache[vllm_key_idx] = src[i];
+    if constexpr (!USE_MLA) {
+      vllm_key_value_cache[vllm_key_idx + vllm_value_offset] = src[i + n];
+    }
+  }
+}
+
 template <GPUKVFormat format>
 __device__ __forceinline__ int64_t page_buffer_offset(
     const int k_or_v, const int token_idx, const int scalar_offset,
@@ -871,6 +924,371 @@ void single_layer_kv_transfer(
                   static_cast<int>(gpu_kv_format));
   }
 #undef LAUNCH_SINGLE_LAYER_KERNEL
+}
+
+void multi_chunk_kv_transfer_h2d(const torch::Tensor& chunk_ptrs,
+                                 torch::Tensor& vllm_key_value_cache,
+                                 const torch::Tensor& slot_mapping,
+                                 const int chunk_size,
+                                 const GPUKVFormat gpu_kv_format) {
+  TORCH_CHECK(chunk_ptrs.is_cuda() && chunk_ptrs.scalar_type() == torch::kInt64,
+              "chunk_ptrs must be an int64 CUDA tensor");
+  // The kernel dereferences the host addresses as-is, which is valid for
+  // cudaHostRegister'ed memory only when the device shares the host's
+  // address space for it.
+  static const bool host_ptr_usable = [] {
+    int device = 0;
+    int usable = 0;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(
+        &usable, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
+    return usable == 1;
+  }();
+  TORCH_CHECK(host_ptr_usable,
+              "device cannot dereference registered host pointers directly");
+
+  const int64_t* chunk_ptrs_ptr =
+      get_kernel_ptr<const int64_t, const torch::Tensor>(chunk_ptrs);
+  int64_t* vllm_key_value_cache_ptr =
+      get_kernel_ptr<int64_t, torch::Tensor>(vllm_key_value_cache);
+  const int64_t* slot_mapping_ptr =
+      get_kernel_ptr<const int64_t, const torch::Tensor>(slot_mapping);
+
+  int elements_per_entry = 8 / vllm_key_value_cache.element_size();
+
+  int num_tokens = slot_mapping.size(0);
+  int num_heads;
+  int head_size_in_64bit;
+  int block_size;
+
+  const bool use_mla = lmc::is_mla(gpu_kv_format);
+  const bool hnd_layout = lmc::is_hnd(gpu_kv_format);
+
+  if (use_mla) {
+    num_heads = 1;
+    block_size = vllm_key_value_cache.size(1);
+    head_size_in_64bit = vllm_key_value_cache.size(2) / elements_per_entry;
+  } else if (hnd_layout) {
+    num_heads = vllm_key_value_cache.size(2);
+    block_size = vllm_key_value_cache.size(3);
+    head_size_in_64bit = vllm_key_value_cache.size(4) / elements_per_entry;
+  } else {
+    block_size = vllm_key_value_cache.size(2);
+    num_heads = vllm_key_value_cache.size(3);
+    head_size_in_64bit = vllm_key_value_cache.size(4) / elements_per_entry;
+  }
+
+  lmc::check_block_size(gpu_kv_format, block_size);
+  lmc::check_head_size(gpu_kv_format, head_size_in_64bit);
+
+  int vllm_block_key_stride_in_64bit;
+  int vllm_value_offset;
+  if (use_mla) {
+    vllm_block_key_stride_in_64bit =
+        vllm_key_value_cache.stride(0) / elements_per_entry;
+    vllm_value_offset = 0;
+  } else if (gpu_kv_format == GPUKVFormat::NL_X_TWO_NB_BS_NH_HS ||
+             gpu_kv_format == GPUKVFormat::NL_X_TWO_NB_NH_BS_HS) {
+    vllm_block_key_stride_in_64bit =
+        vllm_key_value_cache.stride(1) / elements_per_entry;
+    vllm_value_offset = vllm_key_value_cache.stride(0) / elements_per_entry;
+  } else {
+    vllm_block_key_stride_in_64bit =
+        vllm_key_value_cache.stride(0) / elements_per_entry;
+    vllm_value_offset = vllm_key_value_cache.stride(1) / elements_per_entry;
+  }
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min(num_heads * head_size_in_64bit, 128));
+  const at::cuda::OptionalCUDAGuard device_guard(
+      device_of(vllm_key_value_cache));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+#define LAUNCH_MULTI_CHUNK_KERNEL(FORMAT)                                    \
+  lmc::multi_chunk_kv_h2d_kernel<int64_t, FORMAT>                            \
+      <<<grid, block, 0, stream>>>(                                          \
+          chunk_ptrs_ptr, vllm_key_value_cache_ptr, slot_mapping_ptr,        \
+          chunk_size, vllm_block_key_stride_in_64bit, vllm_value_offset,     \
+          num_heads, head_size_in_64bit, block_size);                        \
+  break;
+
+  switch (gpu_kv_format) {
+    case GPUKVFormat::NL_X_NB_BS_HS:
+      LAUNCH_MULTI_CHUNK_KERNEL(GPUKVFormat::NL_X_NB_BS_HS)
+    case GPUKVFormat::NL_X_TWO_NB_BS_NH_HS:
+      LAUNCH_MULTI_CHUNK_KERNEL(GPUKVFormat::NL_X_TWO_NB_BS_NH_HS)
+    case GPUKVFormat::NL_X_NB_TWO_BS_NH_HS:
+      LAUNCH_MULTI_CHUNK_KERNEL(GPUKVFormat::NL_X_NB_TWO_BS_NH_HS)
+    case GPUKVFormat::NL_X_TWO_NB_NH_BS_HS:
+      LAUNCH_MULTI_CHUNK_KERNEL(GPUKVFormat::NL_X_TWO_NB_NH_BS_HS)
+    case GPUKVFormat::NL_X_NB_TWO_NH_BS_HS:
+      LAUNCH_MULTI_CHUNK_KERNEL(GPUKVFormat::NL_X_NB_TWO_NH_BS_HS)
+    default:
+      TORCH_CHECK(false,
+                  "Unsupported GPUKVFormat for multi_chunk_kv_transfer_h2d: ",
+                  static_cast<int>(gpu_kv_format));
+  }
+#undef LAUNCH_MULTI_CHUNK_KERNEL
+}
+
+void batched_memcpy_h2d(const std::vector<int64_t>& src_ptrs,
+                        const std::vector<int64_t>& sizes, torch::Tensor& dst) {
+  // KVPilot: every chunk of one layer in a single cudaMemcpyBatchAsync, packed
+  // back to back into dst. The copies run on the copy engines, so unlike the
+  // gather kernel they leave the SMs to the forward.
+  TORCH_CHECK(src_ptrs.size() == sizes.size(), "src_ptrs/sizes size mismatch");
+  const size_t n = src_ptrs.size();
+  if (n == 0) return;
+  std::vector<void*> dsts(n);
+  std::vector<const void*> srcs(n);
+  std::vector<size_t> bytes(n);
+  char* out = reinterpret_cast<char*>(dst.data_ptr());
+  size_t off = 0;
+  for (size_t c = 0; c < n; ++c) {
+    dsts[c] = out + off;
+    srcs[c] = reinterpret_cast<const void*>(src_ptrs[c]);
+    bytes[c] = static_cast<size_t>(sizes[c]);
+    off += bytes[c];
+  }
+  TORCH_CHECK(off <= static_cast<size_t>(dst.nbytes()),
+              "batched_memcpy_h2d: dst too small");
+  cudaMemcpyAttributes attr = {};
+  attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+  attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+  size_t attr_idx = 0;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(dst));
+  const cudaError_t err =
+      cudaMemcpyBatchAsync(dsts.data(), srcs.data(), bytes.data(), n, &attr,
+                           &attr_idx, 1, at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(err == cudaSuccess,
+              "cudaMemcpyBatchAsync failed: ", cudaGetErrorString(err));
+}
+
+void batched_memcpy_d2h(torch::Tensor& src, const std::vector<int64_t>& dst_ptrs,
+                        const std::vector<int64_t>& sizes) {
+  TORCH_CHECK(dst_ptrs.size() == sizes.size(), "dst_ptrs/sizes size mismatch");
+  std::vector<void*> dsts;
+  std::vector<const void*> srcs;
+  std::vector<size_t> bytes;
+  const char* in = reinterpret_cast<const char*>(src.data_ptr());
+  size_t off = 0;
+  for (size_t c = 0; c < dst_ptrs.size(); ++c) {
+    if (dst_ptrs[c] != 0) {
+      dsts.push_back(reinterpret_cast<void*>(dst_ptrs[c]));
+      srcs.push_back(in + off);
+      bytes.push_back(static_cast<size_t>(sizes[c]));
+    }
+    off += static_cast<size_t>(sizes[c]);
+  }
+  TORCH_CHECK(off <= static_cast<size_t>(src.nbytes()),
+              "batched_memcpy_d2h: src too small");
+  if (dsts.empty()) return;
+  cudaMemcpyAttributes attr = {};
+  attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+  attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+  size_t attr_idx = 0;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(src));
+  const cudaError_t err = cudaMemcpyBatchAsync(
+      dsts.data(), srcs.data(), bytes.data(), dsts.size(), &attr, &attr_idx, 1,
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(err == cudaSuccess,
+              "cudaMemcpyBatchAsync failed: ", cudaGetErrorString(err));
+}
+
+LayerEvictor::~LayerEvictor() {
+  for (cudaEvent_t ev : done_) cudaEventDestroy(ev);
+}
+
+void LayerEvictor::start(const torch::Tensor& layer_ptrs, torch::Tensor staging0,
+                         torch::Tensor staging1,
+                         std::vector<torch::Tensor> kvcaches,
+                         torch::Tensor slot_mapping,
+                         const GPUKVFormat gpu_kv_format) {
+  TORCH_CHECK(!layer_ptrs.is_cuda() && layer_ptrs.scalar_type() == torch::kInt64 &&
+                  layer_ptrs.dim() == 2 && layer_ptrs.is_contiguous(),
+              "layer_ptrs must be a contiguous [layers, blocks] int64 CPU tensor");
+  const int64_t num_layers = layer_ptrs.size(0);
+  const int64_t num_blocks = layer_ptrs.size(1);
+  const int64_t num_tokens = slot_mapping.size(0);
+  TORCH_CHECK(num_layers == static_cast<int64_t>(kvcaches.size()) &&
+                  num_blocks > 0 && num_tokens % num_blocks == 0,
+              "LayerEvictor: layer_ptrs does not match kvcaches / slot_mapping");
+  TORCH_CHECK(num_tokens <= staging0.size(0) && num_tokens <= staging1.size(0),
+              "LayerEvictor: staging buffer too small");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(staging0));
+  while (done_.size() < static_cast<size_t>(num_layers)) {
+    cudaEvent_t ev;
+    TORCH_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess,
+                "cudaEventCreateWithFlags failed");
+    done_.push_back(ev);
+  }
+  staging_[0] = std::move(staging0);
+  staging_[1] = std::move(staging1);
+  kvcaches_ = std::move(kvcaches);
+  slots_ = std::move(slot_mapping);
+  const cudaStream_t s = at::cuda::getCurrentCUDAStream();
+  const int64_t* base = layer_ptrs.data_ptr<int64_t>();
+  for (int64_t l = 0; l < num_layers; ++l) {
+    torch::Tensor buf = staging_[l % 2].narrow(0, 0, num_tokens);
+    single_layer_kv_transfer(buf, kvcaches_[l], slots_, TransferDirection::D2H,
+                             gpu_kv_format, true);
+    const std::vector<int64_t> ptrs(base + l * num_blocks,
+                                    base + (l + 1) * num_blocks);
+    batched_memcpy_d2h(buf, ptrs,
+                       std::vector<int64_t>(num_blocks, buf.nbytes() / num_blocks));
+    TORCH_CHECK(cudaEventRecord(done_[l], s) == cudaSuccess,
+                "cudaEventRecord failed");
+  }
+}
+
+std::vector<int64_t> LayerEvictor::events() const {
+  std::vector<int64_t> out;
+  for (cudaEvent_t ev : done_) out.push_back(reinterpret_cast<int64_t>(ev));
+  return out;
+}
+
+LoadTiming::~LoadTiming() {
+  for (cudaEvent_t ev : begin) cudaEventDestroy(ev);
+  for (cudaEvent_t ev : end) cudaEventDestroy(ev);
+  if (t0) cudaEventDestroy(t0);
+}
+
+std::tuple<double, double, double> LoadTiming::result() {
+  TORCH_CHECK(!end.empty() && end.size() == begin.size(), "no layers timed");
+  TORCH_CHECK(cudaEventSynchronize(end.back()) == cudaSuccess,
+              "cudaEventSynchronize failed");
+  double sum = 0;
+  for (size_t i = 0; i < begin.size(); ++i) {
+    float ms = 0;
+    cudaEventElapsedTime(&ms, begin[i], end[i]);
+    sum += ms;
+  }
+  float span = 0, first = 0;
+  cudaEventElapsedTime(&span, t0 ? t0 : begin.front(), end.back());
+  cudaEventElapsedTime(&first, t0 ? t0 : begin.front(), end.front());
+  return {sum, static_cast<double>(span), static_cast<double>(first)};
+}
+
+LayerwiseLoader::~LayerwiseLoader() {
+  for (cudaEvent_t ev : done_) cudaEventDestroy(ev);
+}
+
+std::shared_ptr<LoadTiming> LayerwiseLoader::start(
+    const torch::Tensor& layer_ptrs, const std::vector<int64_t>& sizes,
+    torch::Tensor staging0, torch::Tensor staging1,
+    std::vector<torch::Tensor> kvcaches, torch::Tensor slot_mapping,
+    const GPUKVFormat gpu_kv_format, const int64_t lookahead, const bool timing,
+    const std::vector<int64_t>& evict_events) {
+  TORCH_CHECK(!layer_ptrs.is_cuda() && layer_ptrs.scalar_type() == torch::kInt64 &&
+                  layer_ptrs.dim() == 2 && layer_ptrs.is_contiguous(),
+              "layer_ptrs must be a contiguous [layers, chunks] int64 CPU tensor");
+  num_layers_ = layer_ptrs.size(0);
+  const int64_t num_chunks = layer_ptrs.size(1);
+  TORCH_CHECK(num_layers_ == static_cast<int64_t>(kvcaches.size()) &&
+                  num_chunks == static_cast<int64_t>(sizes.size()) && num_chunks > 0,
+              "layer_ptrs does not match kvcaches / sizes");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(staging0));
+  while (done_.size() < static_cast<size_t>(num_layers_)) {
+    cudaEvent_t ev;
+    TORCH_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess,
+                "cudaEventCreateWithFlags failed");
+    done_.push_back(ev);
+  }
+  // Per layer, chunks whose host ranges abut are one copy: Mooncake often
+  // places a request's chunks back to back, and fewer copies keep the copy
+  // engine's per-copy overhead off the critical path.
+  const int64_t* base = layer_ptrs.data_ptr<int64_t>();
+  dsts_.assign(num_layers_, {});
+  srcs_.assign(num_layers_, {});
+  bytes_.assign(num_layers_, {});
+  int64_t total = 0;
+  for (int64_t c = 0; c < num_chunks; ++c) total += sizes[c];
+  TORCH_CHECK(total <= static_cast<int64_t>(staging0.nbytes()) &&
+                  total <= static_cast<int64_t>(staging1.nbytes()),
+              "staging buffer too small");
+  for (int64_t l = 0; l < num_layers_; ++l) {
+    size_t off = 0;
+    for (int64_t c = 0; c < num_chunks; ++c) {
+      const int64_t src = base[l * num_chunks + c];
+      if (!srcs_[l].empty() &&
+          reinterpret_cast<int64_t>(srcs_[l].back()) +
+                  static_cast<int64_t>(bytes_[l].back()) == src) {
+        bytes_[l].back() += sizes[c];
+      } else {
+        dsts_[l].push_back(reinterpret_cast<void*>(off));
+        srcs_[l].push_back(reinterpret_cast<const void*>(src));
+        bytes_[l].push_back(sizes[c]);
+      }
+      off += sizes[c];
+    }
+  }
+  TORCH_CHECK(evict_events.empty() ||
+                  static_cast<int64_t>(evict_events.size()) >= num_layers_,
+              "evict_events must have one event per layer");
+  evict_events_.clear();
+  for (int64_t e : evict_events) evict_events_.push_back(reinterpret_cast<cudaEvent_t>(e));
+  staging_[0] = std::move(staging0);
+  staging_[1] = std::move(staging1);
+  kvcaches_ = std::move(kvcaches);
+  slots_ = std::move(slot_mapping);
+  num_tokens_ = slots_.size(0);
+  fmt_ = gpu_kv_format;
+  lookahead_ = std::max<int64_t>(1, lookahead);
+  stream_ = at::cuda::getCurrentCUDAStream();
+  timing_ = timing ? std::make_shared<LoadTiming>() : nullptr;
+  for (int64_t l = 0; l < std::min(lookahead_, num_layers_); ++l) enqueue(l);
+  return timing_;
+}
+
+void LayerwiseLoader::enqueue(const int64_t layer) {
+  const c10::cuda::CUDAStreamGuard guard(*stream_);
+  const cudaStream_t s = stream_->stream();
+  if (timing_) {
+    cudaEvent_t ev;
+    cudaEventCreate(&ev);
+    cudaEventRecord(ev, s);
+    timing_->begin.push_back(ev);
+  }
+  torch::Tensor& buf = staging_[layer % 2];
+  char* out = reinterpret_cast<char*>(buf.data_ptr());
+  std::vector<void*> dsts(dsts_[layer].size());
+  for (size_t i = 0; i < dsts.size(); ++i)
+    dsts[i] = out + reinterpret_cast<size_t>(dsts_[layer][i]);
+  cudaMemcpyAttributes attr = {};
+  attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+  attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+  size_t attr_idx = 0;
+  const cudaError_t err = cudaMemcpyBatchAsync(
+      dsts.data(), srcs_[layer].data(), bytes_[layer].data(), dsts.size(), &attr,
+      &attr_idx, 1, s);
+  TORCH_CHECK(err == cudaSuccess, "cudaMemcpyBatchAsync failed: ",
+              cudaGetErrorString(err));
+  // The scatter overwrites lent blocks: their old KV must be out first.
+  if (!evict_events_.empty()) {
+    TORCH_CHECK(cudaStreamWaitEvent(s, evict_events_[layer], 0) == cudaSuccess,
+                "cudaStreamWaitEvent failed");
+  }
+  torch::Tensor src = buf.narrow(0, 0, num_tokens_);
+  single_layer_kv_transfer(src, kvcaches_[layer], slots_, TransferDirection::H2D,
+                           fmt_, true);
+  TORCH_CHECK(cudaEventRecord(done_[layer], s) == cudaSuccess,
+              "cudaEventRecord failed");
+  if (timing_) {
+    cudaEvent_t ev;
+    cudaEventCreate(&ev);
+    cudaEventRecord(ev, s);
+    timing_->end.push_back(ev);
+  }
+}
+
+void LayerwiseLoader::step(const int64_t layer, const bool wait) {
+  TORCH_CHECK(layer >= 0 && layer < num_layers_, "LayerwiseLoader::step: bad layer");
+  if (layer + lookahead_ < num_layers_) enqueue(layer + lookahead_);
+  if (wait) {
+    TORCH_CHECK(cudaStreamWaitEvent(at::cuda::getCurrentCUDAStream(), done_[layer],
+                                    0) == cudaSuccess,
+                "cudaStreamWaitEvent failed");
+  }
 }
 
 void load_and_reshape_flash(

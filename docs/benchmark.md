@@ -24,6 +24,12 @@ placement / 观测相关的分别记在 [kv-placement.md](kv-placement.md) 和
 
 日志文件：`dynamo-log/<name>-logs/{frontend,prefill-N,decode-N,mooncake_master}.log`。
 
+## 一台机器同一时间只跑一个实验
+
+即使两个服务各占 4 张卡、GPU 不重叠，也共用主机 DRAM（Mooncake）和本地 SSD：一边的
+加载流量会改变另一边的 delay / compute。2026-11-04 的 1P1D boundary 搜索与 SWE 回放
+同时跑了约 25 分钟，4K–34K 的分界点全部作废重跑。先 `cleanforce` 上一个，再起下一个。
+
 ## 非交互 ssh 必须自己 export PYTHONPATH
 
 **这是最容易浪费时间的一个坑。** GPU 机器上装了一份 **stock vLLM 0.23.0** 在
@@ -53,33 +59,35 @@ ERROR: NIXL pair warm failed: ... nixl_log=False
 **跑之前先自查代码有没有生效**：
 
 ```bash
-grep -c 'Free blocks distribution' dynamo-log/<name>-logs/prefill-0.log
+grep -c 'KVPilot placement=' dynamo-log/<name>-logs/prefill-0.log
 ```
 
-正常上千行，**0 就说明跑的是 stock vLLM**。
+正常是 1 行以上（每个 scheduler 启动一行，LRU 也打），**0 就说明跑的是 stock vLLM**。
 
 ## 同步代码到 GPU 机器
 
 ```bash
-bash /Users/liqijing/Desktop/code/sync_to_devcloud.sh \
+bash ~/Desktop/code/utils/sync_to_devcloud.sh \
      local:$HOME/Desktop/code/kvpilot Taiji-GPU:/root
 ```
 
 语义是「把 SRC 目录放到 REMOTE 目录**下面**」，所以上面这条得到 `/root/kvpilot`。
-脚本在 `~/Desktop/code/`（**不在 kvpilot 仓库里**）。
+脚本在 `~/Desktop/code/utils/`（**不在 kvpilot 仓库里**）。新机器的完整恢复流程见
+[gpu-restore.md](gpu-restore.md)。
 
 常用选项：
 
 | 选项 | 作用 |
 |---|---|
 | `-n` / `--dry-run` | 只列出会增/删/改哪些文件，不写入 |
-| `--no-delete` | 不删除目标端多余文件（只增改） |
+| `--delete` | 删除目标端多余文件（默认不删，只增改） |
 | `-e PAT` | 追加排除规则 |
 | `-j N` | 并行分片数（默认 8） |
 
-**删除默认开启且无事前确认**，看到 `*deleting` 时文件已经删了。想先看影响用 `-n`。
-好消息是 `dynamo-log/` 已经登记在脚本的 `PROTECT` 里，GPU 上的历史日志不会被本地的
-缺失覆盖掉。
+**默认不删除目标端多余文件**：本地删掉或改名的文件，GPU 上的旧副本会一直留着。需要
+清理时加 `--delete`，它无事前确认，看到 `*deleting` 时文件已经删了，想先看影响用
+`-n --delete`。即使加了 `--delete`，`dynamo-log/` 也登记在脚本的 `PROTECT` 里，GPU 上的
+历史日志不会被删。
 
 `scp` 到这台机器是不通的（报 `Connection closed`），要传单个文件用：
 
@@ -147,11 +155,11 @@ R_stab = P / (S·Tp)                       prefill 队列发散
 
 `Tp=0.25s, Td=1.35s, Tt=1.65s, n=2.18, S=32.4, N=2465, P=2`：
 
-| 配置 | 有 DRAM 加载的请求 | blank 最低 | expLoad |
-|---|---|---|---|
-| `session 32`, R=0.8 | 5.2% | 604 | 3.4% |
-| `session 128`, R=1.5 | 9.3% | 208 | 6.4% |
-| **`session 400`, R=4.0** | **65.7%** | **78** | **25.9%** |
+| 配置 | 有 DRAM 加载的请求 | blank 最低 |
+|---|---|---|
+| `session 32`, R=0.8 | 5.2% | 604 |
+| `session 128`, R=1.5 | 9.3% | 208 |
+| **`session 400`, R=4.0** | **65.7%** | **78** |
 
 第一行 `R*=1.28/s` 而 `R_stab=0.247/s`，比值 5.2——**窗口是关着的**，单靠抬到达率会先
 把 prefill 队列压爆 5 倍。所以必须走 session cap。
@@ -249,21 +257,16 @@ session 走完一整轮才建立起工作集），总跑时约 65 分钟，比 s
 慢一倍。
 
 **实测结果（2026-09-11，两个 cap 均为 0）**：跑到 172/300 conversations、5833 条 prefill
-时停下，`load_stall.pdf` 聚合栏 **`sum(stall)/sum(e2e)` = 38.8%**（567 s / 1463 s），
-远超 15% 目标。爬坡过程值得记下来，因为中途读数完全不能用：
+时停下。爬坡过程值得记下来，因为中途读数完全不能用：
 
-| runtime | blank 最低 | DRAM 加载占比 | stall 占比 |
-|---|---|---|---|
-| 23 min | 1159 | 0.6% | 3.1% |
-| 40 min | 304 | 1.2% | 10.0% |
-| 51 min | 117 | — | 31.5% |
-| 停止时 | 117 | 7.4% | **38.8%** |
+| runtime | blank 最低 | DRAM 加载占比 |
+|---|---|---|
+| 23 min | 1159 | 0.6% |
+| 40 min | 304 | 1.2% |
+| 停止时 | 117 | 7.4% |
 
-前 40 分钟 stall 只有 3%，看起来像「配置没压出效果」，其实只是工作集还没建立。**开环下
+前 40 分钟 blank 还在上千，看起来像「配置没压出效果」，其实只是工作集还没建立。**开环下
 判断配置好坏至少要等一个 `T_sess`**（这里 40 分钟），否则会误判。
-
-其余实测：5860 次 forward、每次 forward 平均 stall 97 ms、4 waits/forward、斜率
-121 ms/1k DRAM tokens。自洽检查通过——无加载请求的 stall 恰好 0.000 ms。
 
 ### 复盘：sum(e2e) 与墙上时间差 2.5 倍，不矛盾
 
@@ -295,34 +298,31 @@ req/s`（稳态的 58%），`1.58 × 0.251 / 2 = 0.199` —— 与实测占用�
 间隔而非并发竞争。
 
 注意这组的形态和 session-cap 那组不同：**只有 7.4% 的请求真的加载了**（session-cap 组是
-65.7%），但这些请求单条加载量极大（stall/e2e 中位数 92.7%，几乎整个 prefill 都在等 KV），
-形成「少数请求承受极重加载」的长尾。
+65.7%），但这些请求单条加载量极大，形成「少数请求承受极重加载」的长尾。
 
-另外注意这 38.8% 的分母是**全部 5833 条 prefill**，包含 5401 条零 stall 的。只算有 DRAM
-加载的那 432 条的话是 **87.2%**（567 s / 650 s）。做 A/B 要用前者——KVPilot 会同时改变
-「哪些请求需要加载」和「每条加载多久」，分母固定成全部 prefill 两边才可比。
-
-**结论**：开环这条路能到 15%，但可行域被 `Tt > 24 s` 卡住，且爬坡期至少一个 `T_sess`。
+**结论**：开环这条路能制造加载压力，但可行域被 `Tt > 24 s` 卡住，且爬坡期至少一个 `T_sess`。
 相比之下 `--max-inflight-session` 那条路是**把负载和压力解耦**（session cap 只抬压力不
 抬负载），窗口宽得多、跑得也快——这就是两个 cap 存在的意义。
 
-### 目标 >15% exposed load 的可用配置
+### 制造 DRAM 加载压力的可用配置
 
 ```bash
 --max-inflight-req 16 --max-inflight-session 400 -n 4000 \
 --session-arrival-rate 4.0 --tool-time lognormal:0,1
 ```
 
-框架配置一行不用改（prefix HBM 保持开启），实测 expLoad 25.9%。代价是 RPS 减半、span
-拉长约 3 倍（843 s → 2423 s），一轮约 35 分钟加 10 分钟 nsys 收尾。
+框架配置一行不用改（prefix HBM 保持开启），65.7% 的请求有 DRAM 加载。代价是 RPS 减半、span
+拉长约 3 倍（843 s → 2423 s），一轮约 35 分钟。
 
-**另一条路是 `DISABLE_LOCAL_PREFIX_CACHE_LOOKUP=true`**：它跳过本地 prefix cache 查询，
-强制每次复用都走 connector，于是 HBM 命中全变成 DRAM 加载。同样的 benchmark 参数下：
+**另一条路是跳过本地 prefix cache 查询**：请求体 `cache_use_control` 不含 1（回放用
+`--cache-use-control 2`，见 [kv-placement.md](kv-placement.md)），强制每次复用都走 connector，于是 HBM 命中全变成
+DRAM 加载。下表是当时用全局开关 `DISABLE_LOCAL_PREFIX_CACHE_LOOKUP`（已删，换成了按请求的 `cache_use_control`）
+在同样的 benchmark 参数下测的：
 
-| `DISABLE_LOCAL_PREFIX_CACHE_LOOKUP` | 有 DRAM 加载的请求 | 平均加载 token | expLoad | RPS |
-|---|---|---|---|---|
-| `false`（默认） | 5.2% | 153 | 3.4% | 3.99 |
-| `true` | 89% | 5,648 | 25.6% | 2.13 |
+| 跳过本地 prefix 查询 | 有 DRAM 加载的请求 | 平均加载 token | RPS |
+|---|---|---|---|
+| `false`（默认） | 5.2% | 153 | 3.99 |
+| `true` | 89% | 5,648 | 2.13 |
 
 但它是**绕过** HBM 制造 DRAM 流量，不是真的挤爆 HBM——队列几乎是空的（queue 1.3%），
 池子也没溢出。上面那条 session 超订的路才是真淘汰。做 baseline vs KVPilot 的 A/B 时这个
@@ -330,13 +330,22 @@ req/s`（稳态的 58%），`1.58 × 0.251 / 2 = 0.199` —— 与实测占用�
 
 ### 其他加载路径开关
 
+prelookup（lookup 时一次查好所有层副本，C++ `LayerwiseLoader` 把全部层的 H2D 一次 enqueue）、Mooncake 零拷贝
+（CPU backend / local HBM / shm segment）、SSD loader 的 64 个读线程和 256 MiB 槽位都已固定，不再是开关；
+`MOONCAKE_PRELOAD_EXPECTED_ENGINES` 由 `NUM_PREFILL_WORKERS` 推出。见 [kv-placement.md](kv-placement.md)「开关」。
+
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `LMCACHE_FIRST_LAYER_LOOKUP` | `true` | 首层 key 命中即判定，减少查询开销 |
-| `ENABLE_MOONCAKE_CPU_BACKEND` | `false` | Mooncake CPU 后端 |
-| `ENABLE_LOCAL_MOONCAKE_HBM` | `false` | Mooncake HBM 后端（本地） |
-| `ENABLE_SHM_MOONCAKE_HBM` | `false` | Mooncake HBM 后端（共享内存） |
-| `MOONCAKE_PRELOAD_EXPECTED_ENGINES` | `2` | 预加载等待的 engine 数 |
+| `KVPILOT_SSD_OFFLOAD_PATH` | 空（关） | L4：打开 Mooncake SSD offload（master `--enable_offload`，每个 prefill 进程一个 `pid<pid>/` 子目录），并允许 prelookup 从本机 SSD 逐层加载。需要含 `SsdLayerwiseLoader` 的 c_ops 和含 `batch_locate_local_ssd` 的 Mooncake。见 [kv-placement.md](kv-placement.md)「L4」 |
+| `KVPILOT_SSD_READ_GIBPS` | 空（不限） | 每个 prefill 进程（TP rank）SSD 读带宽上限，GiB/s。每次读在同一条时间表上按此速率预约，读完不早于预约结束（没有空闲攒下的突发额度）。按「本 GPU 分到的整机 SSD 带宽」设：裸读峰值 12.8 / 8 GPU = `1.6`，1P TP2 合计 2/8 峰值。`test_loader.py bench` 实测两进程合计 3.16 GiB/s、28.9 ms/1K token（不限时 7.5–9.4）。需要重编的 c_ops |
+| `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` / `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | 开 SSD 时 `1` / `48` | 心跳本身 fork 固定成 100 ms，前者只剩 client buffer GC 的间隔；后者是 bucket 大小（Mooncake 默认 500）。凑不满的剩余 key 由 fork 在下一次没有新 key 的心跳里单独写出（见 [kv-placement.md](kv-placement.md)） |
+| `MODEL` | CFS 上的 Qwen3-30B 路径 | 默认直接用 CFS（见 [gpu-restore.md](gpu-restore.md)）。冷启动偏慢但不必先拷本地；仅 CFS 超时再改指 `/root/models/...` |
+| `PREFILL_EXTRA_ARGS` | 空 | 只传给 prefill worker 的额外 vLLM 参数（按空格切分），例如 `--num-gpu-blocks-override 768` 把 HBM prefix cache 压小，用来在 `-p` 不变时制造 DRAM / SSD 命中 |
+| `PREFILL_COMPILATION_CONFIG` | 空 | 传给 prefill worker 的 `--compilation-config`。不设时 `--max-num-seqs 1` 使最大捕获尺寸为 2，prefill 全走 eager；设成 `{"cudagraph_capture_sizes":[64,128,256,512,1024]}` 后 suffix ≤ 1024 走 PIECEWISE cudagraph，token 数向上补齐到最近一档，补齐的部分真实计算。**它会改变 compute 基线**，前后两组数据不能直接比 |
+
+实测（`paper-figure/prefix-suffix-compute-vs-load/opt/README.md`）：直接从 pinned host
+读的 gather kernel 会占着 SM 等 PCIe，64K 时让计算慢 2–13 倍；copy engine 带宽相同
+（约 55 GB/s），几乎不影响计算。
 
 ### 跑起来后怎么验证压力够了
 

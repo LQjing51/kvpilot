@@ -1,8 +1,15 @@
 #include "master_service.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <optional>
+#include <queue>
+#include <tuple>
+#include <string_view>
 #include <shared_mutex>
 #include <regex>
 #include <unordered_set>
@@ -158,6 +165,26 @@ MasterService::MasterService(const MasterServiceConfig& config)
             "put_start_release_timeout must be larger than "
             "put_start_discard_timeout_sec");
     }
+
+    const char* placement = std::getenv("KVPILOT_PLACEMENT");
+    const std::string placement_name = placement ? placement : "";
+    if (placement_name == "inclusive-safe-reqwise") {
+        kvp_mode_ = KvpMode::kInclusive;
+    } else if (placement_name == "inclusive-penalty-reqwise" ||
+               placement_name == "belady") {
+        // Belady sends FAR - next use as the penalty: the farthest goes first.
+        kvp_mode_ = KvpMode::kInclusivePenalty;
+    } else if (placement_name == "exclusive-penalty-reqwise" ||
+               placement_name == "exclusive-penalty-reqwise-unblocking" ||
+               placement_name == "exclusive-penalty-blockwise-unblocking") {
+        // The others differ only on the prefill side (lending HBM, per-block
+        // tiers and penalties).
+        kvp_mode_ = KvpMode::kExclusive;
+    } else if (!placement_name.empty()) {
+        throw std::invalid_argument("KVPILOT_PLACEMENT=" + placement_name);
+    }
+    LOG(INFO) << "KVPilot placement="
+              << (placement_name.empty() ? "lru" : placement_name);
 
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
@@ -451,9 +478,10 @@ auto MasterService::ExistKey(const std::string& key)
 
     const auto& metadata = accessor.Get();
     if (metadata.HasReplica(&Replica::fn_is_completed)) {
-        // Grant a lease to the object as it may be further used by the
-        // client.
+        // KVPilot: also refresh the group's last access (eviction orders by
+        // it and ignores leases; pins are taken on GetReplicaList).
         metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+        KvpTouchGroup(key);
         return true;
     }
 
@@ -778,12 +806,139 @@ auto MasterService::GetReplicaList(const std::string& key)
         MasterMetricManager::instance().inc_file_cache_hit_nums();
     }
     MasterMetricManager::instance().inc_valid_get_nums();
-    // Grant a lease to the object so it will not be removed
-    // when the client is reading it.
+    // KVPilot: pin memory replicas for the read; the client calls
+    // BatchUnpinMemoryReplicas when done. Eviction ignores the lease and
+    // looks at refcnt instead; the lease still governs Remove and the
+    // client's local soft deadline for a copy-path Get.
     metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+    KvpPinMemoryReplicas(metadata);
+    KvpTouchGroup(key);
 
     return GetReplicaListResponse(std::move(replica_list),
-                                  default_kv_lease_ttl_);
+                                  default_kv_lease_ttl_, true);
+}
+
+uint64_t MasterService::KvpGroupOf(const std::string& key) {
+    // LMCache layer keys: model@world_size@worker_id@chunk_hash@dtype@layer.
+    size_t pos = 0;
+    for (int i = 0; i < 3; ++i) {
+        pos = key.find('@', pos);
+        if (pos == std::string::npos) {
+            return std::hash<std::string_view>{}(key);
+        }
+        ++pos;
+    }
+    size_t end = key.find('@', pos);
+    if (end == std::string::npos) end = key.size();
+    return std::hash<std::string_view>{}(
+        std::string_view(key.data() + pos, end - pos));
+}
+
+static int64_t KvpNowMs(std::chrono::system_clock::time_point tp) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               tp.time_since_epoch())
+        .count();
+}
+
+void MasterService::KvpTouchGroup(const std::string& key) {
+    const uint64_t gid = KvpGroupOf(key);
+    auto& shard = kvp_groups_[gid % kKvpGroupShards];
+    std::lock_guard<std::mutex> lock(shard.mu);
+    // Refresh the last access only. The group keeps its placement until the
+    // next signal sets one (seconds later); dropping it here would park every
+    // just-read prompt in the no-placement class for that whole window.
+    shard.map[gid].access_ms = KvpNowMs(std::chrono::system_clock::now());
+}
+
+void MasterService::KvpPinMemoryReplicas(
+    const ObjectMetadata& metadata) const {
+    metadata.VisitReplicas(&Replica::fn_is_completed,
+                           [](const Replica& replica) {
+                               if (replica.is_memory_replica()) {
+                                   replica.inc_refcnt();
+                               }
+                           });
+}
+
+void MasterService::KvpUnpinMemoryReplicas(
+    const ObjectMetadata& metadata) const {
+    metadata.VisitReplicas(&Replica::fn_is_completed,
+                           [](const Replica& replica) {
+                               if (replica.is_memory_replica() &&
+                                   replica.get_refcnt() > 0) {
+                                   replica.dec_refcnt();
+                               }
+                           });
+}
+
+auto MasterService::BatchUnpinMemoryReplicas(
+    const std::vector<std::string>& keys)
+    -> tl::expected<int64_t, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    int64_t n = 0;
+    for (const auto& key : keys) {
+        MetadataAccessorRW accessor(this, key);
+        if (!accessor.Exists()) continue;
+        auto& metadata = accessor.Get();
+        uint32_t before = 0;
+        metadata.VisitReplicas(
+            &Replica::fn_is_completed, [&before](const Replica& replica) {
+                if (replica.is_memory_replica()) {
+                    before += replica.get_refcnt();
+                }
+            });
+        if (before == 0) continue;
+        KvpUnpinMemoryReplicas(metadata);
+        ++n;
+        // Exclusive placement: the offload of an SSD chunk reads its memory
+        // replica under a pin and reports success before unpinning, so the
+        // replica can only be dropped here, once on disk and unpinned.
+        if (kvp_mode_ == KvpMode::kExclusive &&
+            metadata.HasReplica([](const Replica& r) {
+                return r.is_local_disk_replica() && r.is_completed();
+            }) &&
+            KvpGroupWantsSsd(key)) {
+            kvp_excl_dropped_ += static_cast<int64_t>(
+                metadata.EraseReplicas([](const Replica& r) {
+                    return r.is_memory_replica() && r.is_completed() &&
+                           r.get_refcnt() == 0;
+                }));
+        }
+    }
+    return n;
+}
+
+auto MasterService::SetGroupPlacement(const std::vector<std::string>& groups,
+                                      const std::vector<int32_t>& tiers,
+                                      const std::vector<double>& penalties_ms)
+    -> tl::expected<int64_t, ErrorCode> {
+    if (groups.size() != tiers.size() || groups.size() != penalties_ms.size()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const int64_t now_ms = KvpNowMs(std::chrono::system_clock::now());
+    for (size_t i = 0; i < groups.size(); ++i) {
+        const bool order = tiers[i] == kKvpOrderCode;
+        if (tiers[i] < 0 ||
+            (!order && tiers[i] > static_cast<int32_t>(KvpTier::kHbm)) ||
+            !(penalties_ms[i] >= 0.0)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const uint64_t gid = std::hash<std::string_view>{}(groups[i]);
+        auto& shard = kvp_groups_[gid % kKvpGroupShards];
+        std::lock_guard<std::mutex> lock(shard.mu);
+        auto& st = shard.map[gid];
+        if (order) {
+            const auto v = static_cast<int64_t>(penalties_ms[i]);
+            st.order_seq = v / kKvpOrderPosSpan;
+            st.order_pos = v % kKvpOrderPosSpan;
+            continue;
+        }
+        st.tier = static_cast<KvpTier>(tiers[i]);
+        st.penalty_ms = penalties_ms[i];
+        st.placed = true;
+        st.access_ms = now_ms;
+    }
+    return static_cast<int64_t>(groups.size());
 }
 
 auto MasterService::AllocateAndInsertMetadata(
@@ -792,35 +947,11 @@ auto MasterService::AllocateAndInsertMetadata(
     const ReplicateConfig& config,
     const std::chrono::system_clock::time_point& now)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-    std::vector<Replica> replicas;
-    {
-        ScopedAllocatorAccess allocator_access =
-            segment_manager_.getAllocatorAccess();
-        const auto& allocator_manager = allocator_access.getAllocatorManager();
-
-        std::vector<std::string> preferred_segments;
-        if (!config.preferred_segment.empty()) {
-            preferred_segments.push_back(config.preferred_segment);
-        } else if (!config.preferred_segments.empty()) {
-            preferred_segments = config.preferred_segments;
-        }
-
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, value_length, config.replica_num,
-            preferred_segments);
-
-        if (!allocation_result.has_value()) {
-            VLOG(1) << "Failed to allocate replicas for key=" << key
-                    << ", error: " << allocation_result.error();
-            if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            }
-            need_eviction_ = true;
-            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-        }
-
-        replicas = std::move(allocation_result.value());
+    auto allocated = AllocateMemoryReplicas(key, value_length, config);
+    if (!allocated) {
+        return tl::make_unexpected(allocated.error());
     }
+    std::vector<Replica> replicas = std::move(allocated.value());
 
     if (use_disk_replica_) {
         std::string file_path =
@@ -841,6 +972,61 @@ auto MasterService::AllocateAndInsertMetadata(
                               config.with_soft_pin, config.with_hard_pin));
     shard->processing_keys.insert(key);
 
+    return replica_list;
+}
+
+auto MasterService::AllocateMemoryReplicas(const std::string& key,
+                                           uint64_t value_length,
+                                           const ReplicateConfig& config)
+    -> tl::expected<std::vector<Replica>, ErrorCode> {
+    ScopedAllocatorAccess allocator_access =
+        segment_manager_.getAllocatorAccess();
+    const auto& allocator_manager = allocator_access.getAllocatorManager();
+
+    std::vector<std::string> preferred_segments;
+    if (!config.preferred_segment.empty()) {
+        preferred_segments.push_back(config.preferred_segment);
+    } else if (!config.preferred_segments.empty()) {
+        preferred_segments = config.preferred_segments;
+    }
+
+    auto allocation_result = allocation_strategy_->Allocate(
+        allocator_manager, value_length, config.replica_num,
+        preferred_segments);
+
+    if (!allocation_result.has_value()) {
+        VLOG(1) << "Failed to allocate replicas for key=" << key
+                << ", error: " << allocation_result.error();
+        if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        need_eviction_ = true;
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    return std::move(allocation_result.value());
+}
+
+auto MasterService::KvpAddMemoryReplicas(
+    MetadataShardAccessorRW& shard, ObjectMetadata& metadata,
+    const UUID& client_id, const std::string& key, uint64_t value_length,
+    const ReplicateConfig& config,
+    const std::chrono::system_clock::time_point& now)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    auto allocated = AllocateMemoryReplicas(key, value_length, config);
+    if (!allocated) {
+        return tl::make_unexpected(allocated.error());
+    }
+    std::vector<Replica::Descriptor> replica_list;
+    replica_list.reserve(allocated.value().size());
+    for (const auto& replica : allocated.value()) {
+        replica_list.emplace_back(replica.get_descriptor());
+    }
+    metadata.AddReplicas(std::move(allocated.value()));
+    // PutEnd / PutRevoke accept only the client that started the put.
+    metadata.client_id = client_id;
+    metadata.put_start_time = now;
+    shard->processing_keys.insert(key);
+    VLOG(1) << "key=" << key << ", action=kvp_add_memory_replica";
     return replica_list;
 }
 
@@ -890,6 +1076,18 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             }
             shard->processing_keys.erase(key);
             shard->metadata.erase(it);
+        } else if (kvp_mode_ != KvpMode::kExclusive &&
+                   metadata.size == slice_length &&
+                   shard->processing_keys.count(key) == 0 &&
+                   shard->replication_tasks.count(key) == 0 &&
+                   shard->offloading_tasks.count(key) == 0 &&
+                   !metadata.HasReplica(&Replica::fn_is_memory_replica) &&
+                   metadata.HasReplica([](const Replica& replica) {
+                       return replica.is_local_disk_replica() &&
+                              replica.is_completed();
+                   })) {
+            return KvpAddMemoryReplicas(shard, metadata, client_id, key,
+                                        slice_length, config, now);
         } else {
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -923,7 +1121,13 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         },
         [](Replica& replica) { replica.mark_complete(); });
 
-    if (enable_offload_) {
+    // An object already on local disk got its memory replica back from a
+    // KVPilot SSD write-back; offloading it again would rewrite the same
+    // value and pin the disk replica in an offloading task. Exclusive
+    // placement offloads only SSD groups; the others stay memory-only.
+    if (enable_offload_ &&
+        !metadata.HasReplica(&Replica::fn_is_local_disk_replica) &&
+        (kvp_mode_ != KvpMode::kExclusive || KvpGroupWantsSsd(key))) {
         auto& shard = accessor.GetShard();
         metadata.VisitReplicas(
             &Replica::fn_is_completed, [this, &key, &shard](Replica& replica) {
@@ -987,15 +1191,9 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                        client_id;
         },
         [&replica](Replica& rep) {
-            rep.get_descriptor()
-                .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
+            // get_descriptor() returns a copy, so update the replica itself.
+            rep.update_local_disk(
+                replica.get_descriptor().get_local_disk_descriptor());
         });
     return {};
 }
@@ -1830,6 +2028,15 @@ auto MasterService::Remove(const std::string& key, bool force)
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
+    // Exclusive placement removes on tier changes. An offload still copying
+    // out of the memory replica would read freed memory, so the object stays
+    // (one extra copy) rather than corrupt the disk replica.
+    if (kvp_mode_ == KvpMode::kExclusive &&
+        accessor.GetShard()->offloading_tasks.count(key) > 0) {
+        VLOG(1) << "key=" << key << ", error=object_has_offloading_task";
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+    }
+
     // Remove object metadata
     accessor.Erase();
     return {};
@@ -2018,6 +2225,14 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 continue;
             }
 
+            // See Remove: an in-flight offload still reads the memory replica.
+            if (kvp_mode_ == KvpMode::kExclusive &&
+                shard->offloading_tasks.contains(key)) {
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+                continue;
+            }
+
             // Remove object metadata
             shard->metadata.erase(it);
             results[original_idx] = {};  // Success
@@ -2162,17 +2377,47 @@ auto MasterService::NotifyOffloadSuccess(
             }
         }
 
-        // Add LOCAL_DISK replica.
+        // Add LOCAL_DISK replica. The value follows its key in the bucket
+        // record; file_path is empty for backends without bucket files.
         Replica replica(client_id, metadata.data_size,
-                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);
+                        metadata.transport_endpoint, ReplicaStatus::COMPLETE,
+                        metadata.file_path,
+                        static_cast<uint64_t>(metadata.offset + metadata.key_size));
         auto res = AddReplica(client_id, key, replica);
         if (!res && res.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to add replica: error=" << res.error()
                        << ", client_id=" << client_id << ", key=" << key;
             return tl::make_unexpected(res.error());
         }
+        if (kvp_mode_ == KvpMode::kExclusive && KvpGroupWantsSsd(key)) {
+            // SSD chunk: the disk replica is now its only copy. A memory
+            // replica pinned by a reader stays until it is unpinned.
+            MetadataAccessorRW accessor(this, key);
+            if (accessor.Exists()) {
+                kvp_excl_dropped_ += static_cast<int64_t>(
+                    accessor.Get().EraseReplicas([](const Replica& r) {
+                        return r.is_memory_replica() && r.is_completed() &&
+                               r.get_refcnt() == 0;
+                    }));
+            }
+            const int64_t n = ++kvp_excl_offloaded_;
+            if (n <= 3 || n % 20000 == 0) {
+                LOG(INFO) << "[KVPILOT-EXCL] offloaded=" << n
+                          << " memory_replicas_dropped=" << kvp_excl_dropped_
+                          << " spilled=" << kvp_excl_spilled_;
+            }
+        }
     }
     return {};
+}
+
+bool MasterService::KvpGroupWantsSsd(const std::string& key) {
+    const uint64_t gid = KvpGroupOf(key);
+    auto& shard = kvp_groups_[gid % kKvpGroupShards];
+    std::lock_guard<std::mutex> lock(shard.mu);
+    auto it = shard.map.find(gid);
+    return it != shard.map.end() && it->second.placed &&
+           it->second.tier == KvpTier::kSsd;
 }
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
@@ -3472,264 +3717,312 @@ ha::SnapshotCatalogStore* MasterService::GetSnapshotCatalogStore() {
     return snapshot_catalog_store_.get();
 }
 
-void MasterService::BatchEvict(double evict_ratio_target,
-                               double evict_ratio_lowerbound) {
-    if (evict_ratio_target < evict_ratio_lowerbound) {
-        LOG(ERROR) << "evict_ratio_target=" << evict_ratio_target
-                   << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound
-                   << ", error=invalid_params";
-        evict_ratio_lowerbound = evict_ratio_target;
-    }
-
-    auto now = std::chrono::system_clock::now();
-    long evicted_count = 0;
-    long object_count = 0;
-    uint64_t total_freed_size = 0;
-
-    // Candidates for second pass eviction
-    std::vector<std::chrono::system_clock::time_point> no_pin_objects;
-    std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
-
-    auto can_evict_replicas = [](const ObjectMetadata& metadata) {
-        return metadata.HasReplica([](const Replica& replica) {
-            return replica.is_memory_replica() && replica.is_completed() &&
-                   replica.get_refcnt() == 0;
-        });
-    };
-
-    auto evict_replicas = [](ObjectMetadata& metadata) {
-        return metadata.EraseReplicas([](const Replica& replica) {
-            return replica.is_memory_replica() && replica.is_completed() &&
-                   replica.get_refcnt() == 0;
-        });
-    };
-
-    // Randomly select a starting shard to avoid imbalance eviction between
-    // shards. No need to use expensive random_device here.
-    size_t start_idx = rand() % kNumShards;
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-
-    // First pass: evict objects without soft pin and lease expired
-    for (size_t i = 0; i < kNumShards; i++) {
-        MetadataShardAccessorRW shard(this, (start_idx + i) % kNumShards);
-
-        // Discard expired processing keys first so that they won't be counted
-        // in later evictions.
-        DiscardExpiredProcessingReplicas(shard, now);
-
-        // object_count must be updated at beginning as it will be used later
-        // to compute ideal_evict_num
-        object_count += shard->metadata.size();
-
-        // To achieve evicted_count / object_count = evict_ratio_target,
-        // ideally how many object should be evicted in this shard
-        const long ideal_evict_num =
-            std::ceil(object_count * evict_ratio_target) - evicted_count;
-
-        std::vector<std::chrono::system_clock::time_point>
-            candidates;  // can be removed
-        for (auto it = shard->metadata.begin(); it != shard->metadata.end();
-             it++) {
-            // Hard-pinned objects are never evicted
-            if (it->second.IsHardPinned()) {
-                continue;
-            }
-            // Skip objects that are not expired or have incomplete replicas
-            if (!it->second.IsLeaseExpired(now) ||
-                !can_evict_replicas(it->second)) {
-                continue;
-            }
-            if (!it->second.IsSoftPinned(now)) {
-                if (ideal_evict_num > 0) {
-                    // first pass candidates
-                    candidates.push_back(it->second.lease_timeout);
-                } else {
-                    // No need to evict any object in this shard, put to
-                    // second pass candidates
-                    no_pin_objects.push_back(it->second.lease_timeout);
-                }
-            } else if (allow_evict_soft_pinned_objects_) {
-                // second pass candidates, only if
-                // allow_evict_soft_pinned_objects_ is true
-                soft_pin_objects.push_back(it->second.lease_timeout);
-            }
-        }
-
-        if (ideal_evict_num > 0 && !candidates.empty()) {
-            long evict_num = std::min(ideal_evict_num, (long)candidates.size());
-            long shard_evicted_count =
-                0;  // number of objects evicted from this shard
-            std::nth_element(candidates.begin(),
-                             candidates.begin() + (evict_num - 1),
-                             candidates.end());
-            auto target_timeout = candidates[evict_num - 1];
-            // Evict objects with lease timeout less than or equal to target.
-            auto it = shard->metadata.begin();
-            while (it != shard->metadata.end()) {
-                // Skip objects that are not allowed to be evicted in the first
-                // pass
-                if (it->second.IsHardPinned() ||
-                    !it->second.IsLeaseExpired(now) ||
-                    it->second.IsSoftPinned(now) ||
-                    !can_evict_replicas(it->second)) {
-                    ++it;
-                    continue;
-                }
-                if (it->second.lease_timeout <= target_timeout) {
-                    // Evict this object
-                    total_freed_size +=
-                        it->second.size *
-                        evict_replicas(it->second);  // Erase memory replicas
-                    if (it->second.IsValid() == false) {
-                        it = shard->metadata.erase(it);
-                    } else {
-                        ++it;
-                    }
-                    shard_evicted_count++;
-                } else {
-                    // second pass candidates
-                    no_pin_objects.push_back(it->second.lease_timeout);
-                    ++it;
-                }
-            }
-            evicted_count += shard_evicted_count;
-        }
-    }
-
-    // Try releasing discarded replicas before we decide whether to do the
-    // second pass.
-    uint64_t released_discarded_cnt = ReleaseExpiredDiscardedReplicas(now);
-
-    // The ideal number of objects to evict in the second pass
-    long target_evict_num = std::ceil(object_count * evict_ratio_lowerbound) -
-                            evicted_count - released_discarded_cnt;
-    // The actual number of objects we can evict in the second pass
-    target_evict_num =
-        std::min(target_evict_num,
-                 (long)no_pin_objects.size() + (long)soft_pin_objects.size());
-
-    // Do second pass eviction only if 1). there are candidates that can be
-    // evicted AND 2). The evicted number in the first pass is less than
-    // evict_ratio_lowerbound.
-    if (target_evict_num > 0) {
-        // If 1). there are enough candidates without soft pin OR 2). soft pin
-        // candidates are empty, then do second pass A. Otherwise, do second
-        // pass B. Note that the second condition is ensured implicitly by the
-        // calculation of target_evict_num.
-        if (target_evict_num <= static_cast<long>(no_pin_objects.size())) {
-            // Second pass A: only evict objects without soft pin. The following
-            // code is error-prone if target_evict_num > no_pin_objects.size().
-
-            std::nth_element(no_pin_objects.begin(),
-                             no_pin_objects.begin() + (target_evict_num - 1),
-                             no_pin_objects.end());
-            auto target_timeout = no_pin_objects[target_evict_num - 1];
-
-            // Evict objects with lease timeout less than or equal to target.
-            // Stop when the target is reached.
-            for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
-                MetadataShardAccessorRW shard(this,
-                                              (start_idx + i) % kNumShards);
-                auto it = shard->metadata.begin();
-                while (it != shard->metadata.end() && target_evict_num > 0) {
-                    if (!it->second.IsHardPinned() &&
-                        it->second.IsLeaseExpired(now) &&
-                        it->second.lease_timeout <= target_timeout &&
-                        !it->second.IsSoftPinned(now) &&
-                        can_evict_replicas(it->second)) {
-                        // Evict this object
-                        total_freed_size +=
-                            it->second.size *
-                            evict_replicas(
-                                it->second);  // Erase memory replicas
-                        if (it->second.IsValid() == false) {
-                            it = shard->metadata.erase(it);
-                        } else {
-                            ++it;
-                        }
-                        evicted_count++;
-                        target_evict_num--;
-                    } else {
-                        ++it;
-                    }
-                }
-            }
-        } else if (!soft_pin_objects.empty()) {
-            // Second pass B: Prioritize evicting objects without soft pin, but
-            // also allow to evict soft pinned objects. The following code is
-            // error-prone if the soft pin objects are empty.
-
-            const long soft_pin_evict_num =
-                target_evict_num - static_cast<long>(no_pin_objects.size());
-            // For soft pin objects, prioritize to evict the ones with smaller
-            // lease timeout.
-            std::nth_element(
-                soft_pin_objects.begin(),
-                soft_pin_objects.begin() + (soft_pin_evict_num - 1),
-                soft_pin_objects.end());
-            auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
-
-            // Stop when the target is reached.
-            for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
-                MetadataShardAccessorRW shard(this,
-                                              (start_idx + i) % kNumShards);
-
-                auto it = shard->metadata.begin();
-                while (it != shard->metadata.end() && target_evict_num > 0) {
-                    // Skip hard-pinned or not-yet-expired objects
-                    if (it->second.IsHardPinned() ||
-                        !it->second.IsLeaseExpired(now) ||
-                        !can_evict_replicas(it->second)) {
+void MasterService::KvpBatchEvict(double evict_ratio_target,
+                                  double evict_ratio_lowerbound) {
+    const bool excl = kvp_mode_ == KvpMode::kExclusive;
+    if (excl) {
+        // Offloads free memory only when they land. While the bytes in flight
+        // cover this round's target, skip the scan: a full pass takes every
+        // shard lock in turn and starves the clients' offload RPCs (seconds
+        // per pass at ~500K objects; 2026-11-13 x3), which is what frees DRAM.
+        const auto t = std::chrono::steady_clock::now();
+        if (t - kvp_excl_last_check_ < std::chrono::milliseconds(200)) return;
+        kvp_excl_last_check_ = t;
+        const auto now_sys = std::chrono::system_clock::now();
+        long inflight = 0;
+        {
+            std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
+            for (size_t i = 0; i < kNumShards; i++) {
+                MetadataShardAccessorRW shard(this, i);
+                for (auto it = shard->offloading_tasks.begin();
+                     it != shard->offloading_tasks.end();) {
+                    if (now_sys - it->second.start_time < kKvpExclTaskTtl) {
+                        ++inflight;
                         ++it;
                         continue;
                     }
-                    // Evict objects with 1). no soft pin OR 2). with soft pin
-                    // and lease timeout less than or equal to target.
-                    if (!it->second.IsSoftPinned(now) ||
-                        it->second.lease_timeout <= soft_target_timeout) {
-                        total_freed_size +=
-                            it->second.size *
-                            evict_replicas(
-                                it->second);  // Erase memory replicas
-                        if (it->second.IsValid() == false) {
-                            it = shard->metadata.erase(it);
-                        } else {
-                            ++it;
-                        }
-                        evicted_count++;
-                        target_evict_num--;
-                    } else {
-                        ++it;
+                    auto md = shard->metadata.find(it->first);
+                    if (md != shard->metadata.end()) {
+                        auto source =
+                            md->second.GetReplicaByID(it->second.source_id);
+                        if (source != nullptr) source->dec_refcnt();
                     }
+                    it = shard->offloading_tasks.erase(it);
+                    ++kvp_excl_expired_;
                 }
             }
-        } else {
-            // This should not happen.
-            LOG(ERROR) << "Error in second pass eviction: target_evict_num="
-                       << target_evict_num
-                       << ", no_pin_objects.size()=" << no_pin_objects.size()
-                       << ", soft_pin_objects.size()="
-                       << soft_pin_objects.size()
-                       << ", evicted_count=" << evicted_count
-                       << ", object_count=" << object_count
-                       << ", evict_ratio_target=" << evict_ratio_target
-                       << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound;
+        }
+        if (inflight >= kKvpExclMaxInflight) {
+            ++kvp_excl_scans_skipped_;
+            return;
+        }
+        if (kvp_excl_obj_bytes_ > 0) {
+            const double target_bytes =
+                evict_ratio_target *
+                static_cast<double>(
+                    MasterMetricManager::instance().get_allocated_mem_size());
+            if (inflight * kvp_excl_obj_bytes_ >= target_bytes) {
+                ++kvp_excl_scans_skipped_;
+                return;
+            }
         }
     }
+    const auto now = std::chrono::system_clock::now();
 
-    if (evicted_count > 0 || released_discarded_cnt > 0) {
+    // Snapshot the group table so the scans below never hold a group lock
+    // under a shard lock (reads take them the other way round).
+    std::unordered_map<uint64_t, KvpGroupState> groups;
+    for (auto& shard : kvp_groups_) {
+        std::lock_guard<std::mutex> lock(shard.mu);
+        groups.insert(shard.map.begin(), shard.map.end());
+    }
+
+    // A request's chunks leave from its tail, so what stays is a prefix and a
+    // hit reads HBM, then DRAM, then SSD. Groups are bucketed by the request
+    // that last released them (order_seq); only each request's last chunk
+    // still in memory competes, ranked as below.
+    struct Rank {
+        double cls;    // inclusive-safe: tier class; 0 otherwise
+        double pen;    // exclusive, inclusive-penalty: DRAM -> SSD penalty
+                       // (ms); 0 otherwise
+        int64_t ord;   // releasing request, older first; unordered groups
+                       // (no release yet) after all, by last access
+        bool operator<(const Rank& o) const {
+            if (cls != o.cls) return cls < o.cls;
+            if (pen != o.pen) return pen < o.pen;
+            return ord < o.ord;
+        }
+    };
+    constexpr int64_t kUnordered = int64_t{1} << 50;
+    auto evictable = [](const ObjectMetadata& md) {
+        return md.HasReplica([](const Replica& r) {
+            return r.is_memory_replica() && r.is_completed() &&
+                   r.get_refcnt() == 0;
+        });
+    };
+    auto rank_of = [&](const std::string& key, const ObjectMetadata& md,
+                       Rank& out, bool offloading) -> bool {
+        // A reader's refcnt pin (GetReplicaList) blocks eviction; leases are
+        // not consulted.
+        if (md.IsHardPinned() || !evictable(md)) {
+            return false;
+        }
+        if (excl) {
+            // Memory-only objects move to SSD, once (one already offloading
+            // waits). One with a disk replica is an SSD group whose memory
+            // replica a reader held when it landed; the unpin drops it.
+            const bool has_disk = md.HasReplica([](const Replica& r) {
+                return r.is_local_disk_replica() && r.is_completed();
+            });
+            if (has_disk || offloading) return false;
+        }
+        int64_t ord = kUnordered + KvpNowMs(md.put_start_time);
+        const KvpGroupState* st = nullptr;
+        auto it = groups.find(KvpGroupOf(key));
+        if (it != groups.end()) {
+            st = &it->second;
+            ord = st->order_seq >= 0 ? st->order_seq : kUnordered + st->access_ms;
+        }
+        const bool placed = st != nullptr && st->placed;
+        double cls = 0.0;
+        double pen = 0.0;
+        if (kvp_mode_ == KvpMode::kInclusive) {
+            // none < SSD < DRAM < HBM; no placement yet counts as HBM.
+            cls = static_cast<double>(
+                static_cast<int32_t>(placed ? st->tier : KvpTier::kHbm));
+        } else if (excl || kvp_mode_ == KvpMode::kInclusivePenalty) {
+            pen = placed ? st->penalty_ms
+                         : std::numeric_limits<double>::infinity();
+        }
+        out = Rank{cls, pen, ord};
+        return true;
+    };
+    struct Cand {
+        Rank rank;
+        long objects = 0;
+    };
+    // Group id -> its rank and evictable objects (every layer, every rank).
+    std::unordered_map<uint64_t, Cand> cands;
+
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    long object_count = 0;
+    // The ratio applies to what DRAM holds: objects left with only an SSD
+    // replica outnumber the memory ones, and counting them would evict
+    // ~2x the intended share per round.
+    long mem_object_count = 0;
+    long offloading = 0;
+    double mem_bytes = 0.0;
+    for (size_t i = 0; i < kNumShards; i++) {
+        MetadataShardAccessorRW shard(this, i);
+        DiscardExpiredProcessingReplicas(shard, now);
+        object_count += shard->metadata.size();
+        offloading += static_cast<long>(shard->offloading_tasks.size());
+        for (const auto& [key, md] : shard->metadata) {
+            if (md.HasReplica([](const Replica& r) {
+                    return r.is_memory_replica() && r.is_completed();
+                })) {
+                ++mem_object_count;
+                mem_bytes += static_cast<double>(md.size);
+            }
+            Rank r;
+            if (rank_of(key, md, r, shard->offloading_tasks.count(key) > 0)) {
+                auto& c = cands[KvpGroupOf(key)];
+                c.rank = r;
+                ++c.objects;
+            }
+        }
+    }
+    long candidate_objects = 0;
+    for (const auto& [gid, c] : cands) candidate_objects += c.objects;
+
+    long target =
+        static_cast<long>(std::ceil(mem_object_count * evict_ratio_target));
+    // Exclusive placement: offloads in flight free their memory replica when
+    // they land, so they count toward this round's target.
+    if (excl) {
+        target = std::max<long>(0, target - offloading);
+        if (mem_object_count > 0) kvp_excl_obj_bytes_ = mem_bytes / mem_object_count;
+    }
+    target = std::min<long>(target, candidate_objects);
+
+    // Pick whole groups up to the target: per request, from its tail; across
+    // requests, the smallest rank of each one's current tail.
+    std::unordered_set<uint64_t> chosen;
+    if (target > 0) {
+        // Request -> its groups, tail first. An unordered group is a request
+        // of its own.
+        std::unordered_map<int64_t, std::vector<std::pair<int64_t, uint64_t>>> reqs;
+        int64_t single = -1;
+        for (const auto& [gid, c] : cands) {
+            auto g = groups.find(gid);
+            if (g != groups.end() && g->second.order_seq >= 0) {
+                reqs[g->second.order_seq].emplace_back(g->second.order_pos, gid);
+            } else {
+                reqs[single--].emplace_back(0, gid);
+            }
+        }
+        using Head = std::tuple<Rank, int64_t, size_t>;  // rank, request, index
+        auto later = [](const Head& a, const Head& b) {
+            return std::get<0>(b) < std::get<0>(a);
+        };
+        std::priority_queue<Head, std::vector<Head>, decltype(later)> heap(later);
+        for (auto& [req, list] : reqs) {
+            std::sort(list.begin(), list.end(), std::greater<>());
+            heap.emplace(cands[list[0].second].rank, req, 0);
+        }
+        long picked = 0;
+        while (picked < target && !heap.empty()) {
+            const int64_t req = std::get<1>(heap.top());
+            const size_t idx = std::get<2>(heap.top());
+            heap.pop();
+            const auto& list = reqs[req];
+            const uint64_t gid = list[idx].second;
+            chosen.insert(gid);
+            picked += cands[gid].objects;
+            if (idx + 1 < list.size()) {
+                heap.emplace(cands[list[idx + 1].second].rank, req, idx + 1);
+            }
+        }
+    }
+    long evicted_count = 0;
+    long spilled = 0;
+    std::unordered_set<uint64_t> spilled_groups;
+    uint64_t total_freed_size = 0;
+    if (!chosen.empty()) {
+        for (size_t i = 0; i < kNumShards; i++) {
+            MetadataShardAccessorRW shard(this, i);
+            auto it = shard->metadata.begin();
+            while (it != shard->metadata.end()) {
+                Rank r;
+                const bool busy = shard->offloading_tasks.count(it->first) > 0;
+                if (!chosen.count(KvpGroupOf(it->first)) ||
+                    !rank_of(it->first, it->second, r, busy)) {
+                    ++it;
+                    continue;
+                }
+                if (excl) {
+                    // Write it to SSD; the memory replica goes once the
+                    // offload lands (group turned SSD below).
+                    if (offloading + spilled >= kKvpExclMaxInflight) {
+                        ++it;
+                        continue;
+                    }
+                    bool pushed = false;
+                    it->second.VisitReplicas(
+                        [](const Replica& rep) {
+                            return rep.is_memory_replica() &&
+                                   rep.is_completed() && rep.get_refcnt() == 0;
+                        },
+                        [&](Replica& rep) {
+                            if (pushed || !PushOffloadingQueue(it->first, rep)) {
+                                return;
+                            }
+                            rep.inc_refcnt();
+                            shard->offloading_tasks.emplace(
+                                it->first, OffloadingTask{rep.id(), now});
+                            pushed = true;
+                        });
+                    if (pushed) {
+                        ++spilled;
+                        spilled_groups.insert(KvpGroupOf(it->first));
+                    }
+                    ++it;
+                    continue;
+                }
+                total_freed_size +=
+                    it->second.size *
+                    it->second.EraseReplicas([](const Replica& rep) {
+                        return rep.is_memory_replica() && rep.is_completed() &&
+                               rep.get_refcnt() == 0;
+                    });
+                evicted_count++;
+                if (!it->second.IsValid()) {
+                    it = shard->metadata.erase(it);
+                    continue;
+                }
+                ++it;
+            }
+        }
+    }
+    if (!spilled_groups.empty()) {
+        // After the shard locks: reads take a shard lock, then a group lock.
+        const int64_t now_ms = KvpNowMs(now);
+        for (const uint64_t gid : spilled_groups) {
+            auto& gshard = kvp_groups_[gid % kKvpGroupShards];
+            std::lock_guard<std::mutex> lock(gshard.mu);
+            auto& st = gshard.map[gid];
+            st.tier = KvpTier::kSsd;
+            st.placed = true;
+            st.access_ms = now_ms;
+        }
+        kvp_excl_spilled_ += spilled;
+    }
+    uint64_t released_discarded_cnt = ReleaseExpiredDiscardedReplicas(now);
+
+    if (evicted_count > 0 || spilled > 0 || released_discarded_cnt > 0) {
         need_eviction_ = false;
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);
     } else {
-        if (object_count == 0) {
-            // No objects to evict, no need to check again
-            need_eviction_ = false;
-        }
+        if (object_count == 0) need_eviction_ = false;
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
-            << ", total_freed_size=" << total_freed_size;
+    LOG(INFO) << "[KVPILOT-EVICT] used_ratio="
+              << MasterMetricManager::instance().get_global_mem_used_ratio()
+              << " objects=" << object_count
+              << " mem_objects=" << mem_object_count
+              << " candidates=" << cands.size() << " target=" << target
+              << " evicted=" << evicted_count
+              << " freed_bytes=" << total_freed_size
+              << " lowerbound=" << evict_ratio_lowerbound
+              << " spilled=" << spilled << " offloading=" << offloading
+              << " scans_skipped=" << kvp_excl_scans_skipped_
+              << " offloads_expired=" << kvp_excl_expired_;
+}
+
+void MasterService::BatchEvict(double evict_ratio_target,
+                               double evict_ratio_lowerbound) {
+    KvpBatchEvict(evict_ratio_target, evict_ratio_lowerbound);
 }
 
 void MasterService::ClientMonitorFunc() {

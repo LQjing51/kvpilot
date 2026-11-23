@@ -356,6 +356,8 @@ impl OpenAIPreprocessor {
                 "allowed_token_ids",
                 "bad_words_token_ids",
                 "forced_output_tokens",
+                "cache_use_control",
+                "cache_use_max_tokens",
             ] {
                 if let Some(value) = fields.get(key) {
                     sampling_passthrough.insert(key.to_string(), value.clone());

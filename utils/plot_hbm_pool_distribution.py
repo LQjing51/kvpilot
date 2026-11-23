@@ -114,7 +114,7 @@ def build_grid(census, ratios, include_in_use):
     for _tag, record in census:
         stats["blank"] += record.get("num_blank", 0)
         for row in record["blocks"]:
-            _block_id, state, idle_ns, req_line, _tier = row
+            _block_id, state, idle_ns, req_line = row[:4]
             stats["rows"] += 1
             if state == _IN_USE and not include_in_use:
                 stats["in_use_skipped"] += 1

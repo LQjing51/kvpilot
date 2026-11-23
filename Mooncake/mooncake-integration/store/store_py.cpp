@@ -1426,6 +1426,13 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("file_path", &DiskDescriptor::file_path)
         .def_readwrite("object_size", &DiskDescriptor::object_size);
 
+    py::class_<LocalDiskDescriptor>(m, "LocalDiskDescriptor")
+        .def_readonly("object_size", &LocalDiskDescriptor::object_size)
+        .def_readonly("transport_endpoint",
+                      &LocalDiskDescriptor::transport_endpoint)
+        .def_readonly("file_path", &LocalDiskDescriptor::file_path)
+        .def_readonly("value_offset", &LocalDiskDescriptor::value_offset);
+
     py::class_<Replica::Descriptor>(m, "ReplicaDescriptor")
         .def_readonly("status", &Replica::Descriptor::status)
         .def("is_memory_replica",
@@ -1443,7 +1450,15 @@ PYBIND11_MODULE(store, m) {
             "get_disk_descriptor",
             static_cast<const DiskDescriptor &(Replica::Descriptor::*)() const>(
                 &Replica::Descriptor::get_disk_descriptor),
-            py::return_value_policy::reference_internal);
+            py::return_value_policy::reference_internal)
+        .def("is_local_disk_replica",
+             static_cast<bool (Replica::Descriptor::*)() const noexcept>(
+                 &Replica::Descriptor::is_local_disk_replica))
+        .def("get_local_disk_descriptor",
+             static_cast<const LocalDiskDescriptor &(Replica::Descriptor::*)()
+                             const>(
+                 &Replica::Descriptor::get_local_disk_descriptor),
+             py::return_value_policy::reference_internal);
 
     py::class_<AllocatedBuffer::Descriptor>(
         m, "Descriptor",
@@ -2304,6 +2319,128 @@ PYBIND11_MODULE(store, m) {
             "Map the shared memory segments of same-host peers into this "
             "process so their KV can be read without a cross-process copy. "
             "Returns the number of segments newly mapped, or -1 on failure.")
+        .def(
+            "batch_locate_local_ssd",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real_client) {
+                    return std::vector<std::tuple<std::string, int64_t, int64_t>>(
+                        keys.size(), {std::string(), 0, 0});
+                }
+                py::gil_scoped_release release;
+                return real_client->batch_locate_local_ssd(keys);
+            },
+            py::arg("keys"),
+            "Where each key sits in this client's local SSD offload files: a "
+            "list of (data file path, value offset, value size); the path is "
+            "empty for keys not on this client's SSD.")
+        .def(
+            "batch_remove_local_disk",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) -> int64_t {
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real_client) return -1;
+                py::gil_scoped_release release;
+                return real_client->batch_remove_local_disk(keys);
+            },
+            py::arg("keys"),
+            "KVPilot: drop keys from this client's SSD offload files, freeing "
+            "buckets left empty. Returns how many keys it held, -1 without SSD "
+            "offload.")
+        .def(
+            "batch_offload_local",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<uintptr_t> &ptrs,
+               const std::vector<size_t> &sizes) -> int64_t {
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real_client) return -1;
+                py::gil_scoped_release release;
+                return real_client->batch_offload_local(keys, ptrs, sizes);
+            },
+            py::arg("keys"), py::arg("ptrs"), py::arg("sizes"),
+            "KVPilot: write values from host memory (the caller's buffer, not "
+            "the segment) to this client's SSD as one bucket and register "
+            "them with the master. Returns the number written, -1 on failure.")
+        .def(
+            "batch_set_group_placement",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &groups,
+               const std::vector<int32_t> &tiers,
+               const std::vector<double> &penalties_ms) -> int64_t {
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real_client) return -1;
+                py::gil_scoped_release release;
+                return real_client->batch_set_group_placement(groups, tiers,
+                                                              penalties_ms);
+            },
+            py::arg("groups"), py::arg("tiers"), py::arg("penalties_ms"),
+            "KVPilot: set chunk groups' (the chunk-hash field of LMCache keys) "
+            "tier (0 none, 1 SSD, 2 DRAM, 3 HBM) and penalty (ms). Returns the "
+            "number of groups updated, -1 on failure.")
+        .def(
+            "batch_unpin_memory_replicas",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) -> int64_t {
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real_client) return -1;
+                py::gil_scoped_release release;
+                return real_client->batch_unpin_memory_replicas(keys);
+            },
+            py::arg("keys"),
+            "KVPilot: drop refcnt pins taken by batch_get_replica_desc under "
+            "priority eviction. Call when zero-copy DRAM views are done. "
+            "Returns keys unpinned, 0 when priority eviction is off, -1 on "
+            "failure.")
+        .def(
+            "batch_put_start_local",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<uint64_t> &sizes,
+               const ReplicateConfig &config) {
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real_client) return std::vector<uint64_t>(keys.size(), 0);
+                py::gil_scoped_release release;
+                return real_client->batch_put_start_local(keys, sizes, config);
+            },
+            py::arg("keys"), py::arg("sizes"),
+            py::arg("config") = ReplicateConfig{},
+            "KVPilot zero-copy write-back: start puts whose memory replicas "
+            "the caller writes itself. Per key, the replica's host address in "
+            "this client's own segment, or 0 (already in memory, no space, or "
+            "placed elsewhere; revoked). Finish with batch_put_end / "
+            "batch_put_revoke.")
+        .def(
+            "batch_put_end",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real_client) return std::vector<int>(keys.size(), -1);
+                py::gil_scoped_release release;
+                return real_client->batch_put_end(keys);
+            },
+            py::arg("keys"), "KVPilot: complete puts started by "
+            "batch_put_start_local; per key 0 or an error code.")
+        .def(
+            "batch_put_revoke",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real_client) return std::vector<int>(keys.size(), -1);
+                py::gil_scoped_release release;
+                return real_client->batch_put_revoke(keys);
+            },
+            py::arg("keys"), "KVPilot: drop puts started by "
+            "batch_put_start_local; per key 0 or an error code.")
         .def(
             "batch_replica_clear",
             [](MooncakeStorePyWrapper &self,

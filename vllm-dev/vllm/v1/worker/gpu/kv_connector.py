@@ -69,9 +69,9 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
 
         # TODO: sort out KV Connectors' use of forward_context
-        # Timed as a stall: with layerwise loading this submits the fetches and
-        # then blocks on the first layer. Reset first so the accumulator covers
-        # exactly this forward. See kvpilot_load_stall.py.
+        # Timed as a stall: with layerwise loading this sets the load up before
+        # the forward, while the GPU has nothing queued. Reset first so the
+        # accumulator covers exactly this forward. See kvpilot_load_stall.py.
         kvpilot_load_stall.begin_step()
         timer = kvpilot_load_stall.time_wait()
         if is_forward_context_available():
@@ -107,9 +107,7 @@ class ActiveKVConnector(KVConnector):
             self.kv_connector.build_connector_worker_meta()
         )
         # Read after the forward, so every per-layer wait is included.
-        output.kvpilot_stall_ns, output.kvpilot_num_waits = (
-            kvpilot_load_stall.take_step()
-        )
+        output.kvpilot_wait_ns = kvpilot_load_stall.take_step()
         self.kv_connector.clear_connector_metadata()
         return output
 

@@ -128,6 +128,11 @@ struct LocalDiskReplicaData {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
+    // KVPilot: the owner's bucket file and the value's byte offset in it, so a
+    // client on the same host can read the value directly. Empty / 0 when the
+    // owner's backend has no such file; not kept in master snapshots.
+    std::string file_path;
+    uint64_t value_offset = 0;
 };
 
 struct MemoryDescriptor {
@@ -145,7 +150,10 @@ struct LocalDiskDescriptor {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
-    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
+    std::string file_path{};    // see LocalDiskReplicaData
+    uint64_t value_offset = 0;
+    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint,
+             file_path, value_offset);
 };
 
 class Replica {
@@ -170,9 +178,11 @@ class Replica {
     }
 
     Replica(UUID client_id, uint64_t object_size,
-            std::string transport_endpoint, ReplicaStatus status)
+            std::string transport_endpoint, ReplicaStatus status,
+            std::string file_path = "", uint64_t value_offset = 0)
         : data_(LocalDiskReplicaData{client_id, object_size,
-                                     std::move(transport_endpoint)}),
+                                     std::move(transport_endpoint),
+                                     std::move(file_path), value_offset}),
           status_(status) {}
 
     ~Replica() {
@@ -315,6 +325,17 @@ class Replica {
         return std::nullopt;
     }
 
+    // Replace a local_disk replica's size, endpoint and location (a re-offload
+    // by the same client). No-op for other replica types.
+    void update_local_disk(const LocalDiskDescriptor& desc) {
+        if (auto* disk_data = std::get_if<LocalDiskReplicaData>(&data_)) {
+            disk_data->object_size = desc.object_size;
+            disk_data->transport_endpoint = desc.transport_endpoint;
+            disk_data->file_path = desc.file_path;
+            disk_data->value_offset = desc.value_offset;
+        }
+    }
+
     [[nodiscard]] size_t get_memory_buffer_size() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
@@ -346,9 +367,17 @@ class Replica {
         }
     }
 
-    void inc_refcnt() { refcnt_.fetch_add(1); }
+    // Mutable: GetReplicaList may pin under a const ObjectMetadata view
+    // (same pattern as GrantLease on lease_timeout).
+    void inc_refcnt() const { refcnt_.fetch_add(1); }
 
-    void dec_refcnt() { refcnt_.fetch_sub(1); }
+    void dec_refcnt() const {
+        uint32_t prev = refcnt_.fetch_sub(1);
+        if (prev == 0) {
+            refcnt_.fetch_add(1);  // undo underflow
+            LOG(ERROR) << "dec_refcnt underflow";
+        }
+    }
 
     uint32_t get_refcnt() const { return refcnt_.load(); }
 
@@ -457,7 +486,7 @@ class Replica {
 
     friend class Serializer<Replica>;
     friend class MasterService;  // For MetadataSerializer to access next_id_
-    std::atomic<uint32_t> refcnt_{0};
+    mutable std::atomic<uint32_t> refcnt_{0};
 };
 
 inline Replica::Descriptor Replica::get_descriptor() const {
@@ -489,6 +518,8 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         local_disk_desc.client_id = disk_data.client_id;
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
+        local_disk_desc.file_path = disk_data.file_path;
+        local_disk_desc.value_offset = disk_data.value_offset;
         desc.descriptor_variant = std::move(local_disk_desc);
     }
 

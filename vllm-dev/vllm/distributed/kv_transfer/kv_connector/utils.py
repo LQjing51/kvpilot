@@ -90,12 +90,12 @@ class KVOutputAggregator:
         aggregated_kv_connector_worker_meta = None
         combined_kv_cache_events = None
         invalid_block_ids = set[int]()
-        # TP ranks each hold a shard of every layer and run the step in
-        # lockstep, so the step is not over until the slowest rank's KV has
-        # landed. Max, not sum: summing would multiply one stall by the TP
-        # degree, and taking rank 0 alone would miss a straggler elsewhere.
-        kvpilot_stall_ns = 0
-        kvpilot_num_waits = 0
+        # TP ranks each hold a shard of every layer and pass every layer in
+        # lockstep through an all-reduce, so a wait costs the step its slowest
+        # rank's idle: max over ranks wait by wait. Summing would multiply one
+        # stall by the TP degree; a rank-level max of sums misses ranks that
+        # stall at different layers.
+        kvpilot_wait_ns: list[int] = []
         for model_runner_output in outputs:
             assert model_runner_output is not None
             kv_output = model_runner_output.kv_connector_output
@@ -159,9 +159,10 @@ class KVOutputAggregator:
 
             invalid_block_ids |= kv_output.invalid_block_ids
 
-            if kv_output.kvpilot_stall_ns > kvpilot_stall_ns:
-                kvpilot_stall_ns = kv_output.kvpilot_stall_ns
-                kvpilot_num_waits = kv_output.kvpilot_num_waits
+            rank_wait_ns = kv_output.kvpilot_wait_ns
+            kvpilot_wait_ns += [0] * (len(rank_wait_ns) - len(kvpilot_wait_ns))
+            for i, ns in enumerate(rank_wait_ns):
+                kvpilot_wait_ns[i] = max(kvpilot_wait_ns[i], ns)
 
         # select output of the worker specified by output_rank
         output = outputs[output_rank]
@@ -175,8 +176,7 @@ class KVOutputAggregator:
             kv_connector_worker_meta=aggregated_kv_connector_worker_meta or None,
             invalid_block_ids=invalid_block_ids,
             expected_finished_count=self._expected_finished_count,
-            kvpilot_stall_ns=kvpilot_stall_ns,
-            kvpilot_num_waits=kvpilot_num_waits,
+            kvpilot_wait_ns=kvpilot_wait_ns,
         )
 
         return output

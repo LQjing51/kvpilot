@@ -32,14 +32,19 @@ YLT_REFL(PingResponse, view_version_id, client_status);
 struct GetReplicaListResponse {
     std::vector<Replica::Descriptor> replicas;
     uint64_t lease_ttl_ms;
+    // KVPilot priority eviction: GetReplicaList pinned memory replicas via
+    // refcnt; the client must BatchUnpinMemoryReplicas when done.
+    bool memory_pinned;
 
-    GetReplicaListResponse() : lease_ttl_ms(0) {}
+    GetReplicaListResponse() : lease_ttl_ms(0), memory_pinned(false) {}
     GetReplicaListResponse(std::vector<Replica::Descriptor>&& replicas_param,
-                           uint64_t lease_ttl_ms_param)
+                           uint64_t lease_ttl_ms_param,
+                           bool memory_pinned_param = false)
         : replicas(std::move(replicas_param)),
-          lease_ttl_ms(lease_ttl_ms_param) {}
+          lease_ttl_ms(lease_ttl_ms_param),
+          memory_pinned(memory_pinned_param) {}
 };
-YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms);
+YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, memory_pinned);
 
 /**
  * @brief Response structure for GetStorageConfig operation

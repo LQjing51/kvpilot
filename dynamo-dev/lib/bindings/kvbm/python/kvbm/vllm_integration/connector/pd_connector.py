@@ -111,6 +111,28 @@ class PdConnector(MultiConnector):
                 f"got {type(self._connectors[1]).__name__}"
             )
 
+    def kvpilot_set_group_placement(self, chunk_hashes, tiers, penalties) -> int:
+        """KVPilot: chunk groups' tier / penalty via the offloading connector."""
+        return self._connectors[0].kvpilot_set_group_placement(
+            chunk_hashes, tiers, penalties
+        )
+
+    def kvpilot_chunk_hashes(self, request_id: str, token_ids, n: int):
+        """KVPilot: chunk names from the offloading connector."""
+        return self._connectors[0].kvpilot_chunk_hashes(request_id, token_ids, n)
+
+    def kvpilot_exclusive_submit(self, job: dict) -> None:
+        """KVPilot exclusive placement: jobs ride the offloading connector's metadata."""
+        self._connectors[0].kvpilot_exclusive_submit(job)
+
+    def kvpilot_group_order(self, chunk_hashes) -> None:
+        """KVPilot: a request's release order rides the offloading connector."""
+        self._connectors[0].kvpilot_group_order(chunk_hashes)
+
+    def kvpilot_exclusive_evict(self, request_id: str, evict: dict) -> None:
+        """KVPilot exclusive unblocking: blocks lent to a load ride its metadata."""
+        self._connectors[0].kvpilot_exclusive_evict(request_id, evict)
+
     # ==============================
     # Worker-side methods
     # ==============================

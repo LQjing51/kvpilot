@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <boost/functional/hash.hpp>
 #include <boost/lockfree/queue.hpp>
@@ -8,6 +9,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -130,6 +132,27 @@ class MasterService {
      */
     auto GetSharedMemorySegments(const std::vector<std::string>& segment_names)
         -> tl::expected<std::vector<Segment>, ErrorCode>;
+
+    /**
+     * @brief KVPilot: set chunk groups' tier (KvpTier) and penalty (ms of
+     * exposed load the move to the next tier down adds). A group is the
+     * chunk-hash field of an LMCache key, i.e. every layer and TP rank of one
+     * chunk. See KvpBatchEvict for how each placement uses them.
+     * @return Number of groups updated.
+     */
+    auto SetGroupPlacement(const std::vector<std::string>& groups,
+                           const std::vector<int32_t>& tiers,
+                           const std::vector<double>& penalties_ms)
+        -> tl::expected<int64_t, ErrorCode>;
+
+    /**
+     * @brief KVPilot: drop the refcnt pins GetReplicaList took (one dec per
+     * completed memory replica per key). Call after the client is done with
+     * zero-copy views / finished Get transfer.
+     * @return Number of keys that had at least one memory replica unpinned.
+     */
+    auto BatchUnpinMemoryReplicas(const std::vector<std::string>& keys)
+        -> tl::expected<int64_t, ErrorCode>;
 
     /**
      * @brief Query a segment's capacity and used size in bytes.
@@ -571,6 +594,18 @@ class MasterService {
     // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
 
+    // KVPilot eviction, used for every placement: frees memory replicas of
+    // whole chunk groups, the target counted over objects in memory. LRU
+    // orders groups by last access; inclusive by tier class (none < SSD <
+    // DRAM < HBM = no placement yet), then access; exclusive never drops a
+    // memory-only object but offloads it to SSD, smallest penalty first
+    // (no placement yet last).
+    void KvpBatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    // A read refreshes the group's last access; its placement stays until
+    // the next one arrives.
+    void KvpTouchGroup(const std::string& key);
+    static uint64_t KvpGroupOf(const std::string& key);
+
     // Helper to get a snapshot of alive clients (under client_mutex_ shared
     // lock)
     std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
@@ -837,6 +872,11 @@ class MasterService {
         std::vector<Replica> replicas_;
     };
 
+    // Pin/unpin completed memory replicas for the duration of a read (replaces
+    // the TTL lease). Declared after ObjectMetadata.
+    void KvpPinMemoryReplicas(const ObjectMetadata& metadata) const;
+    void KvpUnpinMemoryReplicas(const ObjectMetadata& metadata) const;
+
     struct ReplicationTask {
         UUID client_id;
         std::chrono::system_clock::time_point start_time;
@@ -920,6 +960,23 @@ class MasterService {
         const std::chrono::system_clock::time_point& now)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
+    // Memory replicas for one object, per config's replica_num and preferred
+    // segments. Sets need_eviction_ when the segments are full.
+    auto AllocateMemoryReplicas(const std::string& key, uint64_t value_length,
+                                const ReplicateConfig& config)
+        -> tl::expected<std::vector<Replica>, ErrorCode>;
+
+    // KVPilot SSD write-back: PutStart on an object whose only complete
+    // replicas are on local disk adds PROCESSING memory replicas to it and
+    // returns just those; PutEnd completes them, PutRevoke or the PutStart
+    // timeout drops them, and the disk replica stays readable throughout.
+    auto KvpAddMemoryReplicas(MetadataShardAccessorRW& shard,
+                              ObjectMetadata& metadata, const UUID& client_id,
+                              const std::string& key, uint64_t value_length,
+                              const ReplicateConfig& config,
+                              const std::chrono::system_clock::time_point& now)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
     /**
      * @brief Helper to discard expired processing keys.
      */
@@ -950,6 +1007,56 @@ class MasterService {
         false};  // Set to trigger eviction when not enough space left
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+
+    // KVPilot placement, from KVPILOT_PLACEMENT (read from the environment so
+    // the master config plumbing stays untouched).
+    enum class KvpMode { kLru, kInclusive, kInclusivePenalty, kExclusive };
+    KvpMode kvp_mode_ = KvpMode::kLru;
+    // Group tiers, as LMCache's kvpilot_placement.TIER_CODE.
+    enum class KvpTier : int32_t { kNone = 0, kSsd = 1, kDram = 2, kHbm = 3 };
+    struct KvpGroupState {
+        KvpTier tier = KvpTier::kHbm;
+        double penalty_ms = 0.0;
+        int64_t access_ms = 0;  // last read or placement
+        bool placed = false;    // a placement has arrived
+        // The last request whose release covered this chunk (prefill side
+        // release counter) and the chunk's index in its prompt; -1 = none.
+        // Eviction takes a request's chunks from its tail.
+        int64_t order_seq = -1;
+        int64_t order_pos = 0;
+    };
+    // SetGroupPlacement tier code that sets a group's (order_seq, order_pos)
+    // instead of its placement; the penalty carries seq * kKvpOrderPosSpan + pos.
+    static constexpr int32_t kKvpOrderCode = 4;
+    static constexpr int64_t kKvpOrderPosSpan = 1 << 16;
+    static constexpr size_t kKvpGroupShards = 64;
+    struct KvpGroupShard {
+        std::mutex mu;
+        std::unordered_map<uint64_t, KvpGroupState> map;
+    };
+    std::array<KvpGroupShard, kKvpGroupShards> kvp_groups_;
+    // Exclusive: PutEnd offloads only SSD groups, and once such an offload
+    // lands the memory replica is dropped; every other group stays
+    // memory-only until DRAM fills up and KvpBatchEvict moves it to SSD.
+    bool KvpGroupWantsSsd(const std::string& key);
+    std::atomic<int64_t> kvp_excl_offloaded_{0};
+    std::atomic<int64_t> kvp_excl_dropped_{0};
+    std::atomic<int64_t> kvp_excl_spilled_{0};
+    // Eviction thread only: when the in-flight check last ran, the mean size
+    // of a memory object the last full scan saw, scans skipped (offloads in
+    // flight already covered the target) and offloads expired.
+    std::chrono::steady_clock::time_point kvp_excl_last_check_{};
+    double kvp_excl_obj_bytes_ = 0.0;
+    int64_t kvp_excl_scans_skipped_ = 0;
+    int64_t kvp_excl_expired_ = 0;
+    // An offload not reported by then is presumed dropped (its pin released,
+    // its object may move again): the client neither writes nor reports a
+    // bucket whose query failed, and the generic expiry only runs in full
+    // scans, which are skipped while offloads are in flight (2026-11-13 x4).
+    static constexpr std::chrono::seconds kKvpExclTaskTtl{120};
+    // Offloads in flight at once, so a backlog never exceeds a few seconds of
+    // SSD writes.
+    static constexpr long kKvpExclMaxInflight = 8192;
 
     // Eviction thread related members
     std::thread eviction_thread_;

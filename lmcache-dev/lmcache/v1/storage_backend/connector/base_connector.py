@@ -3,7 +3,6 @@
 from typing import List, Optional
 import abc
 import asyncio
-import os
 
 # Third Party
 import torch
@@ -18,16 +17,6 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.protocol import get_remote_metadata_bytes, init_remote_metadata_info
 
 logger = init_logger(__name__)
-
-TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
-
-
-def _truthy(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).lower() in TRUE_ENV_VALUES
 
 
 def NotAudit(func):
@@ -62,11 +51,9 @@ class RemoteConnector(metaclass=abc.ABCMeta):
             metadata: the lmcache engine metadata
         """
         assert metadata is not None
-        enable_mooncake_cpu_backend = _truthy(os.getenv("ENABLE_MOONCAKE_CPU_BACKEND", "0"))
         self.save_chunk_meta: bool = (
             config.extra_config is None
             or config.extra_config.get("save_chunk_meta", True)
-            or (config.use_layerwise and not enable_mooncake_cpu_backend)
         )
         self.meta_shapes: list[torch.Size] = metadata.get_shapes()
         self.meta_dtypes: list[torch.dtype] = metadata.get_dtypes()
@@ -382,6 +369,13 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         Is supported batched_contains
         """
         return False
+
+    def batched_replica_location(self, keys: List[CacheEngineKey]) -> list:
+        """
+        Where each key's replica sits relative to this host, as a list of
+        kvpilot_cache_use.ReplicaLocation. Only Mooncake implements it.
+        """
+        raise NotImplementedError
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}>"

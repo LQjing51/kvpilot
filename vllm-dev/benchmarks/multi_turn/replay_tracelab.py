@@ -14,14 +14,16 @@ N — its `prefix` really hits in cache — while keeping distinct sessions from
 colliding, which would inflate the hit rate. Hashing per block rather than per
 position matches how vLLM compares prefixes.
 
-Input is `tracelab_turns.jsonl` from `prepare_tracelab_trace.py`.
+Input is `tracelab_mooncake.jsonl` from `prepare_tracelab_trace.py`; its
+`hash_ids` are ignored in favour of the mapping above.
 
 `--forced-output` additionally pins what decode emits, rendering the round's
-tool calls as `<function=NAME>` so the online dram-safe judge can recognise
-them. Without it the judge parses random tokens, finds no call, and rules every
-turn "session ended" — the verdict becomes a constant. It also needs the
-response-length table built from *this* trace (`KVPILOT_TOOL_RESP_LEN_PATH`);
-TraceLab and SWE-smith share no labels at all.
+tool calls as `<function=NAME>` so the decode-side online predictor
+(`KVPILOT_ONLINE_PREDICT=1`) can recognise them. Without it the predictor parses
+random tokens, finds no call, and rules every turn "session ended" — the signal
+becomes a constant. It also needs the tool-response distribution of *this*
+trace (`KVPILOT_TOOL_RESP_DISTRIBUTION_PATH`); TraceLab and SWE-smith share no
+labels at all.
 
 Usage:
   python3 replay_tracelab.py \
@@ -49,7 +51,7 @@ DEFAULT_INPUT = os.path.normpath(
     os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         "..", "..", "..", "datasets", "agent-traces", "tracelab",
-        "tracelab_turns.jsonl",
+        "tracelab_mooncake.jsonl",
     )
 )
 
@@ -152,7 +154,7 @@ def render_tool_calls(labels):
     """This round's calls as the text the online predictor parses.
 
     The decode-side judge finds call types with `<function=([^>\\s]+)>`
-    (kvpilot_predict.RX_INLINE_CALL), so the wire format has to match the
+    (kvpilot_signal.RX_INLINE_CALL), so the wire format has to match the
     SWE-smith path exactly or the regex finds nothing and every turn is judged
     "session ended". Only the name is read, so the body stays empty.
     """
@@ -200,10 +202,20 @@ def load_turns(path, max_prompt_tokens=0):
             line = line.strip()
             if not line:
                 continue
-            t = json.loads(line)
-            # Physical line number, carried through so the request_id can name
-            # this exact turn — the analyzer keys everything off that prefix.
-            t["line_no"] = lineno
+            r = json.loads(line)
+            t = {
+                "session_id": r["session_id"],
+                "round_index": r["round_index"],
+                "prefix": r["prefix_length"],
+                "append": r["input_length"] - r["prefix_length"],
+                "output": r["output_length"],
+                "arrival_ms": r["timestamp"],
+                "labels": r["tool_calls"],
+                # Physical line number, carried through so the request_id can
+                # name this exact turn — the analyzer keys everything off that
+                # prefix.
+                "line_no": lineno,
+            }
             by_session[t["session_id"]].append(t)
 
     n_cut_sessions = n_cut_rounds = 0
@@ -396,6 +408,15 @@ class RequestBudget:
         return True
 
 
+def sample_tool_time(spec, rng):
+    """Seconds of think time for --tool-time: a constant or lognormal:mu,sigma."""
+    if spec.startswith("lognormal"):
+        _, _, params = spec.partition(":")
+        mu, sigma = (float(x) for x in (params or "0,1").split(","))
+        return rng.lognormvariate(mu, sigma)
+    return float(spec)
+
+
 async def send_one(session, args, prompt_ids, out_len, request_id,
                    forced_ids=None):
     """Stream one completion, returning per-request timings and usage.
@@ -507,6 +528,10 @@ async def replay(args, sessions, pool, tok):
         # what it bounds is how many distinct prefixes the server must keep
         # warm, and a session mid-think still owns its prefix.
         holding = False
+        # --tool-time: think time drawn per session from a seeded stream, so an
+        # A/B pair of runs replays the same gaps.
+        gap_rng = random.Random(f"{args.seed}:{session_id}")
+        next_due_abs_ms = None
         try:
             for t, plan, target_ms in zip(turns, plans, offsets):
                 # Wait until this round is due, waking early if the cap is
@@ -514,7 +539,11 @@ async def replay(args, sessions, pool, tok):
                 # trace's own think time between turns; a round already overdue
                 # (the server is slower than the trace) is issued at once, which
                 # is what makes the replay an open loop.
-                due_ms = target_ms - (time.perf_counter_ns() // 1_000_000 - t0_ms)
+                now_ms = time.perf_counter_ns() // 1_000_000
+                if next_due_abs_ms is not None:
+                    due_ms = next_due_abs_ms - now_ms
+                else:
+                    due_ms = target_ms - (now_ms - t0_ms)
                 if due_ms > 0 and await budget.sleep_unless_spent(due_ms / 1000.0):
                     return
                 if session_sem is not None and not holding:
@@ -554,6 +583,10 @@ async def replay(args, sessions, pool, tok):
                          line_no=idx,
                          label="+".join(t.get("labels") or []) or "-")
                 results.append(r)
+                if args.tool_time:
+                    next_due_abs_ms = (time.perf_counter_ns() // 1_000_000
+                                       + 1000.0 * sample_tool_time(
+                                           args.tool_time, gap_rng))
                 # Parsed by analyze_lp_ttft_breakdown.py. `idx` must match the
                 # decimal in the request_id's leading 8 chars — that is the join
                 # key to the server logs. `hashes` is a mooncake-only field.
@@ -654,6 +687,15 @@ def main():
     ap.add_argument("--time-scale", type=float, default=1.0,
                     help="session 内轮间隔的压缩倍数（>1 更快，同 mooncake）。"
                          "不影响 --session-arrival-rate 决定的 session 起点")
+    ap.add_argument("--max-sessions", type=int, default=0,
+                    help="只回放按 session id 排序后的前 K 个 session（每个都完整回放）。"
+                         "A/B 时用它代替 -n：-n 停发的位置取决于服务端快慢，"
+                         "两次回放的请求集合会不同")
+    ap.add_argument("--tool-time", default="",
+                    help="轮间 think time 改为闭环：上一轮完成后等 Z 秒再发下一轮，"
+                         "忽略 trace 的轮间时间戳。常量秒数或 lognormal:mu,sigma；"
+                         "按 (seed, session) 抽样，A/B 两次回放的间隔相同。"
+                         "SWE trace 没有时间戳，靠它造 tool 耗时")
     ap.add_argument("--max-prompt-tokens", type=int, default=0,
                     help="跳过 prompt 超过此长度的轮，防止超 --max-model-len")
     ap.add_argument("--token-offset", type=int, default=1000)
@@ -671,6 +713,8 @@ def main():
     args = ap.parse_args()
 
     sessions = load_turns(args.input_file, args.max_prompt_tokens)
+    if args.max_sessions > 0:
+        sessions = sessions[: args.max_sessions]
     if not sessions:
         sys.exit(f"{args.input_file} 没有数据，先跑 prepare_tracelab_trace.py")
     n_turns = sum(len(t) for _, t in sessions)

@@ -205,6 +205,97 @@ class RemoteBackend(StorageBackendInterface):
             logger.warning(f"Remote connection failed in batched_contains: {e}")
             return 0
 
+    def batched_replica_location(self, keys: List[CacheEngineKey]) -> list:
+        if self._mla_worker_id_as0_mode:
+            keys = [key.with_new_worker_id(0) for key in keys]
+        return self.connection.batched_replica_location(keys)
+
+    def batched_local_raw_views(self, keys: List[CacheEngineKey]) -> Optional[list]:
+        """Zero-copy host views of the keys, or None (connector does not support
+        it, or some key has no local replica)."""
+        if self.connection is None or self._mla_worker_id_as0_mode:
+            return None
+        fn = getattr(self.connection, "batched_local_raw_views", None)
+        return fn(keys) if fn is not None else None
+
+    def kvpilot_set_group_placement(
+        self, groups: List[str], tiers: List[int], penalties_ms: List[float]
+    ) -> int:
+        """KVPilot: set chunk groups' tier and penalty on the Mooncake master.
+
+        Args:
+            groups: Chunk-hash fields of the keys (one per chunk).
+            tiers: Tier code per group (kvpilot_placement.TIER_CODE).
+            penalties_ms: Penalty per group, same order.
+
+        Returns:
+            Groups updated.
+        """
+        return self.connection.kvpilot_set_group_placement(groups, tiers, penalties_ms)
+
+    def batched_local_sources(self, keys: List[CacheEngineKey]) -> Optional[tuple]:
+        """Per key, (DRAM host address in this process or 0, same-host SSD
+        (file, value offset, size) or ("", 0, 0)); None if the connector does
+        not support it."""
+        if self.connection is None or self._mla_worker_id_as0_mode:
+            return None
+        fn = getattr(self.connection, "batched_local_sources", None)
+        return fn(keys) if fn is not None else None
+
+    def batch_unpin_memory_replicas(self, keys: List[str]) -> int:
+        """Drop Mooncake GetReplicaList refcnt pins (priority eviction)."""
+        if self.connection is None or self._mla_worker_id_as0_mode or not keys:
+            return 0
+        fn = getattr(self.connection, "batch_unpin_memory_replicas", None)
+        return int(fn(keys)) if fn is not None else 0
+
+    def batched_locate_local_ssd(self, keys: List[CacheEngineKey]) -> Optional[list]:
+        """Per key, (file, value offset, value size) on this client's SSD, path
+        empty when absent; None if the connector does not support it."""
+        if self.connection is None or self._mla_worker_id_as0_mode:
+            return None
+        fn = getattr(self.connection, "batched_locate_local_ssd", None)
+        return fn(keys) if fn is not None else None
+
+    def _kvpilot_call(self, name: str, *args):
+        if self.connection is None or self._mla_worker_id_as0_mode:
+            return None
+        fn = getattr(self.connection, name, None)
+        return fn(*args) if fn is not None else None
+
+    def kvpilot_put_start_local(self, keys: List[str], sizes: List[int]) -> List[int]:
+        """Per key, the host address of a new memory replica in this client's
+        segment to write the value to in place, or 0 (see the connector)."""
+        return self.connection.kvpilot_put_start_local(keys, sizes)
+
+    def kvpilot_put_end(self, keys: List[str]) -> Optional[List[int]]:
+        return self._kvpilot_call("kvpilot_put_end", keys)
+
+    def kvpilot_put_revoke(self, keys: List[str]) -> Optional[List[int]]:
+        return self._kvpilot_call("kvpilot_put_revoke", keys)
+
+    def kvpilot_exist(self, keys: List[str]) -> Optional[List[int]]:
+        """Per store key 1 if it has a completed replica, else 0; None if the
+        connector does not support it."""
+        return self._kvpilot_call("kvpilot_exist", keys)
+
+    def kvpilot_remove(self, keys: List[str]) -> Optional[List[int]]:
+        """Remove objects by store key (exclusive placement); per key 0 or a
+        negative error code, None if the connector does not support it."""
+        return self._kvpilot_call("kvpilot_remove", keys)
+
+    def kvpilot_remove_local_disk(self, keys: List[str]) -> int:
+        """Drop store keys from this client's SSD (exclusive placement);
+        returns how many it held."""
+        return self.connection.kvpilot_remove_local_disk(keys)
+
+    def kvpilot_offload_local(
+        self, keys: List[str], ptrs: List[int], sizes: List[int]
+    ) -> int:
+        """Write values from host memory straight to this client's SSD
+        (exclusive placement); returns how many were written."""
+        return self.connection.kvpilot_offload_local(keys, ptrs, sizes)
+
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         with self.lock:
             return key in self.put_tasks

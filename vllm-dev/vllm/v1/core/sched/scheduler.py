@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 import itertools
 import time
 from collections import defaultdict, deque
@@ -37,6 +38,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kvpilot_exclusive import ExclusivePlacement
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -255,6 +257,25 @@ class Scheduler(SchedulerInterface):
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+        self.kvpilot = self.kv_cache_manager.kvpilot
+        if self.kvpilot is not None:
+            if getattr(self.connector, "kvpilot_chunk_hashes", None) is None:
+                # Only the prefill side, whose LMCache connector names chunks
+                # and carries the writes, places KV; the decode side gets no
+                # signals, so its blocks would wait for one forever.
+                self.kv_cache_manager.kvpilot = None
+                self.kvpilot = None
+                logger.info("KVPilot placement off: connector has no LMCache")
+            else:
+                self.kvpilot.bind(self.connector)
+        self.kvpilot_exclusive = (
+            self.kvpilot if isinstance(self.kvpilot, ExclusivePlacement) else None
+        )
+        # Exclusive unblocking admits a request on its loaded prefix and first
+        # prefill chunk alone; later chunks wait for the reserve (no preemption).
+        self.kvpilot_unblocking = (
+            self.kvpilot_exclusive is not None and self.kvpilot_exclusive.unblocking
+        )
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -384,6 +405,9 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        # KVPilot unblocking: a running prefill's next chunk is waiting for free
+        # blocks; no new request may take them first.
+        kvpilot_chunk_waiting = False
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
@@ -478,6 +502,13 @@ class Scheduler(SchedulerInterface):
                         # The request can be scheduled.
                         break
 
+                    if self.kvpilot_unblocking:
+                        # Its next prefill chunk waits for the reserve being
+                        # refilled; preempting would drop what it computed.
+                        self.kvpilot_exclusive.chunk_short()
+                        kvpilot_chunk_waiting = True
+                        break
+
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
@@ -516,6 +547,9 @@ class Scheduler(SchedulerInterface):
             if new_blocks is None:
                 # Cannot schedule this request.
                 break
+            if self.kvpilot_exclusive is not None:
+                # Unblocking: refill what this chunk took from the reserve.
+                self.kvpilot_exclusive.keep_reserve()
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
@@ -569,7 +603,11 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        if (
+            not preempted_reqs
+            and not kvpilot_chunk_waiting
+            and self._pause_state == PauseState.UNPAUSED
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -669,17 +707,6 @@ class Scheduler(SchedulerInterface):
                             num_prompt_tokens=request.num_prompt_tokens,
                             num_local_cached_tokens=num_new_local_computed_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
-                        )
-                        # Eviction policy needs this at block-free time, which
-                        # on the disaggregated path runs after prefill_stats has
-                        # been consumed. Copy it out under the same guard so it
-                        # likewise describes only the first prefill.
-                        request.kvpilot_kv_hit_rate = (
-                            min(
-                                request.prefill_stats.num_cached_tokens,
-                                request.num_prompt_tokens,
-                            )
-                            / max(request.num_prompt_tokens, 1)
                         )
 
                     if self.kvpilot_stall_logger is not None:
@@ -793,7 +820,8 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
+                allocate = functools.partial(
+                    self.kv_cache_manager.allocate_slots,
                     request,
                     num_new_tokens,
                     num_new_computed_tokens=num_new_local_computed_tokens,
@@ -802,9 +830,34 @@ class Scheduler(SchedulerInterface):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    full_sequence_must_fit=(
+                        self.scheduler_reserve_full_isl and not self.kvpilot_unblocking
+                    ),
                     reserved_blocks=reserved_blocks,
                 )
+                lent = 0
+                if (
+                    self.kvpilot_unblocking
+                    and num_external_computed_tokens >= self.block_size
+                    and not load_kv_async
+                ):
+                    lent = self.kvpilot_exclusive.lend(
+                        request_id,
+                        self.kv_cache_manager.kvpilot_admission_blocks(
+                            request,
+                            new_computed_blocks,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                            num_new_tokens,
+                            effective_lookahead_tokens,
+                            num_encoder_tokens,
+                        ),
+                        num_external_computed_tokens // self.block_size,
+                        new_computed_blocks.blocks[0],
+                    )
+                new_blocks = allocate()
+                if new_blocks is None and lent:
+                    raise RuntimeError(f"KVPilot: {request_id} short after lending")
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -813,7 +866,24 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if self.kvpilot_exclusive is not None:
+                        # Pinned blocks hold the space: demote enough of them,
+                        # and retry once their writes free it.
+                        self.kvpilot_exclusive.demote(
+                            self.kv_cache_manager.kvpilot_shortfall,
+                            new_computed_blocks.blocks[0],
+                        )
+                    if not request.kvpilot_block_start_ns:
+                        request.kvpilot_block_start_ns = time.monotonic_ns()
                     break
+                if request.kvpilot_block_start_ns:
+                    request.kvpilot_blocked_ns += (
+                        time.monotonic_ns() - request.kvpilot_block_start_ns
+                    )
+                    request.kvpilot_block_start_ns = 0
+                if self.kvpilot_exclusive is not None:
+                    # Unblocking: the suffix took from the reserve; refill it.
+                    self.kvpilot_exclusive.keep_reserve()
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1431,14 +1501,9 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
-        kvpilot_stall_shares: dict[str, int] = {}
-        kvpilot_step_waits = (
-            kv_connector_output.kvpilot_num_waits if kv_connector_output else 0
+        kvpilot_step_wait_ns = (
+            kv_connector_output.kvpilot_wait_ns if kv_connector_output else []
         )
-        if self.kvpilot_stall_logger is not None:
-            kvpilot_stall_shares = self._kvpilot_attribute_stall(
-                num_scheduled_tokens, kv_connector_output
-            )
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
@@ -1457,16 +1522,14 @@ class Scheduler(SchedulerInterface):
 
             req_index = model_runner_output.req_id_to_index[req_id]
 
-            if self.kvpilot_stall_logger is not None:
-                self._kvpilot_record_step(
-                    request,
-                    kvpilot_stall_shares.get(req_id, 0),
-                    kvpilot_step_waits,
-                )
-
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+
+            if self.kvpilot_stall_logger is not None:
+                self._kvpilot_record_step(
+                    request, kvpilot_step_wait_ns, bool(generated_token_ids)
+                )
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
@@ -1990,6 +2053,10 @@ class Scheduler(SchedulerInterface):
             return True
         if self.connector is None:
             return False
+        # Exclusive placement: a job in flight only reports back through a
+        # step's finished sends.
+        if self.kvpilot_exclusive is not None and self.kvpilot_exclusive.busy():
+            return True
         # Finished requests waiting on delayed connector cleanup remain in
         # self.requests after they have been removed from scheduling queues.
         num_in_queues = (
@@ -1997,62 +2064,38 @@ class Scheduler(SchedulerInterface):
         )
         return len(self.requests) > num_in_queues
 
-    def kvpilot_apply_label(self, request_id: str, dram_safe: bool) -> int:
-        """Apply a decode-side dram-safe verdict to a finished request's blocks."""
-        return self.kv_cache_manager.kvpilot_apply_label(request_id, dram_safe)
-
-    def _kvpilot_attribute_stall(
-        self,
-        num_scheduled_tokens: dict[str, int],
-        kv_connector_output: KVConnectorOutput | None,
-    ) -> dict[str, int]:
-        """Divide this step's measured stall among the requests that loaded.
-
-        The worker reports one number per forward because a forward is shared.
-        Weighting by DRAM tokens is what makes the split defensible: a request
-        with nothing to load did not cause the wait and gets none of it, while a
-        request that pulled twice as much KV is charged twice as much.
-        """
-        if kv_connector_output is None or not kv_connector_output.kvpilot_stall_ns:
-            return {}
-        weights = {}
-        for req_id in num_scheduled_tokens:
-            request = self.requests.get(req_id)
-            # Charge only requests still inside a tracked prefill. Both guards
-            # matter: a decode step in the same batch loads nothing, and a
-            # request whose record was already emitted would absorb a share and
-            # then drop it, quietly diluting everyone else's.
-            if (
-                request is not None
-                and request.kvpilot_scheduled_ns
-                and request.kvpilot_dram_tokens > 0
-            ):
-                weights[req_id] = request.kvpilot_dram_tokens
-        return kvpilot_load_stall.attribute(
-            kv_connector_output.kvpilot_stall_ns, weights
+    def kvpilot_apply_placement(self, request_id: str, signal: dict) -> dict:
+        """Apply the decode side's signal for a freed request: the next turn's
+        safe tier and its prefill time per tier (kvpilot_placement)."""
+        if self.kvpilot is None:
+            raise RuntimeError(f"KVPilot signal for {request_id}: placement is off")
+        return self.kvpilot.apply(
+            request_id, signal["tier"], signal["time"], signal.get("suffix")
         )
 
     def _kvpilot_record_step(
-        self, request: Request, stall_ns: int, num_waits: int
+        self, request: Request, wait_ns: list[int], sampled: bool
     ) -> None:
         """Fold one step into a request's prefill totals, emitting when done.
 
-        Chunked prefill means several forwards per prefill, so both the stall
-        and the step count accumulate; the record is written on the step that
-        finishes the prompt.
+        Assumes one prefill per forward (bs=1): the step's whole stall is this
+        request's. With several loading prefills in one forward, each is
+        charged the whole step. Chunked prefill means several forwards per
+        prefill, so the totals accumulate; the record is written on the step
+        that finishes the prompt, the one that samples a token (`sampled`).
+        Under async scheduling num_computed_tokens already counts the next
+        chunk when a step's output arrives, so it cannot tell.
         """
         if not request.kvpilot_scheduled_ns:
             # Not a tracked first prefill (decode step, or a re-prefill after
             # preemption, whose record was already emitted).
             return
-        request.kvpilot_stall_ns += stall_ns
         request.kvpilot_num_steps += 1
-        if stall_ns:
-            # The forward's blocking calls, counted for any request charged for
-            # them. Not divided: each wait blocked this request's computation
-            # too, so a share of one would describe nothing.
-            request.kvpilot_num_waits += num_waits
-        if request.num_computed_tokens < request.num_prompt_tokens:
+        if request.kvpilot_dram_tokens > 0:
+            # Without a load the timed windows hold only the hooks themselves.
+            request.kvpilot_gpu_stall_ns += sum(wait_ns)
+            request.kvpilot_num_waits += len(wait_ns)
+        if not sampled:
             # Still chunking through the prompt.
             return
         assert self.kvpilot_stall_logger is not None
@@ -2063,9 +2106,10 @@ class Scheduler(SchedulerInterface):
             num_hit_tokens=request.kvpilot_hit_tokens,
             num_dram_tokens=request.kvpilot_dram_tokens,
             e2e_ns=time.monotonic_ns() - request.kvpilot_scheduled_ns,
-            stall_ns=request.kvpilot_stall_ns,
             num_waits=request.kvpilot_num_waits,
             num_steps=request.kvpilot_num_steps,
+            gpu_stall_ns=request.kvpilot_gpu_stall_ns,
+            blocked_ns=request.kvpilot_blocked_ns,
         )
         # Emit once. A later preemption re-prefills the same request, and that
         # is a different event with its own load behaviour, not more of this one.
@@ -2375,6 +2419,9 @@ class Scheduler(SchedulerInterface):
                 self._free_blocks(self.requests[req_id])
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
+            if self.kvpilot_exclusive is not None and req_id.startswith("kvx-"):
+                self.kvpilot_exclusive.on_job_done(req_id)
+                continue
             assert req_id in self.requests
             self._free_blocks(self.requests[req_id])
 

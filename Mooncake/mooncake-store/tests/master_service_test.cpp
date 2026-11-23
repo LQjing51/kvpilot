@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <random>
 #include <thread>
@@ -3448,6 +3449,443 @@ TEST_F(MasterServiceTest, OffloadObjectHeartbeat) {
     for (auto& key : keys) {
         ASSERT_TRUE(res.value().find(key) != res.value().end());
         ASSERT_EQ(res.value().find(key)->second, 1024);
+    }
+}
+
+// KVPilot: the master reads its placement from KVPILOT_PLACEMENT at
+// construction.
+static std::unique_ptr<MasterService> MakeKvpService(
+    const char* placement, MasterServiceConfig config) {
+    setenv("KVPILOT_PLACEMENT", placement, 1);
+    auto service = std::make_unique<MasterService>(config);
+    unsetenv("KVPILOT_PLACEMENT");
+    return service;
+}
+
+// Group tier codes (MasterService::KvpTier).
+constexpr int32_t kKvpSsd = 1;
+constexpr int32_t kKvpDram = 2;
+
+TEST_F(MasterServiceTest, KvpAddMemoryReplicaToDiskOnlyObject) {
+    const uint64_t kv_lease_ttl = 50;
+    for (const char* placement : {"", "exclusive-penalty-reqwise"}) {
+        const bool excl = std::string(placement) == "exclusive-penalty-reqwise";
+        auto service = MakeKvpService(placement,
+                                      MasterServiceConfig::builder()
+                                          .set_default_kv_lease_ttl(kv_lease_ttl)
+                                          .set_enable_offload(true)
+                                          .build());
+        const UUID client_id = generate_uuid();
+        auto segment = MakeSegment();
+        ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+        // Alive, as a client is after its first ping: otherwise its disk
+        // replicas count as stale and the object vanishes on the next put.
+        ASSERT_TRUE(service->ReMountSegment({segment}, client_id).has_value());
+        ASSERT_TRUE(
+            service->MountLocalDiskSegment(client_id, true).has_value());
+        const std::string key =
+            std::string("kvp_writeback_") + (excl ? "excl" : "lru");
+        // Exclusive offloads only SSD groups (a key without LMCache fields is
+        // its own group).
+        if (excl) {
+            ASSERT_TRUE(
+                service->SetGroupPlacement({key}, {kKvpSsd}, {0.0}).has_value());
+        }
+
+        // Put, offload to local disk, then lose the memory replica: the object
+        // is left with only its LOCAL_DISK replica, as after a DRAM eviction.
+        ReplicateConfig config;
+        config.replica_num = 1;
+        ASSERT_TRUE(service->PutStart(client_id, key, 1024, config).has_value());
+        ASSERT_TRUE(
+            service->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+        auto offload = service->OffloadObjectHeartbeat(client_id, true);
+        ASSERT_TRUE(offload.has_value());
+        ASSERT_EQ(offload->count(key), 1);
+        StorageObjectMetadata meta;
+        meta.bucket_id = 1;
+        meta.offset = 0;
+        meta.key_size = static_cast<int64_t>(key.size());
+        meta.data_size = 1024;
+        meta.transport_endpoint = segment.name;
+        meta.file_path = "/tmp/bucket-1";
+        ASSERT_TRUE(
+            service->NotifyOffloadSuccess(client_id, {key}, {meta}).has_value());
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kv_lease_ttl + 10));
+        if (!excl) {
+            // Exclusive already dropped it once on disk.
+            auto cleared =
+                service->BatchReplicaClear({key}, client_id, segment.name);
+            ASSERT_TRUE(cleared.has_value());
+            ASSERT_EQ(cleared->size(), 1);
+        }
+        auto replicas = service->GetReplicaList(key);
+        ASSERT_TRUE(replicas.has_value());
+        ASSERT_EQ(replicas->replicas.size(), 1);
+        ASSERT_TRUE(replicas->replicas[0].is_local_disk_replica());
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kv_lease_ttl + 10));
+
+        auto put_start = service->PutStart(client_id, key, 1024, config);
+        if (excl) {
+            // An SSD hit is not written back: that would be a second copy.
+            ASSERT_FALSE(put_start.has_value());
+            EXPECT_EQ(put_start.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+            continue;
+        }
+        ASSERT_TRUE(put_start.has_value());
+        ASSERT_EQ(put_start->size(), 1);
+        EXPECT_TRUE((*put_start)[0].is_memory_replica());
+        // The disk replica stays readable while the memory one is written.
+        auto during = service->GetReplicaList(key);
+        ASSERT_TRUE(during.has_value());
+        ASSERT_TRUE(
+            service->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+
+        auto after = service->GetReplicaList(key);
+        ASSERT_TRUE(after.has_value());
+        ASSERT_EQ(after->replicas.size(), 2);
+        // Not queued for offload again: it is already on disk.
+        auto offload2 = service->OffloadObjectHeartbeat(client_id, true);
+        ASSERT_TRUE(offload2.has_value());
+        EXPECT_EQ(offload2->count(key), 0);
+        // A second put while the memory replica exists is the usual no-op.
+        auto again = service->PutStart(client_id, key, 1024, config);
+        ASSERT_FALSE(again.has_value());
+        EXPECT_EQ(again.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+}
+
+TEST_F(MasterServiceTest, KvpExclusivePlacement) {
+    auto service = MakeKvpService(
+        "exclusive-penalty-reqwise",
+        MasterServiceConfig::builder().set_enable_offload(true).build());
+    const UUID client_id = generate_uuid();
+    auto segment = MakeSegment();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service->ReMountSegment({segment}, client_id).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(client_id, true).has_value());
+
+    // LMCache layer keys; the group is the chunk-hash field.
+    const std::string dram_key = "m@2@0@aa01@bfloat16@0";
+    const std::string ssd_key = "m@2@0@bb02@bfloat16@0";
+    ASSERT_TRUE(service
+                    ->SetGroupPlacement({"aa01", "bb02"}, {kKvpDram, kKvpSsd},
+                                        {1.0, 0.0})
+                    .has_value());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    for (const auto& key : {dram_key, ssd_key}) {
+        ASSERT_TRUE(service->PutStart(client_id, key, 1024, config).has_value());
+        ASSERT_TRUE(
+            service->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    }
+    // Only the SSD chunk is queued for offload.
+    auto offload = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(offload.has_value());
+    EXPECT_EQ(offload->count(dram_key), 0);
+    ASSERT_EQ(offload->count(ssd_key), 1);
+
+    // While its offload is in flight the object cannot be removed.
+    auto busy = service->Remove(ssd_key, true);
+    ASSERT_FALSE(busy.has_value());
+    EXPECT_EQ(busy.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+
+    StorageObjectMetadata meta;
+    meta.bucket_id = 1;
+    meta.offset = 0;
+    meta.key_size = static_cast<int64_t>(ssd_key.size());
+    meta.data_size = 1024;
+    meta.transport_endpoint = segment.name;
+    meta.file_path = "/tmp/bucket-excl";
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, {ssd_key}, {meta}).has_value());
+    // The disk replica is now the only copy.
+    auto replicas = service->GetReplicaList(ssd_key);
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1);
+    EXPECT_TRUE(replicas->replicas[0].is_local_disk_replica());
+    auto dram_replicas = service->GetReplicaList(dram_key);
+    ASSERT_TRUE(dram_replicas.has_value());
+    ASSERT_EQ(dram_replicas->replicas.size(), 1);
+    EXPECT_TRUE(dram_replicas->replicas[0].is_memory_replica());
+    ASSERT_TRUE(service->BatchUnpinMemoryReplicas({dram_key}).has_value());
+
+    // The client's offload reads the value under a pin and reports success
+    // before unpinning: the memory replica goes on the unpin.
+    const std::string pinned_key = "m@2@0@bb02@bfloat16@1";
+    ASSERT_TRUE(
+        service->PutStart(client_id, pinned_key, 1024, config).has_value());
+    ASSERT_TRUE(
+        service->PutEnd(client_id, pinned_key, ReplicaType::MEMORY).has_value());
+    auto offload2 = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(offload2.has_value());
+    ASSERT_EQ(offload2->count(pinned_key), 1);
+    ASSERT_TRUE(service->GetReplicaList(pinned_key).has_value());  // pins
+    meta.key_size = static_cast<int64_t>(pinned_key.size());
+    ASSERT_TRUE(service->NotifyOffloadSuccess(client_id, {pinned_key}, {meta})
+                    .has_value());
+    auto still = service->GetReplicaList(pinned_key);  // pins again
+    ASSERT_TRUE(still.has_value());
+    EXPECT_EQ(still->replicas.size(), 2);
+    ASSERT_TRUE(service->BatchUnpinMemoryReplicas({pinned_key}).has_value());
+    ASSERT_TRUE(service->BatchUnpinMemoryReplicas({pinned_key}).has_value());
+    auto after_unpin = service->GetReplicaList(pinned_key);
+    ASSERT_TRUE(after_unpin.has_value());
+    ASSERT_EQ(after_unpin->replicas.size(), 1);
+    EXPECT_TRUE(after_unpin->replicas[0].is_local_disk_replica());
+
+    // A tier change removes the object (the client deletes it from its SSD);
+    // back in the SSD tier it is offloaded again.
+    ASSERT_TRUE(service->Remove(ssd_key, true).has_value());
+    auto gone = service->ExistKey(ssd_key);
+    ASSERT_TRUE(gone.has_value());
+    EXPECT_FALSE(gone.value());
+    ASSERT_TRUE(service->PutStart(client_id, ssd_key, 1024, config).has_value());
+    ASSERT_TRUE(
+        service->PutEnd(client_id, ssd_key, ReplicaType::MEMORY).has_value());
+    auto again = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(again->count(ssd_key), 1);
+}
+
+TEST_F(MasterServiceTest, KvpExclusiveSpillInsteadOfEvict) {
+    // Under memory pressure a memory-only (DRAM-tier) object is written to SSD
+    // before its memory replica goes, smallest group penalty first; none is
+    // dropped. Watermark 0: the used ratio comes from a process-wide metric
+    // that other tests' segments dilute, so any usage must trigger eviction.
+    auto service = MakeKvpService("exclusive-penalty-reqwise",
+                                  MasterServiceConfig::builder()
+                                      .set_enable_offload(true)
+                                      .set_eviction_high_watermark_ratio(0.0)
+                                      .build());
+    const UUID client_id = generate_uuid();
+    constexpr size_t value_size = 1024 * 1024;
+    auto segment = MakeSegment("spill_segment", 0x300000000, 16 * value_size);
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service->ReMountSegment({segment}, client_id).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(client_id, true).has_value());
+
+    std::vector<std::string> keys, groups;
+    std::vector<int32_t> tiers;
+    std::vector<double> pens;
+    for (int i = 0; i < 12; ++i) {
+        groups.push_back("cc" + std::to_string(i));
+        tiers.push_back(kKvpDram);
+        pens.push_back(5.0 * (i + 1));  // ms the move to SSD would expose
+        keys.push_back("m@2@0@" + groups.back() + "@bfloat16@0");
+    }
+    ASSERT_TRUE(service->SetGroupPlacement(groups, tiers, pens).has_value());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    for (const auto& key : keys) {
+        ASSERT_TRUE(
+            service->PutStart(client_id, key, value_size, config).has_value());
+        ASSERT_TRUE(
+            service->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    }
+    // No offload at put time (DRAM tier); the eviction thread spills.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    auto offload = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(offload.has_value());
+    EXPECT_GT(offload->size(), 0);
+    EXPECT_LT(offload->size(), keys.size());
+    EXPECT_EQ(offload->count(keys.front()), 1);
+    EXPECT_EQ(offload->count(keys.back()), 0);
+    for (const auto& key : keys) {
+        auto exist = service->ExistKey(key);
+        ASSERT_TRUE(exist.has_value());
+        EXPECT_TRUE(exist.value()) << key;
+    }
+    std::vector<std::string> done;
+    std::vector<StorageObjectMetadata> metas;
+    for (const auto& [key, size] : *offload) {
+        StorageObjectMetadata meta;
+        meta.bucket_id = 1;
+        meta.offset = 0;
+        meta.key_size = static_cast<int64_t>(key.size());
+        meta.data_size = size;
+        meta.transport_endpoint = segment.name;
+        meta.file_path = "/tmp/bucket-spill";
+        done.push_back(key);
+        metas.push_back(meta);
+    }
+    ASSERT_TRUE(service->NotifyOffloadSuccess(client_id, done, metas).has_value());
+    auto first = service->GetReplicaList(keys.front());
+    ASSERT_TRUE(first.has_value());
+    ASSERT_EQ(first->replicas.size(), 1);
+    EXPECT_TRUE(first->replicas[0].is_local_disk_replica());
+}
+
+TEST_F(MasterServiceTest, KvpEvictionTakesRequestTailFirst) {
+    // A request's chunks leave DRAM from its tail even when a chunk further
+    // in has a smaller penalty, so what stays is a prefix.
+    auto service = MakeKvpService("exclusive-penalty-reqwise",
+                                  MasterServiceConfig::builder()
+                                      .set_enable_offload(true)
+                                      .set_eviction_high_watermark_ratio(0.0)
+                                      .build());
+    const UUID client_id = generate_uuid();
+    constexpr size_t value_size = 1024 * 1024;
+    auto segment = MakeSegment("tail_segment", 0x400000000, 16 * value_size);
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service->ReMountSegment({segment}, client_id).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(client_id, true).has_value());
+
+    constexpr int32_t kOrder = 4;  // MasterService::kKvpOrderCode
+    constexpr int64_t kSeq = 7;
+    std::vector<std::string> keys, groups;
+    std::vector<int32_t> tiers, order_codes;
+    std::vector<double> pens, orders;
+    for (int i = 0; i < 12; ++i) {
+        groups.push_back("dd" + std::to_string(i));
+        tiers.push_back(kKvpDram);
+        pens.push_back(i == 11 ? 50.0 : 10.0);  // the tail is the dearest
+        order_codes.push_back(kOrder);
+        orders.push_back(static_cast<double>(kSeq * (1 << 16) + i));
+        keys.push_back("m@2@0@" + groups.back() + "@bfloat16@0");
+    }
+    ASSERT_TRUE(service->SetGroupPlacement(groups, tiers, pens).has_value());
+    ASSERT_TRUE(
+        service->SetGroupPlacement(groups, order_codes, orders).has_value());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    for (const auto& key : keys) {
+        ASSERT_TRUE(
+            service->PutStart(client_id, key, value_size, config).has_value());
+        ASSERT_TRUE(
+            service->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    auto offload = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(offload.has_value());
+    ASSERT_GT(offload->size(), 0);
+    EXPECT_EQ(offload->count(keys.back()), 1);
+    // Spilled chunks are the request's last ones.
+    for (size_t i = 0; i < keys.size() - offload->size(); ++i) {
+        EXPECT_EQ(offload->count(keys[i]), 0) << keys[i];
+    }
+}
+
+TEST_F(MasterServiceTest, KvpInclusivePenaltyDropsSmallestPenaltyTail) {
+  // belady sends FAR - next use as the penalty and shares the order.
+  for (const char* placement : {"inclusive-penalty-reqwise", "belady"}) {
+    SCOPED_TRACE(placement);
+    // inclusive-penalty-reqwise: DRAM drops the request whose next turn loses
+    // the least with its chunks on SSD first, from its tail, and deletes the
+    // memory copies (write-through left one on SSD) instead of spilling.
+    auto service = MakeKvpService(placement,
+                                  MasterServiceConfig::builder()
+                                      .set_eviction_high_watermark_ratio(1.0)
+                                      .set_eviction_ratio(0.1)
+                                      .build());
+    const UUID client_id = generate_uuid();
+    constexpr size_t value_size = 1024 * 1024;
+    auto segment = MakeSegment("incp_segment", 0x400000000, 16 * value_size);
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+
+    constexpr int32_t kOrder = 4;  // MasterService::kKvpOrderCode
+    std::vector<std::string> keys;
+    for (int r = 0; r < 2; ++r) {
+        std::vector<std::string> groups;
+        std::vector<int32_t> tiers, order_codes;
+        std::vector<double> pens, orders;
+        for (int i = 0; i < 6; ++i) {
+            groups.push_back((r == 0 ? "aa" : "bb") + std::to_string(i));
+            tiers.push_back(kKvpDram);
+            pens.push_back(r == 0 ? 5.0 : 1.0);
+            order_codes.push_back(kOrder);
+            orders.push_back(static_cast<double>((r + 1) * (1 << 16) + i));
+            keys.push_back("m@2@0@" + groups.back() + "@bfloat16@0");
+        }
+        ASSERT_TRUE(service->SetGroupPlacement(groups, tiers, pens).has_value());
+        ASSERT_TRUE(
+            service->SetGroupPlacement(groups, order_codes, orders).has_value());
+    }
+    ReplicateConfig config;
+    config.replica_num = 1;
+    for (const auto& key : keys) {
+        ASSERT_TRUE(
+            service->PutStart(client_id, key, value_size, config).has_value());
+        ASSERT_TRUE(
+            service->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    }
+    // Fill the segment with groups that have no placement (they go last);
+    // the put that finds no room starts one eviction round.
+    for (int i = 0;; ++i) {
+        ASSERT_LT(i, 64);
+        const std::string key = "m@2@0@ff" + std::to_string(i) + "@bfloat16@0";
+        if (!service->PutStart(client_id, key, value_size, config).has_value()) {
+            break;
+        }
+        ASSERT_TRUE(
+            service->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::vector<bool> exists;
+    for (const auto& key : keys) {
+        auto r = service->ExistKey(key);
+        exists.push_back(r.has_value() && r.value());
+    }
+    for (int i = 0; i < 6; ++i) EXPECT_TRUE(exists[i]) << keys[i];
+    EXPECT_FALSE(exists[11]);
+    // What b keeps is a prefix.
+    bool dropped = false;
+    for (int i = 6; i < 12; ++i) {
+        if (!exists[i]) {
+            dropped = true;
+        } else {
+            EXPECT_FALSE(dropped) << keys[i] << " kept after a dropped chunk";
+        }
+    }
+  }
+}
+
+TEST_F(MasterServiceTest, KvpExclusiveRespillAfterTierChange) {
+    auto service = MakeKvpService("exclusive-penalty-reqwise",
+                                  MasterServiceConfig::builder()
+                                      .set_enable_offload(true)
+                                      .set_eviction_high_watermark_ratio(0.0)
+                                      .build());
+    const UUID client_id = generate_uuid();
+    constexpr size_t value_size = 1024 * 1024;
+    auto segment =
+        MakeSegment("respill_segment", 0x400000000, 16 * value_size);
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service->ReMountSegment({segment}, client_id).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(client_id, true).has_value());
+
+    const std::string key = "m@2@0@dd01@bfloat16@0";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    StorageObjectMetadata meta;
+    meta.bucket_id = 1;
+    meta.offset = 0;
+    meta.key_size = static_cast<int64_t>(key.size());
+    meta.data_size = value_size;
+    meta.transport_endpoint = segment.name;
+    meta.file_path = "/tmp/bucket-respill";
+    // DRAM-tier twice: spilled to SSD, removed on a tier change (the client
+    // deletes it from its SSD), put back, and spilled again.
+    for (int round = 0; round < 2; ++round) {
+        ASSERT_TRUE(service->SetGroupPlacement({"dd01"}, {kKvpDram}, {5.0})
+                        .has_value());
+        ASSERT_TRUE(
+            service->PutStart(client_id, key, value_size, config).has_value());
+        ASSERT_TRUE(
+            service->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        auto taken = service->OffloadObjectHeartbeat(client_id, true);
+        ASSERT_TRUE(taken.has_value());
+        ASSERT_EQ(taken->count(key), 1) << "round " << round;
+        ASSERT_TRUE(
+            service->NotifyOffloadSuccess(client_id, {key}, {meta}).has_value());
+        auto on_disk = service->GetReplicaList(key);
+        ASSERT_TRUE(on_disk.has_value());
+        ASSERT_EQ(on_disk->replicas.size(), 1);
+        EXPECT_TRUE(on_disk->replicas[0].is_local_disk_replica());
+        ASSERT_TRUE(service->Remove(key, true).has_value());
     }
 }
 

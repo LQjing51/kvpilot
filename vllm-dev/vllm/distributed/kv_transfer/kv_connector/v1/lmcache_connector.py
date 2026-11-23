@@ -212,6 +212,39 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         """
         return self._lmcache_engine.get_finished(finished_req_ids)
 
+    def kvpilot_set_group_placement(
+        self, chunk_hashes: list[int], tiers: list[str | None], penalties: list[float]
+    ) -> int:
+        """KVPilot: set chunk groups' tier and demotion penalty on the Mooncake
+        master (scheduler side)."""
+        return self._lmcache_engine.kvpilot_set_group_placement(
+            chunk_hashes, tiers, penalties
+        )
+
+    def kvpilot_chunk_hashes(
+        self, request_id: str, token_ids: list[int], n: int
+    ) -> list[int] | None:
+        """KVPilot: LMCache chunk hashes of a request's first `n` prompt
+        chunks (scheduler side)."""
+        return self._lmcache_engine.kvpilot_chunk_hashes(request_id, token_ids, n)
+
+    def kvpilot_exclusive_submit(self, job: dict) -> None:
+        """KVPilot exclusive placement: queue a write / drop job for the
+        workers' next step (scheduler side)."""
+        self._lmcache_engine.kvpilot_exclusive_submit(job)
+
+    def kvpilot_group_order(self, chunk_hashes: list[int]) -> None:
+        """KVPilot: a request released these full prompt chunks, head first;
+        the Mooncake master evicts each request from its tail (scheduler
+        side)."""
+        self._lmcache_engine.kvpilot_group_order(chunk_hashes)
+
+    def kvpilot_exclusive_evict(self, request_id: str, evict: dict) -> None:
+        """KVPilot exclusive unblocking: HBM blocks lent to `request_id`'s
+        load this step, written to DRAM before it overwrites them (scheduler
+        side)."""
+        self._lmcache_engine.kvpilot_exclusive_evict(request_id, evict)
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
         Get the set of block IDs that failed to load.

@@ -163,6 +163,16 @@ struct RpcNameTraits<&WrappedMasterService::GetSharedMemorySegments> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::SetGroupPlacement> {
+    static constexpr const char* value = "SetGroupPlacement";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchUnpinMemoryReplicas> {
+    static constexpr const char* value = "BatchUnpinMemoryReplicas";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::Ping> {
     static constexpr const char* value = "Ping";
 };
@@ -719,6 +729,28 @@ MasterClient::GetSharedMemorySegments(
 
     auto result = invoke_rpc<&WrappedMasterService::GetSharedMemorySegments,
                              std::vector<Segment>>(segment_names);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<int64_t, ErrorCode> MasterClient::BatchUnpinMemoryReplicas(
+    const std::vector<std::string>& keys) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchUnpinMemoryReplicas");
+    timer.LogRequest("keys_num=", keys.size());
+    auto result =
+        invoke_rpc<&WrappedMasterService::BatchUnpinMemoryReplicas, int64_t>(
+            keys);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<int64_t, ErrorCode> MasterClient::SetGroupPlacement(
+    const std::vector<std::string>& groups, const std::vector<int32_t>& tiers,
+    const std::vector<double>& penalties_ms) {
+    ScopedVLogTimer timer(1, "MasterClient::SetGroupPlacement");
+    timer.LogRequest("groups_num=", groups.size());
+    auto result = invoke_rpc<&WrappedMasterService::SetGroupPlacement, int64_t>(
+        groups, tiers, penalties_ms);
     timer.LogResponseExpected(result);
     return result;
 }

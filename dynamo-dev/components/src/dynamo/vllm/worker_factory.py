@@ -49,9 +49,10 @@ logger = logging.getLogger(__name__)
 
 
 def _kvpilot_online() -> bool:
-    return os.environ.get("KVPILOT_ONLINE_DRAM_SAFE", "").lower() in (
-        "1", "true", "yes", "on"
-    )
+    """Whether the decode -> prefill signal link is needed at all."""
+    from vllm.v1.core import kvpilot_placement
+
+    return kvpilot_placement.strategy() in kvpilot_placement.MODEL
 
 # (engine_client, vllm_config, default_sampling_params, prometheus_temp_dir, component_gauges)
 # component_gauges is None on the embedding-worker path: pooling engines
@@ -475,7 +476,7 @@ class WorkerFactory:
         encode_worker_client = await self._maybe_get_encode_worker_client(
             runtime, config
         )
-        # Client for reporting dram-safe verdicts back to the prefill worker.
+        # Client for sending KVPilot signals back to the prefill worker.
         prefill_feedback_client = (
             await runtime.endpoint(
                 f"{config.namespace}.prefill.kvpilot_feedback"

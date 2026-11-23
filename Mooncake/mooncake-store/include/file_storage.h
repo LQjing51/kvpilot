@@ -49,6 +49,35 @@ class FileStorage {
      */
     bool ReleaseBuffer(uint64_t batch_id);
 
+    /**
+     * @brief Where each key's value sits in this client's local SSD files.
+     *
+     * KVPilot: lets the caller read offloaded KV straight from disk (O_DIRECT,
+     * layer by layer) instead of going through BatchGet + Transfer Engine.
+     * Only the bucket backend has a stable (file, offset) per key.
+     * @param keys Keys to locate.
+     * @return Per key: (data file path, byte offset of the value, value size),
+     *         or an empty path when the key is not on this client's SSD.
+     */
+    std::vector<std::tuple<std::string, int64_t, int64_t>> BatchLocate(
+        const std::vector<std::string>& keys);
+
+    /**
+     * @brief KVPilot exclusive placement: drop keys whose chunk left SSD and
+     * free the space of buckets left empty (bucket backend only).
+     * @return Number of keys this client held.
+     */
+    int64_t BatchRemoveKeys(const std::vector<std::string>& keys);
+
+    /**
+     * @brief KVPilot exclusive placement: write values held in host memory
+     * straight into one new bucket and register their LOCAL_DISK replicas
+     * with the master, with no memory replica in the segment.
+     * @return Number of keys written.
+     */
+    tl::expected<int64_t, ErrorCode> OffloadHostBuffers(
+        const std::vector<std::string>& keys, const std::vector<Slice>& values);
+
    private:
     friend class FileStorageTest;
     struct AllocatedBatch {
