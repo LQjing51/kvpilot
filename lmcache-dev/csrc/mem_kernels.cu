@@ -1095,6 +1095,38 @@ void batched_memcpy_d2h(torch::Tensor& src, const std::vector<int64_t>& dst_ptrs
               "cudaMemcpyBatchAsync failed: ", cudaGetErrorString(err));
 }
 
+namespace {
+void memcpy_batch(std::vector<void*>& dsts, std::vector<const void*>& srcs,
+                  std::vector<size_t>& bytes, const cudaStream_t s) {
+  if (dsts.empty()) return;
+  cudaMemcpyAttributes attr = {};
+  attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+  attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+  size_t attr_idx = 0;
+  const cudaError_t err = cudaMemcpyBatchAsync(
+      dsts.data(), srcs.data(), bytes.data(), dsts.size(), &attr, &attr_idx, 1, s);
+  TORCH_CHECK(err == cudaSuccess, "cudaMemcpyBatchAsync failed: ",
+              cudaGetErrorString(err));
+}
+}  // namespace
+
+void batched_memcpy_async(const std::vector<int64_t>& dst_ptrs,
+                          const std::vector<int64_t>& src_ptrs,
+                          const std::vector<int64_t>& sizes) {
+  TORCH_CHECK(dst_ptrs.size() == src_ptrs.size() && dst_ptrs.size() == sizes.size(),
+              "batched_memcpy_async: dst_ptrs/src_ptrs/sizes size mismatch");
+  std::vector<void*> dsts;
+  std::vector<const void*> srcs;
+  std::vector<size_t> bytes;
+  for (size_t i = 0; i < dst_ptrs.size(); ++i) {
+    if (dst_ptrs[i] == 0) continue;
+    dsts.push_back(reinterpret_cast<void*>(dst_ptrs[i]));
+    srcs.push_back(reinterpret_cast<const void*>(src_ptrs[i]));
+    bytes.push_back(static_cast<size_t>(sizes[i]));
+  }
+  memcpy_batch(dsts, srcs, bytes, at::cuda::getCurrentCUDAStream());
+}
+
 LayerEvictor::~LayerEvictor() {
   for (cudaEvent_t ev : done_) cudaEventDestroy(ev);
 }
@@ -1103,10 +1135,20 @@ void LayerEvictor::start(const torch::Tensor& layer_ptrs, torch::Tensor staging0
                          torch::Tensor staging1,
                          std::vector<torch::Tensor> kvcaches,
                          torch::Tensor slot_mapping,
-                         const GPUKVFormat gpu_kv_format) {
+                         const GPUKVFormat gpu_kv_format,
+                         const std::optional<torch::Tensor>& side_src,
+                         const std::optional<torch::Tensor>& side_dst,
+                         const int64_t side_bytes) {
   TORCH_CHECK(!layer_ptrs.is_cuda() && layer_ptrs.scalar_type() == torch::kInt64 &&
                   layer_ptrs.dim() == 2 && layer_ptrs.is_contiguous(),
               "layer_ptrs must be a contiguous [layers, blocks] int64 CPU tensor");
+  TORCH_CHECK(side_src.has_value() == side_dst.has_value() &&
+                  (!side_src || (side_src->sizes() == layer_ptrs.sizes() &&
+                                 side_dst->sizes() == layer_ptrs.sizes() &&
+                                 side_src->is_contiguous() &&
+                                 side_dst->is_contiguous() && side_bytes > 0)),
+              "LayerEvictor: side_src / side_dst must both be shaped like "
+              "layer_ptrs, with side_bytes > 0");
   const int64_t num_layers = layer_ptrs.size(0);
   const int64_t num_blocks = layer_ptrs.size(1);
   const int64_t num_tokens = slot_mapping.size(0);
@@ -1136,6 +1178,13 @@ void LayerEvictor::start(const torch::Tensor& layer_ptrs, torch::Tensor staging0
                                     base + (l + 1) * num_blocks);
     batched_memcpy_d2h(buf, ptrs,
                        std::vector<int64_t>(num_blocks, buf.nbytes() / num_blocks));
+    if (side_src) {
+      const int64_t* src = side_src->data_ptr<int64_t>() + l * num_blocks;
+      const int64_t* dst = side_dst->data_ptr<int64_t>() + l * num_blocks;
+      batched_memcpy_async(std::vector<int64_t>(dst, dst + num_blocks),
+                           std::vector<int64_t>(src, src + num_blocks),
+                           std::vector<int64_t>(num_blocks, side_bytes));
+    }
     TORCH_CHECK(cudaEventRecord(done_[l], s) == cudaSuccess,
                 "cudaEventRecord failed");
   }
@@ -1178,7 +1227,8 @@ std::shared_ptr<LoadTiming> LayerwiseLoader::start(
     torch::Tensor staging0, torch::Tensor staging1,
     std::vector<torch::Tensor> kvcaches, torch::Tensor slot_mapping,
     const GPUKVFormat gpu_kv_format, const int64_t lookahead, const bool timing,
-    const std::vector<int64_t>& evict_events) {
+    const std::vector<int64_t>& evict_events,
+    const std::optional<torch::Tensor>& side_dst, const int64_t side_bytes) {
   TORCH_CHECK(!layer_ptrs.is_cuda() && layer_ptrs.scalar_type() == torch::kInt64 &&
                   layer_ptrs.dim() == 2 && layer_ptrs.is_contiguous(),
               "layer_ptrs must be a contiguous [layers, chunks] int64 CPU tensor");
@@ -1187,6 +1237,12 @@ std::shared_ptr<LoadTiming> LayerwiseLoader::start(
   TORCH_CHECK(num_layers_ == static_cast<int64_t>(kvcaches.size()) &&
                   num_chunks == static_cast<int64_t>(sizes.size()) && num_chunks > 0,
               "layer_ptrs does not match kvcaches / sizes");
+  TORCH_CHECK(!side_dst || (!side_dst->is_cuda() &&
+                            side_dst->scalar_type() == torch::kInt64 &&
+                            side_dst->sizes() == layer_ptrs.sizes() &&
+                            side_dst->is_contiguous() && side_bytes > 0),
+              "side_dst must be a contiguous int64 CPU tensor shaped like "
+              "layer_ptrs, with side_bytes > 0");
   const at::cuda::OptionalCUDAGuard device_guard(device_of(staging0));
   while (done_.size() < static_cast<size_t>(num_layers_)) {
     cudaEvent_t ev;
@@ -1222,6 +1278,19 @@ std::shared_ptr<LoadTiming> LayerwiseLoader::start(
       off += sizes[c];
     }
   }
+  side_dsts_.assign(num_layers_, {});
+  side_srcs_.assign(num_layers_, {});
+  side_bytes_ = side_dst ? static_cast<size_t>(side_bytes) : 0;
+  if (side_dst) {
+    const int64_t* side = side_dst->data_ptr<int64_t>();
+    for (int64_t l = 0; l < num_layers_; ++l) {
+      for (int64_t c = 0; c < num_chunks; ++c) {
+        side_dsts_[l].push_back(reinterpret_cast<void*>(side[l * num_chunks + c]));
+        side_srcs_[l].push_back(
+            reinterpret_cast<const void*>(base[l * num_chunks + c] + sizes[c]));
+      }
+    }
+  }
   TORCH_CHECK(evict_events.empty() ||
                   static_cast<int64_t>(evict_events.size()) >= num_layers_,
               "evict_events must have one event per layer");
@@ -1254,19 +1323,26 @@ void LayerwiseLoader::enqueue(const int64_t layer) {
   std::vector<void*> dsts(dsts_[layer].size());
   for (size_t i = 0; i < dsts.size(); ++i)
     dsts[i] = out + reinterpret_cast<size_t>(dsts_[layer][i]);
-  cudaMemcpyAttributes attr = {};
-  attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-  attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
-  size_t attr_idx = 0;
-  const cudaError_t err = cudaMemcpyBatchAsync(
-      dsts.data(), srcs_[layer].data(), bytes_[layer].data(), dsts.size(), &attr,
-      &attr_idx, 1, s);
-  TORCH_CHECK(err == cudaSuccess, "cudaMemcpyBatchAsync failed: ",
-              cudaGetErrorString(err));
+  std::vector<const void*> srcs = srcs_[layer];
+  std::vector<size_t> bytes = bytes_[layer];
+  // Side pages land in place, so with lent blocks they wait like the scatter.
+  const bool side_now = evict_events_.empty();
+  if (side_now) {
+    dsts.insert(dsts.end(), side_dsts_[layer].begin(), side_dsts_[layer].end());
+    srcs.insert(srcs.end(), side_srcs_[layer].begin(), side_srcs_[layer].end());
+    bytes.insert(bytes.end(), side_dsts_[layer].size(), side_bytes_);
+  }
+  memcpy_batch(dsts, srcs, bytes, s);
   // The scatter overwrites lent blocks: their old KV must be out first.
   if (!evict_events_.empty()) {
     TORCH_CHECK(cudaStreamWaitEvent(s, evict_events_[layer], 0) == cudaSuccess,
                 "cudaStreamWaitEvent failed");
+  }
+  if (!side_now && !side_dsts_[layer].empty()) {
+    std::vector<void*> side_dsts = side_dsts_[layer];
+    std::vector<const void*> side_srcs = side_srcs_[layer];
+    std::vector<size_t> side_bytes(side_dsts.size(), side_bytes_);
+    memcpy_batch(side_dsts, side_srcs, side_bytes, s);
   }
   torch::Tensor src = buf.narrow(0, 0, num_tokens_);
   single_layer_kv_transfer(src, kvcaches_[layer], slots_, TransferDirection::H2D,

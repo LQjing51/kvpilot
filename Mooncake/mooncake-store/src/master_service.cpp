@@ -1076,8 +1076,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             }
             shard->processing_keys.erase(key);
             shard->metadata.erase(it);
-        } else if (kvp_mode_ != KvpMode::kExclusive &&
-                   metadata.size == slice_length &&
+        } else if (metadata.size == slice_length &&
                    shard->processing_keys.count(key) == 0 &&
                    shard->replication_tasks.count(key) == 0 &&
                    shard->offloading_tasks.count(key) == 0 &&
@@ -1121,10 +1120,11 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         },
         [](Replica& replica) { replica.mark_complete(); });
 
-    // An object already on local disk got its memory replica back from a
-    // KVPilot SSD write-back; offloading it again would rewrite the same
-    // value and pin the disk replica in an offloading task. Exclusive
-    // placement offloads only SSD groups; the others stay memory-only.
+    // An object already on local disk got its memory replica back (KVPilot
+    // SSD write-back, or exclusive placement writing DRAM for a chunk that
+    // keeps its SSD copy); offloading it again would rewrite the same value
+    // and pin the disk replica in an offloading task. Exclusive placement
+    // offloads only SSD groups; the others stay in memory until demoted.
     if (enable_offload_ &&
         !metadata.HasReplica(&Replica::fn_is_local_disk_replica) &&
         (kvp_mode_ != KvpMode::kExclusive || KvpGroupWantsSsd(key))) {
@@ -1523,6 +1523,15 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
                            .get_local_disk_descriptor()
                            .client_id == client_id;
         });
+    } else if (replica_type == ReplicaType::MEMORY) {
+        // KVPilot exclusive: a chunk leaving DRAM keeps its disk replica. One
+        // a reader or an offload still holds stays (an extra copy until DRAM
+        // demotes it).
+        kvp_excl_dropped_ += static_cast<int64_t>(
+            metadata.EraseReplicas([](const Replica& replica) {
+                return replica.is_memory_replica() && replica.is_completed() &&
+                       replica.get_refcnt() == 0;
+            }));
     } else {
         LOG(ERROR) << "key=" << key
                    << ", error=invalid_replica_type_for_eviction";
@@ -3807,14 +3816,10 @@ void MasterService::KvpBatchEvict(double evict_ratio_target,
         if (md.IsHardPinned() || !evictable(md)) {
             return false;
         }
-        if (excl) {
+        if (excl && offloading) {
             // Memory-only objects move to SSD, once (one already offloading
-            // waits). One with a disk replica is an SSD group whose memory
-            // replica a reader held when it landed; the unpin drops it.
-            const bool has_disk = md.HasReplica([](const Replica& r) {
-                return r.is_local_disk_replica() && r.is_completed();
-            });
-            if (has_disk || offloading) return false;
+            // waits); one with a disk replica only loses its memory replica.
+            return false;
         }
         int64_t ord = kUnordered + KvpNowMs(md.put_start_time);
         const KvpGroupState* st = nullptr;
@@ -3937,6 +3942,27 @@ void MasterService::KvpBatchEvict(double evict_ratio_target,
                 const bool busy = shard->offloading_tasks.count(it->first) > 0;
                 if (!chosen.count(KvpGroupOf(it->first)) ||
                     !rank_of(it->first, it->second, r, busy)) {
+                    ++it;
+                    continue;
+                }
+                const bool on_disk =
+                    it->second.HasReplica([](const Replica& rep) {
+                        return rep.is_local_disk_replica() &&
+                               rep.is_completed();
+                    });
+                if (excl && on_disk) {
+                    // Already on SSD (a chunk keeps its SSD copy when it moves
+                    // up): leaving DRAM writes nothing.
+                    const size_t n =
+                        it->second.EraseReplicas([](const Replica& rep) {
+                            return rep.is_memory_replica() &&
+                                   rep.is_completed() &&
+                                   rep.get_refcnt() == 0;
+                        });
+                    total_freed_size += it->second.size * n;
+                    kvp_excl_dropped_ += static_cast<int64_t>(n);
+                    evicted_count++;
+                    spilled_groups.insert(KvpGroupOf(it->first));
                     ++it;
                     continue;
                 }

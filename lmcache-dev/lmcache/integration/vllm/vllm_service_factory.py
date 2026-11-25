@@ -94,7 +94,9 @@ class VllmServiceFactory(BaseServiceFactory):
         use_mla = mla_enabled(model_config)
         validate_mla_config(self.lmcache_config, use_mla)
 
-        num_layer = model_config.get_num_layers(parallel_config)
+        # KV layers only: a hybrid model's linear-attention layers keep a
+        # per-request state instead (vllm_v1_adapter saves it separately).
+        num_layer = model_config.get_num_layers_by_block_type(parallel_config, "attention")
         num_draft_layers = calculate_draft_layers(self.vllm_config)
         num_layer += num_draft_layers
         chunk_size = self.lmcache_config.chunk_size

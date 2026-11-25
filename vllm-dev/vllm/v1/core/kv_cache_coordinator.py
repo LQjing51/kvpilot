@@ -504,6 +504,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         assert all(
             g.kv_cache_spec.block_size % hash_block_size == 0
             for g in kv_cache_config.kv_cache_groups
+            if g.kv_cache_spec.prefix_cacheable
         ), "block_size must be divisible by hash_block_size"
         assert dcp_world_size == 1, "DCP not support hybrid attn now."
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
@@ -516,6 +517,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         """
         self.attention_groups: list[SpecGroup] = []
         for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
+            if not g.kv_cache_spec.prefix_cacheable:
+                # Scratch groups (Qwen4Exp's QSA ring) hold no token range.
+                continue
             manager_cls = self.single_type_managers[i].__class__
             spec = g.kv_cache_spec
             use_eagle = i in self.eagle_group_ids

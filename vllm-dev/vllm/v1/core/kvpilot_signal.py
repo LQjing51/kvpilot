@@ -32,9 +32,6 @@ from collections import Counter
 
 from vllm.v1.core.kvpilot_time_model import TimeModel
 
-# Block size == LMCache chunk size (the launch scripts): a prompt shorter than
-# this leaves no full block, so the prefill side tracks nothing for it.
-BLOCK = 512
 WARMUP_HEAD = "ffffffff"
 
 RX_INLINE_CALL = re.compile(r"<function=([^>\s]+)>(.*?)(?:</function>|$)", re.S)
@@ -221,12 +218,14 @@ def trace_line(request_id: str) -> int | None:
     raise ValueError(f"KVPilot: request id {request_id!r} has no trace line")
 
 
-def from_env():
-    """The signal source the environment selects."""
+def from_env(block_size: int):
+    """The signal source the environment selects. `block_size`: the vLLM
+    block size, which the launch scripts make the LMCache chunk size too."""
     if os.environ.get("KVPILOT_ONLINE_PREDICT", "0") == "1":
         return OnlinePredictor(
             os.environ["KVPILOT_TOOL_RESP_DISTRIBUTION_PATH"],
             os.environ["KVPILOT_TIME_COEFFS_PATH"],
+            block_size,
         )
     return OfflineTable(os.environ["KVPILOT_OFFLINE_TABLE"])
 
@@ -257,10 +256,11 @@ class OfflineTable:
 class OnlinePredictor:
     """Signals predicted from the turn's tool calls and the time model."""
 
-    def __init__(self, dist_path: str, coeffs_path: str) -> None:
+    def __init__(self, dist_path: str, coeffs_path: str, block_size: int) -> None:
         with open(dist_path) as f:
             raw = json.load(f)
-        self._model = TimeModel.load(coeffs_path, BLOCK)
+        self._block = block_size
+        self._model = TimeModel.load(coeffs_path, block_size)
         self._dist = {}
         mass: Counter = Counter()
         for label, hist in raw.items():
@@ -291,8 +291,8 @@ class OnlinePredictor:
             self.label_misses += 1
             hist = self._global
         mids, probs = hist
-        p = BLOCK * (prompt_len // BLOCK)
-        base = prompt_len % BLOCK + decode_len
+        p = self._block * (prompt_len // self._block)
+        base = prompt_len % self._block + decode_len
         acc = [0.0, 0.0, 0.0]
         weight = sum(probs)
         for resp, prob in zip(mids, probs):

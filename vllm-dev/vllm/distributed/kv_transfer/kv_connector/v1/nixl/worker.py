@@ -3,6 +3,7 @@
 """Worker-side logic for the NIXL connector."""
 
 import logging
+import math
 import os
 import queue
 import threading
@@ -68,7 +69,9 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -96,6 +99,10 @@ class NixlConnectorWorker:
         """Compute NIXL descriptor IDs for given block IDs."""
         num_fa_regions = self.num_regions
         num_ssm_regions = len(self.block_len_per_layer) * 4 if self._has_mamba else 0
+        if self._is_qsa:
+            return self._compute_desc_ids_qsa(
+                block_ids, dst_num_blocks, block_size_ratio, physical_blocks_per_logical
+            )
 
         num_blocks = dst_num_blocks
         if block_size_ratio is not None:
@@ -147,6 +154,44 @@ class NixlConnectorWorker:
                     f"Unknown spec type {self._group_spec_types[i]} at index {i}"
                 )
 
+        return np.concatenate(all_descs)
+
+    def _compute_desc_ids_qsa(
+        self,
+        block_ids: BlockIds,
+        dst_num_blocks: int,
+        block_size_ratio: float | None,
+        physical_blocks_per_logical: int,
+    ) -> np.ndarray:
+        """Qwen4Exp descriptor ids. Descs are [attention regions | GDN 4 per
+        GDN region | PLE], attention virtually split in K/V halves like the
+        hybrid layout (2 per region)."""
+        assert block_size_ratio in (None, 1) and physical_blocks_per_logical == 1
+        assert self.transfer_topo is not None
+        num_blocks = dst_num_blocks
+        num_fa_descs = self.num_regions * num_blocks
+        halves = 2 if self.transfer_topo.virtually_split_kv_in_blocks else 1
+        ring = [r * halves + h for r in self._qsa_ring_regions for h in range(halves)]
+        kv = np.setdiff1d(np.arange(self.num_regions), ring)
+        num_ssm_regions = len(self._qsa_ssm_regions) * 4
+        all_descs: list[np.ndarray] = []
+        for i, group in enumerate(block_ids):
+            group_arr = np.asarray(group)
+            spec_type = self._group_spec_types[i]
+            if spec_type is CircularBufferSpec:
+                regions = np.asarray(ring)[:, None]
+                all_descs.append((regions * num_blocks + group_arr[None, :]).flatten())
+            elif _is_attention_spec(spec_type):
+                all_descs.append((kv[:, None] * num_blocks + group_arr[None, :]).flatten())
+            elif i == self._qsa_ple_group:
+                all_descs.append(num_fa_descs + num_ssm_regions * num_blocks + group_arr)
+            elif _is_ssm_spec(spec_type):
+                regions = np.arange(num_ssm_regions)[:, None]
+                all_descs.append(
+                    (regions * num_blocks + group_arr[None, :] + num_fa_descs).flatten()
+                )
+            else:
+                raise ValueError(f"Unknown spec type {spec_type} at index {i}")
         return np.concatenate(all_descs)
 
     def _build_local_splits_from_plan(
@@ -247,6 +292,36 @@ class NixlConnectorWorker:
             isinstance(g.kv_cache_spec, MambaSpec)
             for g in kv_cache_config.kv_cache_groups
         )
+        # Qwen4Exp (QSA + GDN + PLE): pages of three sizes, each block id one
+        # page in every tensor (_get_kv_cache_groups_qsa). Attention groups
+        # read their own regions: the QSA ring only the ring tensors, the main
+        # KV group the main KV and indexer-key tensors. GDN states, in the
+        # main KV tensors, go by the 3-read; the TP-replicated PLE short-conv
+        # state as one piece. Region indices are set in register_kv_caches.
+        self._is_qsa = any(
+            get_representative_spec_type(g.kv_cache_spec) is CircularBufferSpec
+            for g in kv_cache_config.kv_cache_groups
+        )
+        self._qsa_ple_group = next(
+            (
+                i
+                for i, g in enumerate(kv_cache_config.kv_cache_groups)
+                if isinstance(g.kv_cache_spec, MambaSpec) and g.kv_cache_spec.tp_replicated
+            ),
+            None,
+        )
+        self._qsa_ring_regions: list[int] = []
+        self._qsa_ssm_regions: list[int] = []
+        self._qsa_ple_region: int | None = None
+        self._qsa_ple_bytes = 0
+        if self._is_qsa:
+            if self._qsa_ple_group is None:
+                raise ValueError("NIXL Qwen4Exp: no PLE state group")
+            ple_spec = kv_cache_config.kv_cache_groups[self._qsa_ple_group].kv_cache_spec
+            self._qsa_ple_bytes = sum(
+                math.prod(shape) * get_dtype_size(dtype)
+                for shape, dtype in zip(ple_spec.shapes, ple_spec.dtypes, strict=True)
+            )
         if self._has_mamba:
             assert self._is_hma_required
             from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -260,7 +335,7 @@ class NixlConnectorWorker:
             mamba_spec = next(
                 spec
                 for spec in self._layer_specs.values()
-                if isinstance(spec, MambaSpec)
+                if isinstance(spec, MambaSpec) and not spec.tp_replicated
             )
             self._conv_decomp = derive_mamba_conv_split(
                 mamba_spec,
@@ -881,6 +956,23 @@ class NixlConnectorWorker:
         caches_data = []
         # With hybrid allocator, layers can share a kv cache tensor
         seen_base_addresses = []
+        if self._is_qsa and (
+            self.use_host_buffer or self._physical_blocks_per_logical_kv_block != 1
+        ):
+            raise NotImplementedError(
+                "NIXL Qwen4Exp: device buffers with kernel block == block only"
+            )
+        self._qsa_ring_regions, self._qsa_ssm_regions = [], []
+        self._qsa_ple_region = None
+
+        def qsa_region(base_addr: int, spec) -> None:
+            region = seen_base_addresses.index(base_addr)
+            if isinstance(spec, CircularBufferSpec):
+                self._qsa_ring_regions.append(region)
+            elif isinstance(spec, MambaSpec) and spec.tp_replicated:
+                self._qsa_ple_region = region
+            elif isinstance(spec, MambaSpec) and region not in self._qsa_ssm_regions:
+                self._qsa_ssm_regions.append(region)
 
         # Note(tms): I modified this from the original region setup code.
         # K and V are now in different regions. Advantage is that we can
@@ -905,9 +997,13 @@ class NixlConnectorWorker:
             if isinstance(layer_spec, UniformTypeKVCacheSpecs):
                 # MLA DSv32 Indexer case: UniformTypeKVCacheSpecs merges kv_cache_specs
                 layer_spec = layer_spec.kv_cache_specs[layer_name]
-            cache_list = self.transfer_topo.get_transfer_cache_regions(
-                cache_or_caches, layer_spec
-            )
+            if self._is_qsa and isinstance(layer_spec, MambaSpec):
+                # GDN (conv, ssm) or PLE (conv): the page starts at the first.
+                cache_list = [cache_or_caches[0]]
+            else:
+                cache_list = self.transfer_topo.get_transfer_cache_regions(
+                    cache_or_caches, layer_spec
+                )
             # `layer_spec.page_size_bytes` only accounts for logical page_size, that is
             # the page_size assuming constant `self._logical_num_blocks`.
             physical_page_size = (
@@ -944,11 +1040,15 @@ class NixlConnectorWorker:
                     # pointed to by group0. Also, generally we will have more blocks
                     # per tensor but fewer regions.
                     logger.debug("Skipping %s because it's already seen", layer_name)
+                    if self._is_qsa:
+                        qsa_region(base_addr, layer_spec)
                     continue
                 logger.debug(
                     "Registering layer %s with cache shape: %s", layer_name, cache.shape
                 )
                 seen_base_addresses.append(base_addr)
+                if self._is_qsa:
+                    qsa_region(base_addr, layer_spec)
                 # Only record non-Mamba page sizes.
                 if isinstance(layer_spec, MambaSpec):
                     self.block_len_per_layer.append(
@@ -973,7 +1073,7 @@ class NixlConnectorWorker:
                         f"{self.transfer_topo.is_kv_layout_blocks_first}"
                     )
 
-                if not self.use_mla:
+                if not self.use_mla and not self._is_qsa:
                     # Different kv cache shape is not supported by HeteroTP.
                     # This must also hold true for Mamba-like models.
                     assert tensor_size_bytes == curr_tensor_size_bytes, (
@@ -990,6 +1090,28 @@ class NixlConnectorWorker:
             "Different block lengths collected: %s", set(self.block_len_per_layer)
         )
         assert len(self.block_len_per_layer) == len(seen_base_addresses)
+        if self._is_qsa:
+            # Region order is registration order, the same on P and D.
+            self._qsa_ring_regions.sort()
+            self._qsa_ssm_regions.sort()
+            if (
+                not self._qsa_ring_regions
+                or set(self._qsa_ring_regions) & set(self._qsa_ssm_regions)
+                or self._qsa_ple_region not in self._qsa_ssm_regions
+            ):
+                raise ValueError(
+                    "NIXL Qwen4Exp: unexpected regions: ring "
+                    f"{self._qsa_ring_regions}, GDN {self._qsa_ssm_regions}, "
+                    f"PLE {self._qsa_ple_region}"
+                )
+            logger.info(
+                "NIXL Qwen4Exp regions: %d (ring %s, GDN %s, PLE %s), page bytes %s",
+                len(seen_base_addresses),
+                self._qsa_ring_regions,
+                self._qsa_ssm_regions,
+                self._qsa_ple_region,
+                sorted(set(self.block_len_per_layer)),
+            )
 
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
         self.num_regions = len(caches_data)
@@ -1099,7 +1221,9 @@ class NixlConnectorWorker:
         physical_per_logical = self._physical_blocks_per_logical_kv_block
 
         result: list[tuple[int, int, int]] = []
-        for i, base_addr in enumerate(base_addresses):
+        regions = self._qsa_ssm_regions if self._is_qsa else range(len(base_addresses))
+        for i in regions:
+            base_addr = base_addresses[i]
             # Jump one page_size, but ssm page_size may be bigger when kernel
             # locks block size to a specific value (physical_per_logical scale).
             page_stride = (
@@ -1118,6 +1242,14 @@ class NixlConnectorWorker:
                         ssm_size,
                         self.device_id,
                     )
+                )
+        if self._is_qsa:
+            assert self._qsa_ple_region is not None
+            base_addr = base_addresses[self._qsa_ple_region]
+            page_stride = self.block_len_per_layer[self._qsa_ple_region]
+            for blk in range(num_blocks):
+                result.append(
+                    (base_addr + blk * page_stride, self._qsa_ple_bytes, self.device_id)
                 )
         return result
 
@@ -1150,7 +1282,10 @@ class NixlConnectorWorker:
         result: list[tuple[int, int, int]] = []
         # NOTE (ZhanqiuHu): use per-layer block_lens[i], not [0], in case
         # block lengths vary across layers (e.g. MLA).
-        for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
+        remote_bases = nixl_agent_meta.kv_caches_base_addr
+        regions = self._qsa_ssm_regions if self._is_qsa else range(len(remote_bases))
+        for i in regions:
+            base_addr = remote_bases[i]
             page_stride = nixl_agent_meta.block_lens[i] * remote_physical_per_logical
             for off, sz in conv_offsets:
                 for blk in range(num_blocks):
@@ -1164,6 +1299,14 @@ class NixlConnectorWorker:
                     + local_offset * ssm_read_size
                 )
                 result.append((ssm_addr, ssm_read_size, device_id))
+        if self._is_qsa:
+            assert self._qsa_ple_region is not None
+            base_addr = remote_bases[self._qsa_ple_region]
+            page_stride = nixl_agent_meta.block_lens[self._qsa_ple_region]
+            for blk in range(num_blocks):
+                result.append(
+                    (base_addr + blk * page_stride, self._qsa_ple_bytes, device_id)
+                )
         return result
 
     def _build_fa_local(
@@ -1528,6 +1671,14 @@ class NixlConnectorWorker:
         assert self.transfer_topo is not None
         remote_info = self.transfer_topo.get_engine_info(remote_engine_id)
         assert remote_info.remote_tp_size == remote_tp_size
+        if self._is_qsa and (
+            remote_tp_size != self.world_size
+            or nixl_agent_meta.block_lens != self.block_len_per_layer
+        ):
+            raise NotImplementedError(
+                "NIXL Qwen4Exp: P and D need the same TP and page sizes, got "
+                f"TP {remote_tp_size} / {self.world_size}"
+            )
 
         tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
         block_size_ratio = self.transfer_topo.block_size_ratio(

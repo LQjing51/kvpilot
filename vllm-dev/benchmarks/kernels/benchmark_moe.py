@@ -786,6 +786,7 @@ def get_model_params(config):
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeTextConfig",
+        "Qwen4ExpForConditionalGeneration",
     ):
         text_config = config.get_text_config()
         E = text_config.num_experts

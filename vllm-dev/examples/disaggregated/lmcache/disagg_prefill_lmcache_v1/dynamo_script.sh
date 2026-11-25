@@ -263,7 +263,6 @@ if [[ "$MODE" == "benchmark" ]]; then
     #     --forced-output \
     #     2>&1 | tee "${LOG_DIR}/benchmark.log"
 
-    # Qwen3-30B-A3B-Instruct-2507 vocab_size = 151936 (from HF config.json).
     # conversation_trace_turn4_half.jsonl
     # toolagent_trace.jsonl
     python3 "${KVPILOT_ROOT}/vllm-dev/benchmarks/multi_turn/mooncake_trace_replay.py" \
@@ -271,7 +270,7 @@ if [[ "$MODE" == "benchmark" ]]; then
         -m "$MODEL" \
         -u "http://localhost:${PROXY_PORT}" \
         -p 32 \
-        --vocab-size 151936 \
+        --vocab-size "$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1]+"/config.json")); print(c.get("text_config", c)["vocab_size"])' "$MODEL")" \
         --time-scale 1 \
         2>&1 | tee "${LOG_DIR}/benchmark.log"
 fi
@@ -326,6 +325,7 @@ if [[ "$MODE" == "setup" ]]; then
     LOG_DIR="$LOG_DIR" \
         bash "$ROUTER_SCRIPT" \
         > "${LOG_DIR}/${ROUTER_LOG_NAME}" 2>&1 &
+    ROUTER_PID=$!
 
     # Wait for frontend /v1/models to list registered workers.
     # The frontend opens its port immediately but /v1/models stays empty
@@ -342,6 +342,11 @@ if [[ "$MODE" == "setup" ]]; then
             echo ""
             models_ready=1
             break
+        fi
+        # The router script exits as soon as one worker dies.
+        if ! kill -0 "$ROUTER_PID" 2>/dev/null; then
+            echo "  ERROR: ${ROUTER_SCRIPT} exited after ${waited}s (a worker failed to start)."
+            exit 1
         fi
         sleep 5
         waited=$((waited + 5))

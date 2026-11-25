@@ -65,6 +65,79 @@ GPU 页表），而 Mooncake 注册自己和 peer 的 segment 是在 vLLM 测完
 两个 prefill 引擎随即 `EngineDeadError`，所有请求 500（2026-11-03 全量 toolagent 回放）。64 GiB segment
 只占 512 MiB，没有问题；要用 200 GiB 得给显存留出这部分余量。
 
+**单 KV 头的模型 LMCache 会读错 KV 布局，表现为 CUDA 非法访问**（Qwen3.6 TP2，2026-11-23 修）。vLLM 给 HND
+提示，KV 张量却是逻辑 NHD 顺序 `(块, 2, 64, 1, 256)`（长度 1 的头那一维不影响 `is_contiguous`，不会被重排），LMCache
+按 HND 读成 64 个头、每块 1 token。slot 小于 kernel 块数时不报错、只是 KV 存取到错的位置（输出错）；新分到的块号一大，
+`illegal memory access` 在下一个检查错误的地方冒出来：LMCache 存储的 `store_stream.synchronize`、前向结束的同步，
+`CUDA_LAUNCH_BLOCKING=1` 下才停在 `LayerwiseLoader.start`。修法见 [kv-placement.md](kv-placement.md)「混合模型」。
+查这类问题：纯 vLLM（`LLM(...)`，同样的 block / 前缀缓存 / cudagraph 配置）先跑一遍排除 vLLM，再对 LMCache 的
+gather / scatter 打 slot 范围和张量形状。
+
+**LMCache 逐层 connector 的 GPU buffer 不在 vLLM 的显存预算里**（Qwen3.6 TP4，2026-11-23 修）。它在第一次存数据时
+懒分配，上游按一层整个 HBM 缓存的 token 数开：TP4 下 691 万 token × 1 KiB = 6.75 GiB。`GPU_MEM_UTIL=0.9` 时 vLLM 已
+把 85.5 GiB 分给权重、激活和 KV，加上它 PyTorch 占 91.6 GiB，第 5 个请求申请 48 MiB 激活时 `CUDA out of memory`，
+所有请求 500。TP2 下是 5.1 GiB，刚好放得下。现在按 `max_model_len` 开（prefill `--max-num-seqs 1`，一次只存一条
+prompt）。日志 `Lazily initializing GPU buffer (max tokens=...)` 看实际大小。
+
+**混合模型复用后的输出可能和冷算不同，不是加载错了**。vLLM 原生 HBM 前缀缓存也会这样（TP4 下 4 个种子里 2 个）：
+冷算分几步算到边界，复用从缓存的状态接着算，数值不逐位相同。判断 LMCache 路径对不对，要拿 DRAM / SSD 复用和 HBM
+命中比，`check_state_reuse.py` 两者都打印。
+
+**Qwen3.8 第一次编译时可用 KV 显存会被压到几 GiB**（2026-11-23）。torch.compile 第一次编译这个模型时，编译的峰值
+（约 35 GiB）落在 vLLM 测显存的 profile run 里，可用 KV 只剩 4.46 GiB（P）/ 2.96 GiB（D，再小于 262K 上下文所需时
+起不来）；编译缓存热了以后是 38.3 / 34.5 GiB。改了 vLLM 代码或启动参数（包括关异步调度）都会让缓存失效。A/B 里
+显式给 `HBM_BLOCKS`（`--num-gpu-blocks-override`），各组 HBM 不受影响；D 第一次起不来时 `run_ab.sh` 会重试 setup。
+
+**Qwen3.8 不能开异步调度**：V1 runner 的 PLE n-gram 上下文从 CPU 端的 token 读，异步调度下 decode 时它落后一步，
+同一 prompt 两次输出不同。`Qwen4ExpForConditionalGenerationConfig` 默认关掉，显式打开直接报错。
+
+**FP8 模型开专家并行要 nvcc 在 PATH 里**（2026-11-25；现在所有模型都开 EP）。Hopper 上 block FP8 的 MoE 在 EP 下
+选 FlashInfer CUTLASS（`fused_moe/oracle/fp8.py`：TP 优先 Triton、EP 优先 FI CUTLASS），它的分组 GEMM 由 TensorRT-LLM
+第一次用到时用 nvcc 现编（缓存在 `~/.tensorrt_llm/cache`）。镜像的 PATH 里没有 nvcc 时日志是 `sh: 1: nvcc: not found`、
+`Failed to copy kernel files to cache ... nvcc_kernel.cubin`，随后 `Assertion failed: !cubin.empty() || isPathValid(path_)`。
+11-23 接 Qwen3.8 时把它当成「缺 cubin」、对 Qwen3.8 关了 EP（之前 Qwen3.8 的时间模型和 Eval-EXP1 都是不开 EP 测的）；
+现在 `disagg_lmcache.sh` 设 `CUDA_HOME=/usr/local/cuda`、把它的 `bin` 放进 PATH，所有模型 `--enable-expert-parallel`。
+同时装了 `flashinfer-cubin==0.6.12`（离线 cubin 包，见 [gpu-restore.md](gpu-restore.md)）。
+
+**慢的是 FlashInfer CUTLASS，不是 EP**（2026-11-25，`utils/moe_bench/`，离线单条 prefill，chunk 8192、CUDA graph 64–1024）。
+`--moe-backend triton` 在 EP 下也能用：
+
+| 单条 prefill（ms），256 / 1K / 2K / 4K / 8K token | 不开 EP + Triton | 开 EP + Triton | 开 EP + FI CUTLASS | 不开 EP + FI CUTLASS |
+|---|---|---|---|---|
+| Qwen3.6-FP8 TP2 | 19.4 / 37.9 / 73.1 / 113.0 / 218.0 | 19.8 / 38.9 / 74.2 / 115.9 / 224.4 | 24.8 / 45.8 / 75.8 / 131.1 / 248.0 | 27.8 / 53.1 / 85.5 / 147.8 / 278.5 |
+| Qwen3.8 TP4 | 47.7 / 108.9 / 190.3 / 347.0 / 650.1 | 37.6 / 90.4 / 163.0 / 302.0 / 573.0 | 42.2 / 95.3 / 168.3 / 309.0 / 580.9 | — |
+
+Qwen3.8 不开 EP 时每卡中间维 640/4 = 160 不是 128 的倍数，FP8 块缩放只能细化成 32×32、只有 Triton 能跑，所以必须开 EP；
+FI CUTLASS 下它的 MoE GEMM 其实已经是 TensorRT-LLM 里的 `deep_gemm::fp8_gemm_kernel`，不用另装 DeepGEMM。给 EP 的形状
+（E=128,N=512 / N=640）用 `benchmarks/kernels/benchmark_moe.py --tune` 调了 Triton 配置表（要 ray，从 CFS 装），按 token 数直接用、
+或按每个专家的 token 数错位用（脚本在 EP 下让每个专家分到真机 EP 倍的 token，`shift_tuned.py`），都和默认配置差不到 1%。
+MoE 只占 GPU 时间的一部分（torch profiler，8K token：Qwen3.6 27%、Qwen3.8 19%；稠密 FP8 GEMM 25% / 33%），换 kernel 最多
+让 Qwen3.6 快 10–20%（小 chunk）、Qwen3.8 快 1–11%。Eval-EXP1 第二轮用的是 FI CUTLASS。Qwen3.8（512 个专家）反过来，开 EP 后 request-safe 拟合的每千 token 计算从 86.6 ms
+降到 74.5 ms。开 EP 后第一次启动同样要重新编译，D 端会因为可用 KV 不够起不来（见「Qwen3.8 第一次编译时可用 KV
+显存会被压到几 GiB」），热缓存后 KV 回到
+38.4 / 35.5 GiB（P / D），和不开 EP 一样。
+
+**很小块的 KV 组会把全局块大小拖下来**：0.23 的 `EngineCore` 把 `cache_config.block_size` 设成所有 KV 组里最小的
+块，Qwen3.8 的 indexer 环形缓冲组是 4，于是 mamba 对齐切分、LMCache 都按 4 个 token 一块（LMCache 报
+`Num tokens: 3072, num blocks: 4, block size: 4`）。现在只取参与前缀缓存的组（同上游 0.30）。
+
+**mooncake_master 起不来时客户端只报 `Client not available`**：快速重启时上一个 master 还占着 50052，新 master
+`bind port 50052 error: Address already in use` 后退出，所有 worker 重试 20 次后 `store.setup() failed`。清理后
+确认没有 `mooncake_master` 进程、端口空闲再起。
+
+**worker 不绑 NUMA 时，TP 4 随机几个 rank 的 SSD 加载慢 3–4 倍**（2026-11-24 Eval-EXP1，现在默认绑，
+`KVPILOT_NUMA_BIND`）。这台机器 GPU 0–3 和 nvme0 在 NUMA 0、GPU 4–7 和 nvme1 在 NUMA 1，worker 进程原来不绑 CPU。
+LMCache SSD loader 的 256 MiB pinned 读缓冲在 worker 初始化时分配，落在当时线程所在的节点；落到另一侧时第 0 层的
+SSD 读每块 1.0–1.4 ms（正常 0.2–0.4 ms）。哪几个 rank 慢每次起服务都不一样，与策略无关：同一 trace 上 Qwen3.8 的
+belady 第一次 TP0/2/3 慢、TTFT 比 LRU 只快 1.5 ms，重跑四个 rank 都正常、快 6.9 ms。不绑时两个 TP 4 混合模型的 7 次
+服务里 4 次有慢 rank；绑了以后 6 次、24 个 rank 一个都没有，各组 TTFT 也普遍快 4–11 ms（DRAM 加载也少了跨 socket）。
+TP 2（GPU 0–3）上没出现过。
+查法：`KVPilot load req=... ssd=N first=...ms` 按 rank（日志前缀 `Worker_TPx`）算 first / (N / KV 层数)，
+`paper-figure/Eval-EXP1/summarize.py` 的「SSD first layer p90」一列也会跟着变大。
+
+**`pkill -f <pattern>` 会杀掉执行它的 ssh 自己**：`ssh host 'pkill -f run_check.sh; ...'` 的命令行里就有这个模式，
+后面的命令不会执行。按 PID 杀。
+
 **`scp` 到 Taiji-GPU 不通**（`Connection closed`），用 `base64 | ssh ... base64 -d`。
 
 **本机没有 matplotlib**，作图要在 GPU 机器上跑。

@@ -8,9 +8,14 @@ import random
 import pytest
 
 from vllm.v1.core import kvpilot_blockwise, kvpilot_heap, kvpilot_placement, kvpilot_signal
-from vllm.v1.core.kv_cache_utils import FreeKVCacheClassQueue, KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    FreeKVCacheClassQueue,
+    KVCacheBlock,
+    make_block_hash_with_group_id,
+)
 from vllm.v1.core.kvpilot_claims import Claims
 from vllm.v1.core.kvpilot_inclusive import InclusivePlacement
+from vllm.v1.core.kvpilot_states import boundary_states
 
 RID = "{:08d}-aaaa-4bbb-8ccc-dddddddddddd"
 WARMUP = "ffffffff-aaaa-4bbb-8ccc-dddddddddddd"
@@ -79,6 +84,19 @@ def test_class_queue_order_and_rekey(py_heap):
     assert q.rekey([blocks[3]], [float(kvpilot_placement.CLASS[None])]) == 1
     assert q.rekey([blocks[0]], [1.0]) == 0  # not free
     assert [b.block_id for b in q.popleft_n(7)] == [7, 3, 2, 5, 1, 4, 6]
+
+
+def test_class_queue_state_blocks_first(py_heap):
+    """A freed linear-attention state goes before every class, after blocks
+    without KV."""
+    blocks, q = _queue(4)
+    q.set_state_groups([0, 1])
+    _hash(blocks[0], make_block_hash_with_group_id(b"a", 2))
+    _hash(blocks[1], make_block_hash_with_group_id(b"a", 1))
+    _hash(blocks[2], make_block_hash_with_group_id(b"a", 0))
+    q.append_n(blocks)
+    assert q.rekey([blocks[0]], [float(kvpilot_placement.CLASS[None])]) == 1
+    assert [b.block_id for b in q.popleft_n(4)] == [3, 1, 2, 0]
 
 
 def test_class_queue_prepend_and_remove(py_heap):
@@ -191,6 +209,17 @@ class _Pool:
     def __init__(self, queue):
         self.free_block_queue = queue
 
+    def touch(self, blocks):
+        for b in blocks:
+            if b.ref_cnt == 0:
+                self.free_block_queue.remove(b)
+            b.ref_cnt += 1
+
+    def free_blocks(self, blocks):
+        for b in blocks:
+            b.ref_cnt -= 1
+        self.free_block_queue.append_n([b for b in blocks if b.ref_cnt == 0])
+
 
 def test_inclusive_reclasses_hbm_and_dram(py_heap):
     blocks, q = _queue(6)
@@ -212,6 +241,45 @@ def test_inclusive_reclasses_hbm_and_dram(py_heap):
     # No next turn (b) before SSD (a); free order within each.
     assert [x.block_id for x in q.popleft_n(4)] == [3, 2, 1, 0]
 
+
+
+def test_inclusive_hybrid_holds_the_end_state(py_heap):
+    """Hybrid model (state groups 0 and 1, attention 2): the states at the
+    end of a head's prompt stay out of the free queue until its signal says
+    there is no next turn, then go first with the other freed states."""
+    blocks, q = _queue(10)
+    q.set_state_groups([0, 1])
+    null = KVCacheBlock(99, is_null=True)
+    attn = blocks[0:3]  # 2 full blocks + a partial one
+    _hash(attn[0], make_block_hash_with_group_id(b"h0", 2))
+    _hash(attn[1], make_block_hash_with_group_id(b"h1", 2))
+    g0 = [null, blocks[3], blocks[4]]  # state at the end of block 1, running
+    g1 = [null, blocks[5], blocks[6]]
+    _hash(g0[1], make_block_hash_with_group_id(b"h1", 0))
+    _hash(g1[1], make_block_hash_with_group_id(b"h1", 1))
+    mid = blocks[7]  # the state after block 0, freed during the prefill
+    _hash(mid, make_block_hash_with_group_id(b"h0", 0))
+    inc = InclusivePlacement(_Pool(q), block_size=16)
+    inc.bind(_Conn())
+    q.append_n([mid])
+    # The end states were taken when the request finished; the rest frees,
+    # each group tail first.
+    end = boundary_states([attn, g0, g1], attn[:2])
+    assert end == [blocks[3], blocks[5]]
+    for s in end:
+        s.ref_cnt = 1
+    q.append_n([g0[2], g1[2]])
+    q.append_n(attn[::-1])
+    inc.track("a", [attn], list(range(40)), end)
+    assert not {3, 5} & {b.block_id for b in q.get_all_free_blocks()}
+    assert len(inc.states) == 1
+    inc.apply("a", None, None)
+    assert len(inc.states) == 0
+    # Running states and the partial block, then the states (mid prefill
+    # first), then the prefix with no next turn.
+    assert [b.block_id for b in q.popleft_n(8)] == [4, 6, 2, 7, 3, 5, 1, 0]
+    with pytest.raises(RuntimeError):
+        boundary_states([attn, [null, null, blocks[4]]], attn[:2])
 
 
 def test_inclusive_penalty_keys_by_the_model(py_heap, monkeypatch):

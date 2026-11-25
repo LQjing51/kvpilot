@@ -91,7 +91,8 @@ std::shared_ptr<LoadTiming> SsdLayerwiseLoader::start(
     std::vector<torch::Tensor> kvcaches, torch::Tensor slot_mapping,
     const GPUKVFormat gpu_kv_format, const bool timing,
     const std::optional<torch::Tensor>& writeback,
-    const std::vector<int64_t>& evict_events) {
+    const std::vector<int64_t>& evict_events,
+    const std::optional<torch::Tensor>& side_dst, const int64_t side_bytes) {
   TORCH_CHECK(!file_idx.is_cuda() && file_idx.scalar_type() == torch::kInt32 &&
                   file_idx.dim() == 2 && file_idx.is_contiguous(),
               "file_idx must be a contiguous [layers, chunks] int32 CPU tensor");
@@ -106,6 +107,13 @@ std::shared_ptr<LoadTiming> SsdLayerwiseLoader::start(
                              writeback->is_contiguous()),
               "writeback must be a contiguous int64 CPU tensor shaped like "
               "file_idx");
+  TORCH_CHECK(!side_dst || (!side_dst->is_cuda() &&
+                            side_dst->scalar_type() == torch::kInt64 &&
+                            side_dst->sizes() == file_idx.sizes() &&
+                            side_dst->is_contiguous() && side_bytes > 0),
+              "side_dst must be a contiguous int64 CPU tensor shaped like "
+              "file_idx, with side_bytes > 0");
+  const int64_t side = side_dst ? side_bytes : 0;
   const int64_t num_layers = file_idx.size(0), num_chunks = file_idx.size(1);
   TORCH_CHECK(num_layers == static_cast<int64_t>(kvcaches.size()) &&
                   num_chunks == static_cast<int64_t>(sizes.size()) &&
@@ -173,12 +181,12 @@ std::shared_ptr<LoadTiming> SsdLayerwiseLoader::start(
       r.chunk = c;
       r.fd = fds[f];
       r.aligned_off = align_down(o);
-      r.need = o - r.aligned_off + sizes[c];
+      r.need = o - r.aligned_off + sizes[c] + side;
       r.aligned_len = align_up(r.need);
       r.slot_off = slot_off;
       if (wb && wb[l * num_chunks + c]) {
         r.wb_dst = reinterpret_cast<char*>(wb[l * num_chunks + c]);
-        r.wb_len = sizes[c];
+        r.wb_len = sizes[c] + side;
       }
       src[l][c] = slot_off + (o - r.aligned_off);
       in_slot[l][c] = true;
@@ -242,6 +250,13 @@ std::shared_ptr<LoadTiming> SsdLayerwiseLoader::start(
   for (int64_t e : evict_events) evict_events_.push_back(reinterpret_cast<cudaEvent_t>(e));
   num_tokens_ = slots_map_.size(0);
   sizes_ = sizes;
+  side_bytes_ = side;
+  side_dst_.clear();
+  if (side_dst) {
+    const int64_t* sd = side_dst->data_ptr<int64_t>();
+    for (int64_t l = 0; l < num_layers; ++l)
+      side_dst_.emplace_back(sd + l * num_chunks, sd + (l + 1) * num_chunks);
+  }
   fmt_ = gpu_kv_format;
   num_layers_ = num_layers;
   next_read_ = 0;
@@ -312,9 +327,23 @@ void SsdLayerwiseLoader::submit_ready_locked() {
     }
     torch::Tensor& buf = staging_[l % 2];
     batched_memcpy_h2d(src, sizes_, buf);
+    bool waited = false;
+    if (!side_dst_.empty()) {
+      // Side pages follow each value's KV; they go to their page directly
+      // (after a lent block's old page is out), and out of the slot before
+      // it is freed.
+      if (!evict_events_.empty()) {
+        cudaStreamWaitEvent(s, evict_events_[l], 0);
+        waited = true;
+      }
+      std::vector<int64_t> side_src(num_chunks);
+      for (int64_t c = 0; c < num_chunks; ++c) side_src[c] = src[c] + sizes_[c];
+      batched_memcpy_async(side_dst_[l], side_src,
+                           std::vector<int64_t>(num_chunks, side_bytes_));
+    }
     if (uses_slot) cudaEventRecord(slot_free_[slot], s);
     // The scatter overwrites lent blocks: their old KV must be out first.
-    if (!evict_events_.empty()) cudaStreamWaitEvent(s, evict_events_[l], 0);
+    if (!evict_events_.empty() && !waited) cudaStreamWaitEvent(s, evict_events_[l], 0);
     torch::Tensor dst = buf.narrow(0, 0, num_tokens_);
     single_layer_kv_transfer(dst, kvcaches_[l], slots_map_,
                              TransferDirection::H2D, fmt_, true);
@@ -439,7 +468,7 @@ torch::Tensor SsdLayerwiseLoader::set_writeback(const int64_t gen,
     const int64_t at = r.layer * num_chunks + r.chunk;
     if (wb[at] && !r.wb_dst) {
       r.wb_dst = reinterpret_cast<char*>(wb[at]);
-      r.wb_len = sizes_[r.chunk];
+      r.wb_len = sizes_[r.chunk] + side_bytes_;
       out[at] = 1;
     }
   }

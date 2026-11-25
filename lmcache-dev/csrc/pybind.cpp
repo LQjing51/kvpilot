@@ -57,6 +57,9 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("batched_memcpy_d2h", &batched_memcpy_d2h, py::arg("src"),
         py::arg("dst_ptrs"), py::arg("sizes"),
         py::call_guard<py::gil_scoped_release>());
+  m.def("batched_memcpy_async", &batched_memcpy_async, py::arg("dst_ptrs"),
+        py::arg("src_ptrs"), py::arg("sizes"),
+        py::call_guard<py::gil_scoped_release>());
   py::class_<LoadTiming, std::shared_ptr<LoadTiming>>(m, "LoadTiming")
       .def("result", &LoadTiming::result,
            py::call_guard<py::gil_scoped_release>());
@@ -65,6 +68,8 @@ PYBIND11_MODULE(c_ops, m) {
       .def("start", &LayerEvictor::start, py::arg("layer_ptrs"),
            py::arg("staging0"), py::arg("staging1"), py::arg("kvcaches"),
            py::arg("slot_mapping"), py::arg("gpu_kv_format"),
+           py::arg("side_src") = py::none(), py::arg("side_dst") = py::none(),
+           py::arg("side_bytes") = 0,
            py::call_guard<py::gil_scoped_release>())
       .def("events", &LayerEvictor::events);
   py::class_<LayerwiseLoader>(m, "LayerwiseLoader")
@@ -74,6 +79,7 @@ PYBIND11_MODULE(c_ops, m) {
            py::arg("kvcaches"), py::arg("slot_mapping"), py::arg("gpu_kv_format"),
            py::arg("lookahead"), py::arg("timing"),
            py::arg("evict_events") = std::vector<int64_t>(),
+           py::arg("side_dst") = py::none(), py::arg("side_bytes") = 0,
            py::call_guard<py::gil_scoped_release>())
       .def("step", &LayerwiseLoader::step, py::arg("layer"), py::arg("wait"),
            py::call_guard<py::gil_scoped_release>());
@@ -88,6 +94,7 @@ PYBIND11_MODULE(c_ops, m) {
            py::arg("slot_mapping"), py::arg("gpu_kv_format"), py::arg("timing"),
            py::arg("writeback") = py::none(),
            py::arg("evict_events") = std::vector<int64_t>(),
+           py::arg("side_dst") = py::none(), py::arg("side_bytes") = 0,
            py::call_guard<py::gil_scoped_release>())
       .def("step", &SsdLayerwiseLoader::step, py::arg("layer"),
            py::arg("wait"), py::call_guard<py::gil_scoped_release>())

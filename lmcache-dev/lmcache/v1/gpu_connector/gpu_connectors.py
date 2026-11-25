@@ -1072,6 +1072,14 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         )
 
         self.gpu_buffer_allocator = None
+        # Tokens the GPU buffer holds at most; the adapter sets vLLM's
+        # max_model_len. None: one layer of the whole HBM cache.
+        self.max_buffer_tokens: Optional[int] = None
+        # Qwen3.8's indexer keys (set_side_caches): per KV layer one page per
+        # vLLM block, carried at the end of the layer's value.
+        self.side_caches: Optional[List[torch.Tensor]] = None
+        self.side_bytes = 0
+        self.side_block = 0
 
         assert "chunk_size" in kwargs, (
             "chunk_size should be provided to create a GPU buffer."
@@ -1164,10 +1172,16 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             self.elements_per_layer = get_elements_per_layer(
                 kv_caches, self.gpu_kv_format
             )
-            logger.info(
-                f"Lazily initializing GPU buffer (max tokens={self.tokens_per_layer})."
+            # The buffer sits outside vLLM's GPU memory budget: a layer of
+            # the whole cache (6.75 GiB for Qwen3.6 at TP 4) runs the GPU out
+            # of memory. It holds one store or fallback load at a time.
+            tokens = self.tokens_per_layer
+            if self.max_buffer_tokens is not None:
+                tokens = min(tokens, self.max_buffer_tokens)
+            logger.info(f"Lazily initializing GPU buffer (max tokens={tokens}).")
+            gpu_buffer_size = (
+                self.elements_per_layer // self.tokens_per_layer * tokens * self.element_size
             )
-            gpu_buffer_size = self.elements_per_layer * self.element_size
             self.gpu_buffer_allocator = GPUMemoryAllocator(
                 gpu_buffer_size, device=self.device
             )
@@ -1187,6 +1201,41 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         return self.element_size * (
             self.hidden_dim_size if self.use_mla else 2 * self.hidden_dim_size
         )
+
+    def set_side_caches(self, caches: List[torch.Tensor], block_size: int) -> None:
+        """Qwen3.8: caches[l] holds KV layer l's indexer keys, one contiguous
+        page per vLLM block of block_size tokens (= one chunk). A value is
+        then the chunk's token-major KV followed by its block's page."""
+        page = caches[0][0].nbytes
+        for cache in caches:
+            if not cache.is_contiguous() or cache[0].nbytes != page:
+                raise ValueError("LMCache: side caches must be contiguous, one page size")
+        self.side_caches = caches
+        self.side_bytes = page
+        self.side_block = block_size
+
+    def value_bytes(self, num_tokens: int) -> int:
+        """Bytes of one layer's value for a chunk of num_tokens."""
+        return num_tokens * self.token_bytes() + self.side_bytes
+
+    def _side_pages(self, firsts: List[int], slots_cpu: torch.Tensor) -> torch.Tensor:
+        """int64 [layers, chunks]: device address of each chunk's side page,
+        from the slot of the chunk's first token, which starts a block."""
+        assert self.side_caches is not None
+        slots = slots_cpu[torch.tensor(firsts, dtype=torch.long)]
+        if bool((slots % self.side_block).any()):
+            raise RuntimeError("LMCache: a side-page chunk does not start a block")
+        base = torch.tensor([c.data_ptr() for c in self.side_caches], dtype=torch.int64)
+        return (base[:, None] + (slots // self.side_block)[None, :] * self.side_bytes).contiguous()
+
+    def _side_dst(self, start: int, chunk_tokens: List[int], **kwargs) -> Optional[torch.Tensor]:
+        """The loaders' side_dst for chunks from `start`; None without side pages."""
+        if self.side_caches is None:
+            return None
+        if any(n != self.side_block for n in chunk_tokens):
+            raise RuntimeError(f"LMCache: side pages load whole blocks, got {chunk_tokens}")
+        firsts = [start + i * self.side_block for i in range(len(chunk_tokens))]
+        return self._side_pages(firsts, kwargs["slot_mapping_cpu"])
 
     @_lmcache_nvtx_annotate
     def start_layers(
@@ -1244,6 +1293,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         # slot_mapping was written on the compute stream, and the paged KV it
         # addresses may still be read by work already queued there.
         self.load_stream.wait_stream(torch.cuda.current_stream())
+        side = self._side_dst(start, chunk_tokens, **kwargs)
         if not hasattr(self, "_loader"):
             self._loader = lmc_ops.LayerwiseLoader()
         with torch.cuda.stream(self.load_stream):
@@ -1251,6 +1301,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             return self._loader.start(
                 ptrs, sizes, staging[0], staging[1], self.kvcaches, slots,
                 self.gpu_kv_format, lookahead, timing, evict_events or [],
+                side, self.side_bytes,
             )
 
     def start_evict(
@@ -1273,6 +1324,14 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         """
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None
+        side_src = side_dst = None
+        if self.side_caches is not None:
+            # Blocks are whole chunks: each one's page goes after its KV.
+            side_src = self._side_pages(
+                list(range(0, len(slots), self.side_block)), slots
+            )
+            kv_bytes = self.side_block * self.token_bytes()
+            side_dst = torch.where(layer_ptrs != 0, layer_ptrs + kv_bytes, 0).contiguous()
         self._lazy_initialize_buffer(self.kvcaches)
         if self._evictor is None:
             self._evictor = lmc_ops.LayerEvictor()
@@ -1290,6 +1349,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             self._evictor.start(
                 layer_ptrs, self._evict_bufs[0], self._evict_bufs[1], self.kvcaches,
                 slots.to(self.device), self.gpu_kv_format,
+                side_src, side_dst, self.side_bytes,
             )
             done = torch.cuda.Event()
             done.record()
@@ -1352,6 +1412,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         slots = slot_mapping[start:end]
         nbytes = self.token_bytes()
         sizes = [n * nbytes for n in chunk_tokens]
+        side = self._side_dst(start, chunk_tokens, **kwargs)
         loader = self._ssd_loader()
         self.load_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.load_stream):
@@ -1359,7 +1420,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             return loader.start(
                 paths, file_idx, offsets, sizes, staging[0], staging[1],
                 self.kvcaches, slots, self.gpu_kv_format, timing, writeback,
-                evict_events or [],
+                evict_events or [], side, self.side_bytes,
             )
 
     def step_layer_ssd(self, layer_id: int, wait: bool) -> None:
@@ -1434,6 +1495,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
+        if self.side_caches is not None:
+            raise NotImplementedError("LMCache: side pages load only by prelookup")
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
@@ -1596,6 +1659,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
+        if self.side_caches is not None:
+            raise NotImplementedError("LMCache: side pages store only to addresses")
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
@@ -1715,6 +1780,15 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         slot_mapping_full = torch.cat(
             [slot_mapping[start:end] for start, end in zip(starts, ends, strict=True)]
         )
+        # The KV of each chunk, packed in the GPU buffer; a side page follows
+        # it in the value.
+        kv_sizes = [(end - start) * self.token_bytes() for start, end in zip(starts, ends)]
+        assert sizes == [n + self.side_bytes for n in kv_sizes]
+        side = (
+            None
+            if self.side_caches is None
+            else self._side_pages(starts, kwargs["slot_mapping_cpu"]).tolist()
+        )
         mem_fmt = MemoryFormat.KV_MLA_FMT if self.use_mla else MemoryFormat.KV_T2D
         assert self.gpu_buffer_allocator is not None
         tmp = self.gpu_buffer_allocator.allocate(
@@ -1736,7 +1810,13 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     self.gpu_kv_format,
                     token_major=True,
                 )
-                lmc_ops.batched_memcpy_d2h(tmp.tensor, addrs[layer_id], sizes)
+                lmc_ops.batched_memcpy_d2h(tmp.tensor, addrs[layer_id], kv_sizes)
+                if side is not None:
+                    lmc_ops.batched_memcpy_async(
+                        [a + n if a else 0 for a, n in zip(addrs[layer_id], kv_sizes)],
+                        side[layer_id],
+                        [self.side_bytes] * len(kv_sizes),
+                    )
             yield
             if sync:
                 self.store_stream.synchronize()

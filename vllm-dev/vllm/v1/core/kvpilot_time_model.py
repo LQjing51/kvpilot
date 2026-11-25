@@ -6,8 +6,11 @@ fit_times2.py fits it; utils/ssd_load_check/mixed_model.py checks it).
 For prefix p, suffix s, and D / X prefix tokens loaded from DRAM / SSD (the
 rest of the prefix hits HBM):
 
-  compute  the suffix runs in chunks of `chunk` tokens (chunked prefill); a
-           chunk of n tokens after context q costs
+  compute  the suffix runs in chunks of `chunk` tokens (chunked prefill;
+           hybrid models, `align` = the block size: as the scheduler splits
+           in mamba "align" mode, every chunk ends at a block boundary and
+           one ends at the prompt's last); a chunk of n tokens after context
+           q costs
              d_graph + b_graph * pad(n)          n <= the largest cudagraph
              d_eager + b_eager * n               otherwise
              + a * n * (q + n / 2) + e * q       attention
@@ -33,7 +36,8 @@ VERSION = 2
 COMPUTE = ("d_graph", "d_eager", "b_graph", "b_eager", "a", "e")
 
 
-def compute_features(p: float, s: float, chunk: int, capture: list) -> list:
+def compute_features(p: float, s: float, chunk: int, capture: list,
+                     align: int | None = None) -> list:
     """Per-chunk compute features, summed; the first chunk's separately.
 
     Returns:
@@ -42,8 +46,13 @@ def compute_features(p: float, s: float, chunk: int, capture: list) -> list:
     """
     first, rest = [0.0] * 6, [0.0] * 6
     q, left, j = p, s, 0
+    last = (p + s) // align * align if align else 0
     while left > 0:
         n = min(left, chunk)
+        if q + n < last:
+            n = n // align * align
+        elif q < last < q + n:
+            n = last - q
         out = first if j == 0 else rest
         pad = next((c for c in capture if n <= c), None)
         if pad is not None:
@@ -80,11 +89,13 @@ class TimeModel:
         # Scheduler settings the coefficients were fitted under.
         self.chunk = k["chunk"]
         self.capture = sorted(k["capture"])
+        # Hybrid models: chunks aligned to this block size (mamba "align").
+        self.align = k.get("align")
         # Tokens per block.
         self.block = block
 
     def _chunks(self, p: float, s: float) -> tuple[float, float]:
-        first, rest = compute_features(p, s, self.chunk, self.capture)
+        first, rest = compute_features(p, s, self.chunk, self.capture, self.align)
         dot = lambda f: sum(a * b for a, b in zip(f, self._comp))  # noqa: E731
         return dot(first), dot(rest)
 

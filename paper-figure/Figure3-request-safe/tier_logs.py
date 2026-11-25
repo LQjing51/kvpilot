@@ -65,10 +65,12 @@ def check(r, got, ret):
         return None
     if t == 1:
         return None if hit >= p and conn == 0 else "[1] source"
-    if hit != 0 or conn < p or len(ret) != 2:
+    if hit != 0 or conn < p or len(ret) != r.get("tp", 2):
         return f"[{t}] source"
-    want = (lambda c: 0) if t == 2 else (lambda c: LAYERS * c)
-    return None if all(c == p // BLOCK and v == want(c) for c, v in ret) else f"[{t}] source"
+    # Rows of runs before make_trace recorded the model: Qwen3-30B-A3B.
+    block, layers = r.get("block", BLOCK), r.get("kv_layers", LAYERS)
+    want = (lambda c: 0) if t == 2 else (lambda c: layers * c)
+    return None if all(c == p // block and v == want(c) for c, v in ret) else f"[{t}] source"
 
 
 def results(d, trace, logs=None):

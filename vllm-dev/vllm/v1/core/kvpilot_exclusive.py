@@ -2,21 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KVPilot exclusive-penalty-reqwise placement, scheduler side.
 
-Every prompt block keeps one copy, in the tier its session's next turn needs
-(kvpilot_claims: the fastest tier any head claims it for; HBM while a signal
-is pending):
+Every prompt block keeps one copy in HBM or DRAM, in the tier its session's
+next turn needs (kvpilot_claims: the fastest tier any head claims it for; HBM
+while a signal is pending). An SSD copy, once written, stays when the block
+moves up, so moving it back down writes nothing (SSD space is not short):
 
   * A prefill writes nothing below HBM. A freed request's blocks stay pinned
     in HBM, out of the free queue, until its signal arrives: a pending block
     is never evicted.
-  * HBM: the blocks stay; a copy an earlier turn left below is removed. They
+  * HBM: the blocks stay; a DRAM copy an earlier turn left is removed. They
     go back to the free queue as held blocks (kv_cache_utils), the only copy
-    of their KV: last in line, by penalty, never handed out as they are.
-  * DRAM / SSD: blocks not yet in that tier are written there (a copy in the
-    other lower tier is removed first), then their HBM copies are dropped. A
-    block already there only loses its HBM copy.
-  * No next turn: a block keeps the lower copy it has, or is written to SSD;
-    then its HBM copy goes.
+    of their KV above SSD: last in line, by penalty, never handed out as
+    they are.
+  * DRAM: blocks not in DRAM are written there, then their HBM copies are
+    dropped. A block already there only loses its HBM copy.
+  * SSD: blocks with an SSD copy lose their DRAM / HBM copies; the others
+    are written to SSD (a DRAM copy removed first), then lose their HBM copy.
+  * No next turn: nothing is written. A DRAM copy stays, first to demote
+    when DRAM fills; the HBM copy goes.
 
 The writes run on the prefill workers (LMCache, kvpilot_exclusive.py there),
 from HBM blocks that stay pinned until the job id comes back as a finished
@@ -57,8 +60,10 @@ from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.core import kvpilot_blockwise, kvpilot_placement
+from vllm.v1.core.kv_cache_utils import get_block_hash
 from vllm.v1.core.kvpilot_claims import Claims
 from vllm.v1.core.kvpilot_inclusive import full_prompt_blocks
+from vllm.v1.core.kvpilot_states import StatePins
 
 logger = init_logger(__name__)
 
@@ -72,7 +77,7 @@ class _Job:
     demote: bool
     pinned: list[Any]  # job pins: the blocks the write reads
     stored: list[tuple[Any, Any]]  # (block, hash) written below
-    dropped: list[Any]  # hashes whose lower copy the job removes
+    dropped: list[Any]  # hashes whose DRAM copy the job removes
 
 
 class ExclusivePlacement:
@@ -99,16 +104,22 @@ class ExclusivePlacement:
         self._cand_seq = itertools.count()
         self._connector = None
         self._claims = Claims()
-        # Block hash -> the lower tier holding its copy (DRAM / SSD).
+        # Block hash -> the fastest lower tier holding a copy: DRAM, else SSD.
         self._lower: dict[Any, str] = {}
+        # Block hashes with an SSD copy (kept while the block sits above).
+        self._ssd: set[Any] = set()
         # block_id -> (block, hash): tracked blocks pinned in HBM.
         self._pinned: dict[int, tuple[Any, Any]] = {}
         self._jobs: dict[str, _Job] = {}
         self._demoting = 0
-        # Hash -> jobs in flight removing its lower copy: not lent until they
+        # Hash -> jobs in flight removing its DRAM copy: not lent until they
         # finish (the copy a lend writes would be removed after it).
         self._dropping: Counter = Counter()
+        # Hash -> jobs in flight writing it below.
+        self._writing: Counter = Counter()
         self._ids = itertools.count()
+        # Hybrid models: states move nowhere; HBM holds them (kvpilot_states).
+        self.states = StatePins(block_pool)
         self.stats: Counter = Counter()
         self._last_log = time.monotonic()
         if reserve:
@@ -124,14 +135,20 @@ class ExclusivePlacement:
         them finish."""
         return bool(self._jobs)
 
+    def writing(self, h) -> bool:
+        """Whether a job in flight is writing block `h` below."""
+        return h in self._writing
+
     # ---- events -------------------------------------------------------------
 
-    def track(self, request_id: str, block_groups, token_ids) -> None:
+    def track(self, request_id: str, block_groups, token_ids, states=None) -> None:
         """A request freed its blocks: it becomes its session's head, and its
-        blocks stay pinned in HBM until the signal arrives."""
+        blocks stay pinned in HBM until the signal arrives. `states`: the
+        state at its prompt's end (hybrid models)."""
         blocks = full_prompt_blocks(block_groups, len(token_ids), self._block_size)
         if not blocks:
             return
+        self.states.track(blocks, states)
         lmc = self._connector.kvpilot_chunk_hashes(request_id, token_ids, len(blocks))
         if lmc is None:
             raise RuntimeError(f"KVPilot: no LMCache chunk hashes for {request_id}")
@@ -146,6 +163,8 @@ class ExclusivePlacement:
         `suffix` distribution (blockwise: each block to its own)."""
         if self._model is None or tier is None:
             head = self._claims.signal(request_id, tier, time_ms)
+            if tier is None:
+                self.states.release(get_block_hash(head.hashes[-1]))
         elif not suffix:
             raise RuntimeError(f"KVPilot signal for {request_id}: no suffix")
         elif self._blockwise:
@@ -248,6 +267,10 @@ class ExclusivePlacement:
             self._dropping[h] -= 1
             if not self._dropping[h]:
                 del self._dropping[h]
+        for _, h in job.stored:
+            self._writing[h] -= 1
+            if not self._writing[h]:
+                del self._writing[h]
         if job.pinned:
             self._pool.free_blocks(list(reversed(job.pinned)))
         dropped = 0
@@ -292,10 +315,12 @@ class ExclusivePlacement:
     # ---- placement ----------------------------------------------------------
 
     def _reconcile(self, head) -> dict:
+        # drop: DRAM copies to remove (an SSD copy is never removed).
         drop: list[int] = []
         store: dict[str, list[int]] = {"DRAM": [], "SSD": []}
         zero: list[int] = []
         now_release = []
+        free_now = []
         hold = []
         for i, (b, h) in enumerate(zip(head.blocks, head.hashes)):
             if b.block_hash != h:
@@ -303,29 +328,40 @@ class ExclusivePlacement:
             lower = self._lower.get(h)
             want = self._claims.required(h)
             if want == "HBM":
-                if lower is not None:
+                if lower == "DRAM":
                     drop.append(i)
-                    del self._lower[h]
+                    self._drop_dram(h)
                 if not self._pending(h):
                     hold.append((b, h))
                 continue
-            if lower is not None and (want is None or lower == want):
-                # Nobody needs it soon, or it already sits where it should.
-                if want is None and lower == "DRAM":
+            if want is None:
+                # No next turn: nothing is written.
+                if lower == "DRAM":
                     # First to demote to SSD when DRAM fills up.
                     zero.append(i)
+                (free_now if lower is None else now_release).append((b, h))
+                continue
+            if lower == want or (want == "SSD" and h in self._ssd):
+                # Already sits where it should (SSD: a DRAM copy goes).
+                if want == "SSD" and lower == "DRAM":
+                    drop.append(i)
+                    self._drop_dram(h)
                 now_release.append((b, h))
                 continue
-            if lower is not None:
+            if lower == "DRAM":
                 drop.append(i)
-            dest = want or "SSD"
-            store[dest].append(i)
-            self._lower[h] = dest
+            store[want].append(i)
+            self._lower[h] = want
+            if want == "SSD":
+                self._ssd.add(h)
         released = 0
         for b, h in now_release:
             self._unpin(b)
             released += self._release(b, h)
         self.stats["hbm_dropped_now"] += released
+        for b, h in free_now:
+            self._unpin(b)
+            self.stats["hbm_freed_no_next"] += self._free(b, h)
         # Tail first, as a request frees: within a penalty the tail goes first.
         for b, h in reversed(hold):
             self._unpin(b)
@@ -357,13 +393,21 @@ class ExclusivePlacement:
             "write_ssd": len(store["SSD"]),
             "drop": len(drop),
             "hbm_released": released,
+            "hbm_freed": len(free_now),
             "job": job_id,
         }
+
+    def _drop_dram(self, h) -> None:
+        """Block h's DRAM copy is being removed; an SSD copy stays below."""
+        if h in self._ssd:
+            self._lower[h] = "SSD"
+        else:
+            del self._lower[h]
 
     def _plan_held(self, n: int, own, lend: bool) -> list:
         """Up to n held blocks to move to DRAM, cheapest to expose first,
         never one of the admitted request's own prefix hits (`own`) and, for a
-        lend, none whose lower copy a job still removes. Blockwise takes only
+        lend, none whose DRAM copy a job still removes. Blockwise takes only
         a head's last HBM block (HBM stays a prefix), keyed by what its move
         adds, the next one after it. Plans only; _commit_held applies.
         Returns (block, hash, head, index) tuples."""
@@ -487,11 +531,12 @@ class ExclusivePlacement:
 
     def _hbm_penalty(self, h) -> float:
         """Exposed load added by moving block `h` from HBM to DRAM: the most
-        any head needing it in HBM would gain (all signalled)."""
+        any head needing it in HBM would gain (all signalled); none, nothing."""
         return max(
-            kvpilot_placement.penalties(head.time)[0]
-            for head in self._claims.claimants(h)
-            if head.tier == "HBM"
+            (kvpilot_placement.penalties(head.time)[0]
+             for head in self._claims.claimants(h)
+             if head.tier == "HBM"),
+            default=0.0,
         )
 
     def _dram_penalty(self, h) -> float:
@@ -503,10 +548,13 @@ class ExclusivePlacement:
                  for g in self._claims.claimants(h) if g.tier == "B"),
                 default=0.0,
             )
+        # No head needing it in DRAM or faster (a shared block whose HBM head
+        # was superseded): moving it exposes nothing.
         return max(
-            kvpilot_placement.penalties(head.time)[1]
-            for head in self._claims.claimants(h)
-            if head.tier in ("HBM", "DRAM")
+            (kvpilot_placement.penalties(head.time)[1]
+             for head in self._claims.claimants(h)
+             if head.tier in ("HBM", "DRAM")),
+            default=0.0,
         )
 
     def _send(self, *, demote, lmc, blocks, drop, dram, ssd, dram_pen, req, tier, zero=(),
@@ -520,6 +568,7 @@ class ExclusivePlacement:
         self._jobs[job_id] = _Job(
             demote, written, [(b, b.block_hash) for b in written], dropped
         )
+        self._writing.update(b.block_hash for b in written)
         self._connector.kvpilot_exclusive_submit({
             "id": job_id,
             "req": req,
@@ -540,9 +589,16 @@ class ExclusivePlacement:
         """Drop a free block's HBM copy once a copy below holds it, unless a
         head still wants it in HBM (a demotion drops it anyway: that is the
         eviction)."""
-        if block.ref_cnt != 0 or block.block_hash != h or h not in self._lower:
+        if h not in self._lower:
             return False
         if not force and self._claims.required(h) == "HBM":
+            return False
+        return self._free(block, h)
+
+    def _free(self, block, h) -> bool:
+        """Drop a free block's HBM copy (still in use by a running request:
+        it pins the block again when it frees it)."""
+        if block.ref_cnt != 0 or block.block_hash != h:
             return False
         if not self._pool.kvpilot_uncache(block):
             return False
@@ -568,8 +624,11 @@ class ExclusivePlacement:
         lower = Counter(self._lower.values())
         logger.info(
             "KVPilot exclusive heads=%d jobs_in_flight=%d pinned=%d held=%d "
-            "demoting=%d lower DRAM/SSD=%d/%d free=%d hbm_candidates=%d stats=%s",
+            "demoting=%d lower DRAM/SSD=%d/%d ssd_copies=%d free=%d hbm_candidates=%d "
+            "states=%d stats=%s",
             len(self._claims.heads), len(self._jobs), len(self._pinned),
             len(self._queue.held()), self._demoting, lower["DRAM"], lower["SSD"],
-            self._pool.get_num_free_blocks(), len(self._cand), dict(self.stats),
+            len(self._ssd),
+            self._pool.get_num_free_blocks(), len(self._cand), len(self.states),
+            dict(self.stats),
         )

@@ -54,27 +54,97 @@ Z = 3.0
 G = {}  # sess, plans, pools, args: set before the workers fork
 
 
-def build(order, sess, k, mid, rng, cap):
-    queue, active, out = deque(order), deque(), []
+def build_hot(order, sess, k, mid, rng, cap, hot, frac):
+    """Two round-robins: `hot` fast sessions send `frac` of the requests (a
+    turn comes back after ~hot / frac requests), K slow ones the rest (every
+    ~K / (1 - frac)). A finished session is replaced by the pool's next in
+    the same group."""
+    queue, out = deque(order), []
+    groups = [deque(), deque()]
 
     def admit(first):
         s = queue.popleft()
-        active.append([s, rng.randrange(len(sess[s]) - 1) if first and mid else 0])
+        return [s, rng.randrange(len(sess[s]) - 1) if first and mid else 0]
+
+    for g, n in ((0, hot), (1, k)):
+        for _ in range(min(n, len(queue))):
+            groups[g].append(admit(True))
+    while any(groups) and len(out) < cap:
+        g = 0 if (rng.random() < frac and groups[0]) or not groups[1] else 1
+        cur = groups[g].popleft()
+        out.append(tuple(cur))
+        cur[1] += 1
+        if cur[1] < len(sess[cur[0]]):
+            groups[g].append(cur)
+        elif queue:
+            groups[g].append(admit(False))
+    return out
+
+
+def build(order, sess, k, mid, rng, cap, rand=0, stick=0.0, hot=0, frac=0.0):
+    """K sessions at a time, each sending its turns in order.
+    rand 0: round-robin, every turn's reuse distance is K;
+    rand -1: each request from an active session drawn at random;
+    rand w > 1: from the first w sessions of the round-robin queue at random,
+    the chosen one back at its tail, so reuse distances spread around K.
+    stick: the chance that a session sends its next turn right away (a burst
+    of tool calls), ahead of the order above.
+    hot > 0: build_hot (rand and stick unused)."""
+    if hot:
+        return build_hot(order, sess, k, mid, rng, cap, hot, frac)
+    queue, active, out = deque(order), deque(), []
+    if stick:
+        base = build(order, sess, k, mid, rng, cap, rand)
+        # Merge each session's turns forward: after a turn, with probability
+        # `stick`, its session's next turn (from later in the trace) follows.
+        nxt = {}
+        for t, (s, j) in enumerate(base):
+            nxt[(s, j)] = t
+        taken, out = set(), []
+        for t, (s, j) in enumerate(base):
+            if t in taken:
+                continue
+            out.append((s, j))
+            while rng.random() < stick and nxt.get((s, j + 1), -1) > t and nxt[(s, j + 1)] not in taken:
+                j += 1
+                taken.add(nxt[(s, j)])
+                out.append((s, j))
+        return out[:cap]
+
+    def admit(first):
+        s = queue.popleft()
+        return [s, rng.randrange(len(sess[s]) - 1) if first and mid else 0]
 
     for _ in range(min(k, len(queue))):
-        admit(True)
+        active.append(admit(True))
     while active and len(out) < cap:
-        cur = active.popleft()
+        if rand == -1:
+            i = rng.randrange(len(active))
+            cur = active[i]
+            out.append(tuple(cur))
+            cur[1] += 1
+            if cur[1] >= len(sess[cur[0]]):
+                if queue:
+                    active[i] = admit(False)
+                else:
+                    del active[i]
+            continue
+        if rand > 1:
+            i = rng.randrange(min(rand, len(active)))
+            cur = active[i]
+            del active[i]
+        else:
+            cur = active.popleft()
         out.append(tuple(cur))
         cur[1] += 1
         if cur[1] < len(sess[cur[0]]):
             active.append(cur)
         elif queue:
-            admit(False)
+            active.append(admit(False))
     return out
 
 
-def candidate(pool, k, mid, seed, cap):
+def candidate(pool, k, mid, seed, cap, rand=0, stick=0.0, hot=0, frac=0.0):
     """pool 0: every session in swe_full's order; else the top pool % by
     blockwise HBM demand, shuffled by seed."""
     sess = G["sess"]
@@ -84,7 +154,7 @@ def candidate(pool, k, mid, seed, cap):
     else:
         order = list(G["pools"][pool])
         rng.shuffle(order)
-    return build(order, sess, k, mid, rng, cap)
+    return build(order, sess, k, mid, rng, cap, rand, stick, hot, frac)
 
 
 def next_suffixes(trace):
@@ -179,7 +249,9 @@ def main():
     if a.write:
         kv = dict(x.split("=") for x in a.write.split(","))
         trace = candidate(int(kv["pool"]), int(kv["k"]), int(kv["mid"]), int(kv["seed"]),
-                          a.n or a.cap)
+                          a.n or a.cap, rand=int(kv.get("rand", 0)),
+                          stick=float(kv.get("stick", 0)), hot=int(kv.get("hot", 0)),
+                          frac=float(kv.get("frac", 0)))
         gtc.pos = set(trace)
         gt.write(a.out, trace, sess)
         table = ROOT / f"utils/placement_ab/signal_{a.out.stem}.json"

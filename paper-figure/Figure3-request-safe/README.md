@@ -139,3 +139,122 @@ t_dram, t_ssd)，是 penalty placement 用的时间模型，A/B 时经 `KVPILOT_
 `python3 plot_boundary.py` 现场在 `raw/swe/` 上重新拟合（并打印是否与 `fit_times_swe.json` 一致），画出
 `model_safe_boundary.pdf`。边界 = 每个 prefix 下，预测的 t_hbm 把该介质的加载盖到 5% 以内的最短 suffix
 （`fit_times.bounds`，SSD 边界不低于 DRAM 边界）；prefix 画到 72K，不超出 `raw/swe/` 最大的 prefix（74240）。
+
+## Qwen3.6 TP4（2026-11-23）
+
+测量已完成，本地日志在 `raw/qwen3.6-tp4/swe_blockprio_k160/`。1P1D，Qwen3.6-35B-A3B，TP4，block 1024，
+10 个全注意力层；线性注意力状态始终在 HBM，只有 KV 从指定层复用。`GPU_MEM_UTIL=0.9`，prefill cudagraph
+`[64,128,256,512,1024]`，SSD offload 开、读带宽不限。北京时间 19:12:36 开始回放，19:33:15 回放结束，
+19:33:26 完成归档和清理；4420 个请求成功、0 请求错误、0 prefill ERROR。3315 次来源检查全部通过，无需重测。
+
+共 1105 组完整的 HBM / DRAM / SSD 测量；实测 safe tier 为 HBM 54、DRAM 956、SSD 95。
+三层 prefill e2e 的均值分别为 77.96 / 78.46 / 134.08 ms。这不是五种 placement 的 A/B 结果。
+
+TP4 系数为 `fit_times2_qwen3.6-tp4_k160.json`，拟合沿用 `fit_times2.py` 的 suffix <= 8192 过滤，共 1095 组。
+以下为拟合数据上的误差，不是独立验证集误差：
+
+| 来源 | 绝对相对误差 p50 | p90 |
+|---|---|---|
+| HBM | 3.6% | 9.1% |
+| DRAM | 3.8% | 9.8% |
+| SSD | 4.6% | 12.5% |
+
+```bash
+python3 fit_times2.py --raw raw/qwen3.6-tp4 --datasets swe_blockprio_k160 \
+    --block 1024 --align --out fit_times2_qwen3.6-tp4_k160.json
+cd ../../utils/placement_ab
+python3 make_req_table.py ../../datasets/block-priority-trace/swe_blockprio_k160.jsonl \
+    raw/qwen3.6-tp4/swe_blockprio_k160 signal_swe_blockprio_k160_b1024.json
+python3 add_next_suffix.py ../../datasets/block-priority-trace/swe_blockprio_k160.jsonl \
+    signal_swe_blockprio_k160_b1024.json --block 1024 --drops-last
+cd ../..
+python3 datasets/block-priority-trace/sim_placement.py \
+    --trace datasets/block-priority-trace/swe_blockprio_k160.jsonl \
+    --model qwen3.6-tp4 --strategies lru,belady,incp,exclu,exclb --skip 160
+```
+
+判据表共 1300 行，`next_suffix` 按 TP4 的块边界及 P 少算最后一个 token 的规则生成；tier 和时间均来自本次 TP4
+实测，不沿用 TP2 或 Qwen3-30B。系数和判据表已在本地产出，尚未上传 GPU。
+
+**默认容量的模拟没有拉开五组**：HBM 6912 块、每 rank DRAM 100 GiB（0.9 水位）、去掉前 160 行预热，剩余 1140 条
+中 LRU / Belady / incp 的复用前缀全部命中 HBM。LRU 每轮结束时的 KV 加状态占用峰值为 6716 块，没有缓存淘汰压力。
+五组模拟 prefill e2e 均值依次为 74.4 / 74.5 / 74.5 / 75.3 / 76.1 ms。
+模拟 TTFT 中 exclusive 出现的约 3%–5% 优势主要来自沿用 Qwen3-30B 的前后处理开销模型，不能当成 TP4 的放置收益。
+TP4 的放置上限是够的：同一批 1105 组里 prefix 全从 SSD 比全在 HBM 平均慢 72%（TP2 只有 8.4%），全从 DRAM 慢 0.6%。
+缺的是容量压力，所以五组 A/B 改用默认容量下各模型共用的 `sweblock512`（pool 10、K 512、4000 条），判据表用这份 TP4
+时间模型算（`make_model_table.py`，k160 上与实测 tier 一致 84%），见
+[block-priority-trace README](../../datasets/block-priority-trace/README.md) 末节。
+
+## Qwen3.8-Flash-Next（TP 4，2026-11-24）
+
+日志 `raw/qwen3.8/swe_blockprio_k160/`。1P1D，TP 4，块 1024，12 个 QSA 层（value 带 indexer 压缩 key 的侧页，见
+[docs/kv-placement.md](../../docs/kv-placement.md)「Qwen3.8」），状态只在 HBM。配置同 Qwen3.6 TP4（`GPU_MEM_UTIL=0.9`、
+prefill cudagraph `[64,128,256,512,1024]`、SSD offload、读带宽不限），不开专家并行。GPU 上从 `/root/q38` 跑：
+
+```bash
+python3 make_trace.py swe_blockprio_k160 --model qwen3.8 --raw raw/qwen3.8 --stop 1300 --stride 3
+ROOT=/root/q38 RAW=raw/qwen3.8 TP_SIZE=4 MODEL=/root/models/Qwen/Qwen3.8-Flash-Next-FP8 \
+    bash raw/run_one.sh swe_blockprio_k160          # GPU 上
+python3 fit_times2.py --raw raw/qwen3.8 --datasets swe_blockprio_k160 --block 1024 --align \
+    --out fit_times2_qwen3.8_k160.json
+```
+
+**每 3 行取 1 行**（`--stride 3`，369 行、1476 个请求）：这个模型 prefill 很慢（冷算 12K token 1.25 s），整条 k160
+要 2 小时以上；取样后 20 分钟（UTC 16:45–17:05）。1476 个请求全部成功，来源核对全部通过，无需重测。
+
+| | 行数 | HBM safe | DRAM safe | SSD safe | prefill e2e 均值 HBM / DRAM / SSD |
+|---|---|---|---|---|---|
+| Qwen3.8 TP4 | 369 | 2.2% | 47.7% | 50.1% | 217.6 / 216.3 / 244.6 ms |
+| Qwen3.6 TP4（对照） | 1105 | 4.9% | 86.5% | 8.6% | 78.0 / 78.5 / 134.1 ms |
+
+prefix 全从 SSD 只比全在 HBM 慢 12%（Qwen3.6 TP4 72%）：每千 token 计算约 85 ms（加 31 ms 固定），SSD 加载每千
+token 4.2 ms，DRAM 0.37 ms，大多被盖住。拟合（366 组，拟合数据上的误差，不是独立验证集）：
+
+| 来源 | 绝对相对误差 p50 | p90 | 偏差 |
+|---|---|---|---|
+| HBM | 2.9% | 7.2% | −1.2% |
+| DRAM | 2.8% | 6.9% | −1.4% |
+| SSD | 3.1% | 7.4% | −0.4% |
+
+系数 `fit_times2_qwen3.8_k160.json`（`align=1024`），Eval-EXP1 第一轮的 Qwen3.8 判据表和模拟器用它；第二轮起换成
+下节开专家并行的那份。
+
+## Qwen3.6 FP8 TP 2、Qwen3.8 开专家并行（2026-11-25）
+
+Eval-EXP1 第二轮所有模型都开专家并行，Qwen3.6 换成官方 FP8 权重（`Qwen3.6-35B-A3B-FP8`，KV 仍是 BF16）跑 TP 2，
+两个模型重测 request-safe。FP8 的 MoE 在专家并行下走 FlashInfer CUTLASS（`docs/pitfalls.md`「FP8 模型开专家并行」）。
+其余配置同上两节。
+
+```bash
+python3 make_trace.py swe_blockprio_k160 --model qwen3.6 --raw raw/qwen3.6-fp8 --stop 1300 --stride 2
+MODEL=/cfs_cloud_code/kiry/model/Qwen/Qwen3.6-35B-A3B-FP8 TP_SIZE=2 RAW=raw/qwen3.6-fp8 \
+    bash raw/run_one.sh swe_blockprio_k160          # GPU 上
+MODEL=/root/models/Qwen/Qwen3.8-Flash-Next-FP8 TP_SIZE=4 RAW=raw/qwen3.8-ep \
+    bash raw/run_one.sh swe_blockprio_k160          # GPU 上；trace 同上节（--stride 3）
+python3 fit_times2.py --raw raw/qwen3.6-fp8 --datasets swe_blockprio_k160 --block 1536 --align \
+    --out fit_times2_qwen3.6-fp8_k160.json
+python3 fit_times2.py --raw raw/qwen3.8-ep --datasets swe_blockprio_k160 --block 1024 --align \
+    --out fit_times2_qwen3.8-ep_k160.json
+```
+
+Qwen3.6 FP8：541 行、2164 个请求，UTC 18:00–18:13；Qwen3.8：369 行、1476 个请求，UTC 18:46–19:05。两次都全部成功、
+0 prefill ERROR，来源核对全部通过。
+
+| | 行数 | HBM safe | DRAM safe | SSD safe | prefill e2e 中位 HBM / DRAM / SSD |
+|---|---|---|---|---|---|
+| Qwen3.6 FP8 TP2 | 541 | 1.8% | 50.1% | 48.1% | 81.6 / 82.2 / 95.6 ms |
+| Qwen3.8 TP4 开专家并行 | 369 | 3.3% | 65.9% | 30.9% | 149.2 / 147.7 / 181.7 ms |
+| Qwen3.8 TP4 不开（上节） | 369 | 2.2% | 47.7% | 50.1% | 163.5 / 162.9 / 189.7 ms |
+
+这里用中位数：Qwen3.8 开专家并行时有 8 个点的 HBM 测量慢了 0.3–2.7 s，都在回放最开始（第 0–30 个点和第 82 个），是第一次
+碰到某个 token 数时的一次性开销，均值会被它们拉歪。拟合（拟合数据上的误差）：
+
+| | HBM p50 / p90 | DRAM p50 / p90 | SSD p50 / p90 |
+|---|---|---|---|
+| Qwen3.6 FP8 TP2 | 4.2% / 11.4% | 4.3% / 12.0% | 5.2% / 10.7% |
+| Qwen3.8 开专家并行 | 3.2% / 7.8% | 2.8% / 7.7% | 2.9% / 8.2% |
+
+和不开专家并行、BF16 的对照比：Qwen3.6 FP8 TP2 每千 token 计算 27.6 ms（BF16 TP2 30.8），SSD 加载 1.73 ms（BF16 TP2
+1.73），也就是 SSD 加载只占计算的 6%，TP 4 时 KV 头复制、四张卡一起读盘才是 20%；Qwen3.8 开专家并行后每千 token
+计算从 86.6 ms 降到 74.5 ms（512 个专家切到 4 张卡上），SSD 加载不变（4.0 ms）。系数 `fit_times2_qwen3.6-fp8_k160.json`
+（`align=1536`）、`fit_times2_qwen3.8-ep_k160.json`（`align=1024`），Eval-EXP1 第二轮的判据表和模拟器用它们。

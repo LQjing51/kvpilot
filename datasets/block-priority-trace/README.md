@@ -10,6 +10,8 @@
 | `search_trace.py` | 用模拟器在 `swe_full` 里搜「最少请求就能分开各策略」的 trace，见末节 |
 | `swe_blockprio.jsonl` | 从 `agent-traces/swe-smith-trajectories/swe_full.jsonl` 生成，判据表 `utils/placement_ab/signal_swe_blockprio.json` |
 | `swe_blockprio_k160.jsonl` | `search_trace.py` 给默认 HBM 挑的短 trace（1300 条，前 160 条预热），判据表 `signal_swe_blockprio_k160.json` |
+| `swe_blockprio_k512.jsonl` | 各模型共用的 trace（4000 条，前 512 条预热），判据表 `signal_swe_blockprio_k512.json`（Qwen3-30B）、`_b1024.json`（Qwen3.6 TP4），见末节 |
+| `search_trace_models.py` | 同一条候选 trace 在几个模型（`sim_placement.PROFILES`）各自的默认容量下模拟 |
 
 ## swe_blockprio：blockwise 下 HBM 和 DRAM 也满
 
@@ -44,15 +46,18 @@ python3 sim_placement.py --strategies lru,incp --logs lru=<dynamo-log 目录> in
 
 按 trace 顺序逐条请求模拟（模型和不模拟的部分写在脚本开头）：块按「内容 + 前缀链」识别；请求先读 HBM 里连续的前缀，
 再在 DRAM、SSD 里接着读；prefill 时间用时间模型（`fit_times2_swe.json`）。HBM / DRAM 按各策略的键淘汰，DRAM 超水位时
-inclusive 一次删一成；exclusive 和 master 一样每轮最多下沉 85 块（`kKvpExclMaxInflight` 8192 个 value），直到回到水位以下，
-所以 DRAM 一直贴着水位。时钟按回放推进（首 token 到了才发下一条），判据在这一轮 decode 结束（输出 token × `--tpot`）
-后到达；exclusive 往下写走一个串行 writer（每个 job 4.9 ms + 每块 DRAM 1.0 ms / SSD 25 ms，由真机 job 日志拟合），
-写完块才离开 HBM，放不下时等写完或等判据。
+inclusive 一次删一成，exclusive 一次下沉 / 删掉一成（2026-11-25 前是每轮最多下沉 85 块、贴着水位，和真机 master 不符）。
+时钟按回放推进（首 token 到了才发下一条），判据在这一轮 decode 结束（输出 token × `--tpot`）后 `signal_ms` 到达，
+早于同 session 下一轮的命中判定；exclusive 往下写走一个串行 writer（每个 job 的耗时按模型的 `job`，由真机 job 日志拟合），
+写完块才离开 HBM、往 SSD 写的块写完才在 SSD 上：写完前到达的请求等写完（LMCache 的 `KVPilot hybrid / exclusive wait`；
+非混合模型 2026-11-25 之前不等、从那里起重算）；放不下时等写完或等判据。exclusive 的 prefill 比时间模型快的部分（不 write-through）按 `excl_save`
+扣掉。这几处是 2026-11-25 对照 Eval-EXP1 第二轮真机查出来的，见 `paper-figure/Eval-EXP1/README.md`「第二轮 SWE 结果」。
 
 **TTFT**（`done − sent`）= 准入前开销 + P 上排队 + 分配阻塞 + prefill e2e：
 - 发送：上一条的首 token 到客户端后 0.6 ms（`-p 1 --release-at-first-token`），或同 session 上一轮 decode 完；
 - 准入前开销（前端、查找）：约 6 ms + 每千 token（新算、HBM、DRAM、SSD 分别计价）约 1 ms；HBM、DRAM 命中的 token
-  inclusive 要 1.3 / 1.4 ms，exclusive 只要 0.9 / 1.0 ms（HBM 600 和 2361 两种容量下一致），按两族分别拟合（8 组真机，残差 sd 5–7 ms）；
+  inclusive 要 1.3 / 1.4 ms，exclusive 只要 0.9 / 1.0 ms（HBM 600 和 2361 两种容量下一致），按两族分别拟合（8 组真机，残差 sd 5–7 ms）。
+  这是 Qwen3-30B 的；Qwen3.6 FP8、Qwen3.8 用各自的 `pre`（约 5 ms + 每千 prompt token 0.27 / 0.37 ms，和放置无关）；
 - P 上排队：P 一次只做一个 prefill，到达时上一条还没算完才排；`-p 1` 下首 token 要等 P 算完，所以恒为 0，真机也是 0；
 - 分配阻塞：exclusive 系列 HBM 不够时等写回或判据；
 - P 算完到客户端首 token：52.9 ms + 每千 token 0.97 ms + 一个 `--tpot`（D 拉 KV、第一步 decode）。
@@ -114,3 +119,39 @@ A/B：`run_ab.sh <arm> sweblock160`，HBM 用默认。真机结果（第 160 条
 inclusive-penalty −19.6%，unblocking −26.5%，blockwise −28.0%；LRU、belady、inclusive-penalty、blockwise 的 TTFT 和模拟差
 不到 4 ms，unblocking 真机比模拟快 8.4 ms，所以 blockwise 对 unblocking 只差 3.7 ± 2.4 ms（模拟 11.3 ms）。逐对结果见
 `docs/kv-placement.md`「A/B」。
+
+## swe_blockprio_k512：各模型共用一条 trace
+
+```bash
+python3 search_trace_models.py --models qwen3-30b,qwen3.6-tp4 --ks 256,384,512,768 --pools 20,10,5 --jobs 3
+python3 search_trace.py --write pool=10,k=512,mid=1,seed=0 --n 4000 --out swe_blockprio_k512.jsonl
+cd ../../utils/placement_ab && python3 make_model_table.py ../../datasets/block-priority-trace/swe_blockprio_k512.jsonl \
+    ../../paper-figure/Figure3-request-safe/fit_times2_qwen3.6-tp4_k160.json signal_swe_blockprio_k512_b1024.json --block 1024 --drops-last
+```
+
+`--jobs` 别开太多：每个进程 1 GB 以上，本机 32 GB 开 10 个会把 swap 用满。
+
+要求所有模型（Qwen3-30B TP2、Qwen3.6 TP4，以及还跑不起来的 Qwen3.8-Flash-Next）在默认容量下用同一条 trace 都有收益。
+按 token 算的容量差很多：Qwen3-30B HBM 121 万 / DRAM 197 万，Qwen3.6 TP4 708 万 / 944 万（每 rank 每 token KV 10 KiB，
+Qwen3-30B 48 KiB）。所以 K 有上下限：
+
+- **下限（Qwen3.6 TP4）**：活跃 session 最新 prompt 之和要超过它的 DRAM，LRU 才读 SSD；轮转回放下 LRU 是断崖式的，pool 10
+  时 K 256 全从 DRAM 读，K 384 一半 SSD，K 512 全 SSD。Qwen3.6 TP2 加载几乎全被计算盖住，K 多大都只差约 2%。
+- **上限（Qwen3.8 估算）**：HBM 约 2700 块（FP8 权重 TP4 每卡约 45 GB 后剩的约 36 GB），每个持有的状态 3 块，K 640 时
+  状态就占 1920 块，exclusive 腾不出块、TTFT 涨几倍。
+- **Qwen3-30B 的收益随 K 变小**：LRU 从 K 160 起就 98% 从 SSD 读，变不了更差；DRAM 装得下活跃 prompt 的比例从 47%（K 160）
+  降到 14%（K 512），blockwise 从 DRAM 读的比例从 50% 降到 15%，收益从 −29% 降到 −13%。
+
+各策略持有的线性注意力状态相同（LRU 和 belady 一样按 trace 持有，见 `docs/kv-placement.md`「混合模型」），否则 LRU 压力
+一大就丢状态整段重算，差距是状态保留而不是放置。模拟（第 512 条以后，3488 条；TTFT ms，括号是 prefix 从 HBM / DRAM /
+SSD 的 %）：
+
+| | LRU | belady | inclusive-penalty | unblocking | blockwise |
+|---|---|---|---|---|---|
+| Qwen3-30B | 283.6（2/0/98） | −5.0% | −6.3% | −6.5% | −12.6%（7/15/78） |
+| Qwen3.6 TP4 | 166.1（0/0/100） | −21.5% | −22.9% | −33.7% | −32.6%（8/68/25） |
+
+Qwen3.6 TP4 的准入开销系数是 Qwen3-30B 上标定的；exclusive 与 inclusive 用同一组系数时 unblocking / blockwise 是 −28.1% /
+−28.2%（blockwise 对 belady / inclusive-penalty −8.6% / −6.9%）。Qwen3.8 按 Qwen3.6 TP4 的时间模型缩放（加载 ×1.28，稀疏注意力只看 2048，
+计算 ×1 或 ×2）估算 blockwise 对 LRU −25% / −16%，对 belady / inclusive-penalty 只约 −2%；它的 HBM 若实际不到约 2200 块，
+K 512 也会撑不住，得退到 pool 5、K 384。回放每臂约 40 分钟（Qwen3-30B）/ 21 分钟（Qwen3.6 TP4）。

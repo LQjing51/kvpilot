@@ -50,11 +50,8 @@ class Backend:
     def kvpilot_put_revoke(self, names):
         return [0] * len(names)
 
-    def kvpilot_remove(self, names):
+    def kvpilot_remove_memory(self, names):
         self.removed += names
-        return [0] * len(names)
-
-    def kvpilot_remove_local_disk(self, names):
         return len(names)
 
     def kvpilot_exist(self, names):

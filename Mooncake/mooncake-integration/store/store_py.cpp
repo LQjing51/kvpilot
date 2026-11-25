@@ -2351,6 +2351,20 @@ PYBIND11_MODULE(store, m) {
             "buckets left empty. Returns how many keys it held, -1 without SSD "
             "offload.")
         .def(
+            "batch_remove_memory_replicas",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) -> int64_t {
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real_client) return -1;
+                py::gil_scoped_release release;
+                return real_client->batch_remove_memory_replicas(keys);
+            },
+            py::arg("keys"),
+            "KVPilot: drop keys' memory replicas, keeping disk ones (a chunk "
+            "leaving DRAM). Returns how many keys the master processed, -1 "
+            "without a client.")
+        .def(
             "batch_offload_local",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,

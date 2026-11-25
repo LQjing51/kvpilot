@@ -17,13 +17,15 @@ logger = logging.getLogger(__name__)
 class KvpilotReporter:
     """Computes each finished turn's signal and sends it to the prefill worker."""
 
-    def __init__(self, tokenizer, prefill_client):
+    def __init__(self, tokenizer, prefill_client, block_size: int):
         # Ships with vLLM next to the placement it feeds, so both sides share
         # one definition of the signal.
         from vllm.v1.core import kvpilot_signal
 
-        self._signal = kvpilot_signal
-        self._source = kvpilot_signal.from_env()
+        # The prefill side's block size: the launch scripts give both sides
+        # the same one.
+        self._block = block_size
+        self._source = kvpilot_signal.from_env(block_size)
         self._tokenizer = tokenizer
         self._client = prefill_client
         logger.info("KVPilot signal source: %s", type(self._source).__name__)
@@ -37,7 +39,7 @@ class KvpilotReporter:
         remote_request_id = kv_params["remote_request_id"]
         worker_id = int(request["routing"]["prefill_worker_id"])
         prompt_len = len(request["token_ids"])
-        if prompt_len < self._signal.BLOCK:
+        if prompt_len < self._block:
             # No full prompt block: the prefill side tracked nothing.
             return
         token_ids = accumulated_token_ids.get(0) or []

@@ -50,6 +50,17 @@ mkdir -p $D && cd $S && nohup setsid bash -c "ls | xargs -P 16 -I{} cp {} $D/{};
 
 `run_ab.sh`、`run_one.sh`、`dynamo_script.sh` 都读 `MODEL` 环境变量，起服务前 `export MODEL=$D` 即可。
 
+Qwen3.8-Flash-Next-FP8（173 GiB）在 `/root/models/Qwen/Qwen3.8-Flash-Next-FP8`（CFS 上也有一份），从本地盘起服务。
+
+### 另一份代码：/root/q38
+
+2026-11-23 起，Qwen3.8 的接入和 Eval-EXP1 都在 `/root/q38` 下跑（`vllm-dev`、`lmcache-dev`、`dynamo-dev`、`utils`、
+`paper-figure/Figure3-request-safe`、`paper-figure/Eval-EXP1`，从本机同步），`/root/kvpilot` 保持原样。脚本用
+`ROOT=/root/q38` 切过去（`run_one.sh`、`run_ab.sh`、`run_check.sh`、`run_exp1.sh`）。它的 LMCache `c_ops`（带侧页和
+`batched_memcpy_async`）编在 `/root/q38/lmcache-dev/build/`，装在包目录 `/root/q38/lmcache-dev/lmcache/` 而不是
+`dist-packages`：`lmcache/__init__.py` 用 `extend_path`，`PYTHONPATH` 在前的那份先被找到，`/root/kvpilot` 仍用全局那份。
+换 `.so` 时先拷成 `.new` 再 `mv`，正在跑的进程继续用旧文件。
+
 ### 补 PYTHONPATH
 
 仓库的 Python 代码不是 pip 安装的，**只靠 `PYTHONPATH` 生效**。新机器的 `.bashrc` 里没有它：
@@ -70,7 +81,7 @@ EOF'
 
 | 组件 | 改了什么 | 装在哪 | KVPilot 标记 |
 |---|---|---|---|
-| Mooncake | `mooncake-store/` + `mooncake-integration/store/store_py.cpp` | `mooncake.store` 的 `.so`、`/usr/local/bin/mooncake_master` | `cuda_host_register_segment_succeeded`、`preload_shared_memory_segments`、`GetSharedMemorySegments`；SSD 加载还要 Python 属性 `batch_locate_local_ssd`；SSD 命中 load-through 还要 Python 属性 `batch_put_start_local`（client 把 put 拆成三个调用）；placement 还要 Python 属性 `batch_set_group_placement`、`batch_remove_local_disk`、`batch_offload_local`（exclusive 直写 SSD），以及 master 里的 `KVPilot placement=` 字符串（2026-11-19 重构把 `SetGroupPriority` RPC 换成了 `SetGroupPlacement`，三个策略都按组淘汰，`store` 与 `mooncake_master` 必须一起换，否则 RPC 对不上） |
+| Mooncake | `mooncake-store/` + `mooncake-integration/store/store_py.cpp` | `mooncake.store` 的 `.so`、`/usr/local/bin/mooncake_master` | `cuda_host_register_segment_succeeded`、`preload_shared_memory_segments`、`GetSharedMemorySegments`；SSD 加载还要 Python 属性 `batch_locate_local_ssd`；SSD 命中 load-through 还要 Python 属性 `batch_put_start_local`（client 把 put 拆成三个调用）；placement 还要 Python 属性 `batch_set_group_placement`、`batch_offload_local`（exclusive 直写 SSD）、`batch_remove_memory_replicas`（exclusive 只删 DRAM 副本、SSD 副本留着，2026-11-25；master 也要同一版：它让 exclusive 的 PutStart 能给只有磁盘副本的对象加内存副本、DRAM 下沉时有磁盘副本的只删不写），以及 master 里的 `KVPilot placement=` 字符串（2026-11-19 重构把 `SetGroupPriority` RPC 换成了 `SetGroupPlacement`，三个策略都按组淘汰，`store` 与 `mooncake_master` 必须一起换，否则 RPC 对不上） |
 | dynamo Rust | `lib/llm/src/preprocessor.rs`、`protocols/openai/validate.rs` | `dynamo/_core.abi3.so` | `cache_use_control`、`cache_use_max_tokens`、`forced_output_tokens`；`local SSD`（`cache_use_control` 允许 4）；`one entry per`（`cache_use_max_tokens` 允许按层级的列表） |
 | LMCache `c_ops` | `csrc/{mem_kernels.cu,mem_kernels.cuh,ssd_loader.cu,ssd_loader.cuh,pybind.cpp}`（未提交） | `dist-packages/lmcache/c_ops*.so` | Python 属性 `LayerwiseLoader`、`SsdLayerwiseLoader`；SSD 读带宽上限还要 `.so` 里有字符串 `KVPILOT_SSD_READ_GIBPS`；HBM→DRAM 写（store、exclusive）还要 `batched_memcpy_d2h`；SSD 命中 load-through 还要 `SsdLayerwiseLoader.wait_writeback` / `set_writeback`；`start()` 总带着写回参数，`c_ops` 缺它们时每次 SSD 加载都报错，exclusive 下也一样 |
 
@@ -92,7 +103,7 @@ echo "  KVPilot placement=:                   $(cnt 'KVPilot placement=' "$MM")"
 echo "dynamo _core    $CORE"
 for s in cache_use_control cache_use_max_tokens forced_output_tokens "local SSD" "one entry per"; do
   echo "  $s: $(cnt "$s" "$CORE")"; done
-python3 -c 'import mooncake.store as s; S = s.MooncakeDistributedStore; print(" ", *(f"{a}: {hasattr(S, a)}" for a in ("batch_locate_local_ssd", "batch_put_start_local", "batch_set_group_placement", "batch_remove_local_disk", "batch_offload_local")))'
+python3 -c 'import mooncake.store as s; S = s.MooncakeDistributedStore; print(" ", *(f"{a}: {hasattr(S, a)}" for a in ("batch_locate_local_ssd", "batch_put_start_local", "batch_set_group_placement", "batch_offload_local", "batch_remove_memory_replicas")))'
 python3 -c 'import lmcache.c_ops as c; print("lmcache c_ops  ", c.__file__); print("  LayerwiseLoader:", hasattr(c, "LayerwiseLoader"), " SsdLayerwiseLoader:", hasattr(c, "SsdLayerwiseLoader"), " wait_writeback:", hasattr(getattr(c, "SsdLayerwiseLoader", None), "wait_writeback"), " batched_memcpy_d2h:", hasattr(c, "batched_memcpy_d2h"))' 2>&1 | grep -v INFO
 CO=$(python3 -c 'import lmcache.c_ops as c; print(c.__file__)' 2>/dev/null)
 echo "  KVPILOT_SSD_READ_GIBPS: $(cnt KVPILOT_SSD_READ_GIBPS "$CO")"
@@ -270,6 +281,19 @@ ssh Taiji-GPU 'tail -1 /root/kvpilot/Mooncake/build/build.log'
    pip install --force-reinstall --no-deps /root/kvpilot/dynamo-dev/lib/bindings/python/target/wheels/ai_dynamo_runtime-*.whl 2>&1 | tail -1
    python3 -c "import dynamo._core; print(\"import ok\")"'
    ```
+
+### 2.5 FlashInfer 离线 cubin（EP 下的 FP8 MoE）
+
+FP8 模型开 EP 时 MoE 走 FlashInfer CUTLASS（见 [pitfalls.md](pitfalls.md)「FP8 模型开专家并行」）。GPU 机器不能上网，
+缺的 cubin 下载不了，装和 FlashInfer 同版本（`python3 -c 'import flashinfer; print(flashinfer.__version__)'`）的
+`flashinfer-cubin`。CPU-dev 能上网，经 CFS 中转：
+
+```bash
+ssh CPU-dev 'mkdir -p /cfs_cloud_code/kiry/wheels && cd /cfs_cloud_code/kiry/wheels && python3 -m pip download flashinfer-cubin==0.6.12 --no-deps -d .'
+ssh Taiji-GPU 'cp /cfs_cloud_code/kiry/wheels/flashinfer_cubin-0.6.12-py3-none-any.whl /root/ && pip install --no-deps /root/flashinfer_cubin-0.6.12-py3-none-any.whl'
+```
+
+它还要现编 TensorRT-LLM 的分组 GEMM，nvcc 必须在 PATH 里（`disagg_lmcache.sh` 自己设 `CUDA_HOME`、PATH）。
 
 ## 3. 最后确认
 

@@ -1,14 +1,20 @@
 #!/bin/bash
 # A/B one arm of the KVPilot placement experiment on a fresh 1P1D service.
-#   bash run_ab.sh <lru|belady|incl|incp|excl|exclu|exclb> <tracelab|swe|swe1to2b|swereq|swereqhbm|sweblock|sweblock160|swefile320|tlreq|toolagent> [tag]
+#   bash run_ab.sh <lru|belady|incl|incp|excl|exclu|exclb> <tracelab|swe|swe1to2b|swereq|swereqhbm|sweblock|sweblock160|sweblock512|swefile320|tlreq|toolagent|exp1swe|exp1tl|exp1swr|exp1tlr> [tag]
 # Every arm replays the same trace (*_mooncake_interleaved.jsonl,
 # utils/trace_order; swe1to2b = swe_hbm1to2_budget220.jsonl; swereq / tlreq =
 # datasets/req-priority-trace/{swe,tracelab}_reqprio.jsonl; swereqhbm = swereq with
 # every signal HBM, signal_swe_reqprio_allhbm.json; sweblock =
 # datasets/block-priority-trace/swe_blockprio.jsonl, HBM 600 blocks by default;
 # sweblock160 = swe_blockprio_k160.jsonl, search_trace.py's pick for the default
-# HBM, the first 160 lines warm-up; swefile320 = swe_fileorder_k320.jsonl, swe_full's
-# sessions in file order, 320 at a time, the first 320 lines warm-up) in file order, one
+# HBM, the first 160 lines warm-up; sweblock512 = swe_blockprio_k512.jsonl, the same
+# pool 512 sessions at a time, the trace every model shares (Qwen3-30B, Qwen3.6 at
+# TP 4) at default capacities, the first 512 lines warm-up; swefile320 =
+# swe_fileorder_k320.jsonl, swe_full's sessions in file order, 320 at a time, the
+# first 320 lines warm-up; exp1swe / exp1tl (exp1swr / exp1tlr: the round with
+# sessions drawn at random) = Eval-EXP1's SWE and TraceLab
+# traces, paper-figure/Eval-EXP1/<name>.jsonl, shared by Qwen3-30B, Qwen3.6
+# and Qwen3.8 at TP 4) in file order, one
 # request in flight, with forced decode output, under the same HBM pool,
 # Mooncake DRAM size and SSD offload; only KVPILOT_PLACEMENT differs.
 #   lru         upstream HBM free queue (FIFO), Mooncake evicts whole chunk
@@ -38,18 +44,21 @@
 # The signal is the next turn's tier and [t_hbm, t_dram, t_ssd] from the
 # signal table signal_<trace>.json (make_req_table.py / toolagent_prep.py); with
 # KVPILOT_ONLINE_PREDICT=1 it is predicted from the turn's tool calls instead.
-#   HBM_BLOCKS  prefill KV pool in 512-token blocks; empty = what GPU_MEM_UTIL
-#               leaves (2361 at 0.9), as in utils/trace_order/run.sh
+#   HBM_BLOCKS  prefill KV pool in vLLM blocks (512 tokens, Qwen3.6 1536 at
+#               TP 2, 1024 at TP 4); empty = what GPU_MEM_UTIL leaves
+#               (Qwen3-30B 2361, Qwen3.6 3485 at 0.9), as in utils/trace_order/run.sh
+#   TP_SIZE     TP ranks per worker, default 2 (Qwen3.6 also 4: 1P1D on 8 GPUs)
 #   DRAM_GIB    Mooncake global_segment_size per TP rank, default 100
 #   MAX_OUT     cap on each request's output tokens (0 = trace value)
 set -euo pipefail
-ARM=${1:?usage: run_ab.sh lru|belady|incl|incp|excl|exclu|exclb tracelab|swe|swe1to2b|swereq|swereqhbm|sweblock|sweblock160|swefile320|tlreq|toolagent [tag]}
-DS=${2:?usage: run_ab.sh lru|belady|incl|incp|excl|exclu|exclb tracelab|swe|swe1to2b|swereq|swereqhbm|sweblock|sweblock160|swefile320|tlreq|toolagent [tag]}
+ARM=${1:?usage: run_ab.sh lru|belady|incl|incp|excl|exclu|exclb tracelab|swe|swe1to2b|swereq|swereqhbm|sweblock|sweblock160|sweblock512|swefile320|tlreq|toolagent|exp1swe|exp1tl|exp1swr|exp1tlr [tag]}
+DS=${2:?usage: run_ab.sh lru|belady|incl|incp|excl|exclu|exclb tracelab|swe|swe1to2b|swereq|swereqhbm|sweblock|sweblock160|sweblock512|swefile320|tlreq|toolagent|exp1swe|exp1tl|exp1swr|exp1tlr [tag]}
 TAG=${3:-r1}
 case $ARM in lru|belady|incl|incp|excl|exclu|exclb) ;; *) echo "bad arm $ARM"; exit 1 ;; esac
-case $DS in tracelab|swe|swe1to2b|swereq|swereqhbm|sweblock|sweblock160|swefile320|tlreq|toolagent) ;; *) echo "bad dataset $DS"; exit 1 ;; esac
+case $DS in tracelab|swe|swe1to2b|swereq|swereqhbm|sweblock|sweblock160|sweblock512|swefile320|tlreq|toolagent|exp1swe|exp1tl|exp1swr|exp1tlr) ;; *) echo "bad dataset $DS"; exit 1 ;; esac
 
-ROOT=/root/kvpilot
+# Repo root on the GPU machine (another checkout: ROOT=/root/q38).
+ROOT=${ROOT:-/root/kvpilot}
 HERE=$ROOT/utils/placement_ab
 SD=$ROOT/vllm-dev/examples/disaggregated/lmcache/disagg_prefill_lmcache_v1
 export PYTHONPATH=$ROOT/vllm-dev:$ROOT/lmcache-dev:$ROOT/dynamo-dev/components/src:$ROOT/dynamo-dev/lib/bindings/kvbm/python
@@ -59,6 +68,29 @@ export KVPILOT_LOAD_STALL=true
 export KVPILOT_SSD_OFFLOAD_PATH=${KVPILOT_SSD_OFFLOAD_PATH:-/root/kvpilot-ssd}
 export MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=${MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES:-4398046511104}
 export MODEL=${MODEL:-/cfs_cloud_code/kiry/model/Qwen/Qwen3-30B-A3B-Instruct-2507}
+export TP_SIZE=${TP_SIZE:-2}
+# Hybrid models (Qwen3.6, linear attention) run 1536-token blocks at TP 2 and
+# 1024 at TP 4: their own signal tables (signal_<trace>_b<block>.json,
+# add_next_suffix.py --block <block> --drops-last) and time model (Figure3
+# request-safe under raw/qwen3.6, raw/qwen3.6-tp4). Qwen3.8 (qwen4_exp, TP 4,
+# block 1024): signal_<trace>_q38.json, time model from raw/qwen3.8-ep (expert parallel).
+MODEL_TYPE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]+"/config.json")).get("model_type", ""))' "$MODEL")
+if [ "$MODEL_TYPE" = qwen4_exp ]; then
+    [ "$TP_SIZE" = 4 ] || { echo "Qwen3.8 runs at TP 4"; exit 1; }
+    HYBRID=1 TABLE_SUFFIX=_q38 COEFFS_DEFAULT=fit_times2_qwen3.8-ep_k160.json
+elif python3 -c 'import json,sys; c=json.load(open(sys.argv[1]+"/config.json")); t=c.get("text_config", c); sys.exit("linear_attention" not in (t.get("layer_types") or []))' "$MODEL"; then
+    HYBRID=1
+    FP8=$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1]+"/config.json")); t=c.get("text_config", c); print(int(bool(c.get("quantization_config") or t.get("quantization_config"))))' "$MODEL")
+    case $TP_SIZE$FP8 in
+        21) TABLE_SUFFIX=_q36f8 COEFFS_DEFAULT=fit_times2_qwen3.6-fp8_k160.json ;;
+        20) TABLE_SUFFIX=_b1536 COEFFS_DEFAULT=fit_times2_qwen3.6_k160.json ;;
+        40) TABLE_SUFFIX=_b1024 COEFFS_DEFAULT=fit_times2_qwen3.6-tp4_k160.json ;;
+        *) echo "no Qwen3.6 setup for TP $TP_SIZE (FP8 $FP8)"; exit 1 ;;
+    esac
+else
+    [ "$TP_SIZE" = 2 ] || { echo "Qwen3-30B runs at TP 2"; exit 1; }
+    HYBRID=0 TABLE_SUFFIX= COEFFS_DEFAULT=fit_times2_swe.json
+fi
 # Same compute regime the time model was fitted under (Figure3 request-safe).
 export PREFILL_COMPILATION_CONFIG=${PREFILL_COMPILATION_CONFIG-'{"cudagraph_capture_sizes":[64,128,256,512,1024]}'}
 export GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.9}
@@ -86,11 +118,21 @@ case $DS in
                TABLE=signal_swe_reqprio_allhbm.json ;;
     sweblock) INPUT=$ROOT/datasets/block-priority-trace/swe_blockprio.jsonl RESP=swe ;;
     sweblock160) INPUT=$ROOT/datasets/block-priority-trace/swe_blockprio_k160.jsonl RESP=swe ;;
+    sweblock512) INPUT=$ROOT/datasets/block-priority-trace/swe_blockprio_k512.jsonl RESP=swe ;;
     swefile320) INPUT=$ROOT/datasets/block-priority-trace/swe_fileorder_k320.jsonl RESP=swe ;;
     tlreq) INPUT=$ROOT/datasets/req-priority-trace/tracelab_reqprio.jsonl RESP=tracelab ;;
     # First 4000 requests of the Mooncake toolagent trace, sessions and tiers
     # from toolagent_prep.py; it has no tool labels, so offline table only.
     toolagent) INPUT=$ROOT/datasets/mooncake-trace/toolagent_sessions.jsonl RESP=swe ;;
+    exp1swe) INPUT=$ROOT/paper-figure/Eval-EXP1/exp1_swe.jsonl RESP=swe
+             TABLE_DIR=$ROOT/paper-figure/Eval-EXP1 ;;
+    exp1tl) INPUT=$ROOT/paper-figure/Eval-EXP1/exp1_tracelab.jsonl RESP=tracelab
+            TABLE_DIR=$ROOT/paper-figure/Eval-EXP1 ;;
+    # Eval-EXP1 second round: sessions drawn at random instead of round-robin.
+    exp1swr) INPUT=$ROOT/paper-figure/Eval-EXP1/exp1_swe_rand.jsonl RESP=swe
+             TABLE_DIR=$ROOT/paper-figure/Eval-EXP1 ;;
+    exp1tlr) INPUT=$ROOT/paper-figure/Eval-EXP1/exp1_tl_rand.jsonl RESP=tracelab
+             TABLE_DIR=$ROOT/paper-figure/Eval-EXP1 ;;
 esac
 # AB_INPUT: replay another file (e.g. the first lines of the trace, for a smoke
 # run); the signal table is still signal_<its basename>.json unless the dataset
@@ -99,6 +141,9 @@ INPUT=${AB_INPUT:-$INPUT}
 
 unset KVPILOT_PLACEMENT KVPILOT_OFFLINE_TABLE KVPILOT_TOOL_RESP_DISTRIBUTION_PATH KVPILOT_BELADY_TRACE
 case $ARM in
+    # Hybrid: LRU holds a prompt's end state while the trace reuses it, as
+    # Belady and the signalled arms do, so the arms differ only in the KV.
+    lru) if [ $HYBRID = 1 ]; then export KVPILOT_BELADY_TRACE=$INPUT; fi ;;
     belady) export KVPILOT_PLACEMENT=belady KVPILOT_BELADY_TRACE=$INPUT ;;
     incl) export KVPILOT_PLACEMENT=inclusive-safe-reqwise ;;
     incp) export KVPILOT_PLACEMENT=inclusive-penalty-reqwise ;;
@@ -107,15 +152,15 @@ case $ARM in
     exclb) export KVPILOT_PLACEMENT=exclusive-penalty-blockwise-unblocking ;;
 esac
 case $ARM in incl|incp|excl|exclu|exclb)
-    export KVPILOT_TIME_COEFFS_PATH=${KVPILOT_TIME_COEFFS_PATH:-$ROOT/paper-figure/Figure3-request-safe/fit_times2_swe.json} ;;
+    export KVPILOT_TIME_COEFFS_PATH=${KVPILOT_TIME_COEFFS_PATH:-$ROOT/paper-figure/Figure3-request-safe/$COEFFS_DEFAULT} ;;
 esac
 export KVPILOT_ONLINE_PREDICT=${KVPILOT_ONLINE_PREDICT:-0}
 if [ "$ARM" != lru ] && [ "$ARM" != belady ]; then
     if [ "$KVPILOT_ONLINE_PREDICT" = 1 ]; then
         export KVPILOT_TOOL_RESP_DISTRIBUTION_PATH=$ROOT/paper-figure/algorithm/resp_length_dist_$RESP.json
-        export KVPILOT_TIME_COEFFS_PATH=${KVPILOT_TIME_COEFFS_PATH:-$ROOT/paper-figure/Figure3-request-safe/fit_times2_swe.json}
+        export KVPILOT_TIME_COEFFS_PATH=${KVPILOT_TIME_COEFFS_PATH:-$ROOT/paper-figure/Figure3-request-safe/$COEFFS_DEFAULT}
     else
-        export KVPILOT_OFFLINE_TABLE=$HERE/${TABLE:-signal_$(basename "$INPUT" .jsonl).json}
+        export KVPILOT_OFFLINE_TABLE=${TABLE_DIR:-$HERE}/${TABLE:-signal_$(basename "$INPUT" .jsonl)$TABLE_SUFFIX.json}
         [ -f "$KVPILOT_OFFLINE_TABLE" ] || { echo "missing $KVPILOT_OFFLINE_TABLE"; exit 1; }
     fi
 fi
@@ -156,7 +201,7 @@ say "$(grep -m1 -o 'GPU KV cache size: [0-9,]* tokens' $L/prefill-0.log)"
 # TTFT ≈ prefill + fixed P→D. A session's next round waits for the previous one.
 python3 $ROOT/vllm-dev/benchmarks/multi_turn/mooncake_trace_replay.py \
     -i $INPUT -m $MODEL -u http://localhost:8000 -p 1 --release-at-first-token \
-    --vocab-size 151936 --forced-output \
+    --vocab-size "$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1]+"/config.json")); print(c.get("text_config", c)["vocab_size"])' "$MODEL")" --forced-output \
     ${MAX_OUT:+--max-output-tokens $MAX_OUT} \
     > $L/benchmark.log 2>&1 || say "replay exited non-zero"
 say "replay done ($(grep -c '^\[ok \]' $L/benchmark.log) ok, $(grep -c '^\[ERR\]' $L/benchmark.log) err)"

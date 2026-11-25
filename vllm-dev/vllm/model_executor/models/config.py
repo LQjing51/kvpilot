@@ -560,6 +560,59 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
             )
 
 
+def _strip_qwen4_exp_mrope(model_config: "ModelConfig") -> None:
+    configs = {
+        id(config): config
+        for config in (
+            getattr(model_config, "hf_config", None),
+            model_config.hf_text_config,
+        )
+        if config is not None
+    }
+    for config in configs.values():
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if rope_parameters is not None:
+            rope_parameters.pop("mrope_section", None)
+            rope_parameters.pop("mrope_interleaved", None)
+
+
+class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConfig):
+    """Qwen3.8-Flash-Next (backported from vLLM 0.30, no MTP)."""
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        text_config = vllm_config.model_config.hf_text_config
+        if text_config.hc_count <= 1:
+            raise ValueError("Qwen4Exp requires hc_count > 1")
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.enable_dbo or parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError("Qwen4Exp runs without DBO and with PP=1")
+        if vllm_config.speculative_config is not None:
+            raise NotImplementedError("Qwen4Exp is backported without MTP")
+        # The V1 runner reads the PLE n-gram context from the CPU token mirror
+        # (GPUModelRunner._ngram_model_kwargs), which async scheduling leaves
+        # a step behind on decode.
+        if text_config.ple_layer_ids:
+            scheduler_config = vllm_config.scheduler_config
+            if scheduler_config.async_scheduling:
+                raise NotImplementedError(
+                    "Qwen4Exp's n-gram embedding on the V1 runner needs "
+                    "--no-async-scheduling"
+                )
+            scheduler_config.async_scheduling = False
+        multimodal_config = vllm_config.model_config.multimodal_config
+        if multimodal_config is not None and multimodal_config.language_model_only:
+            _strip_qwen4_exp_mrope(vllm_config.model_config)
+
+
+class Qwen4ExpForCausalLMConfig(Qwen4ExpForConditionalGenerationConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        _strip_qwen4_exp_mrope(vllm_config.model_config)
+
+
 class SnowflakeGteNewModelConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -621,6 +674,8 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Qwen3VLForSequenceClassification": Qwen3VLForSequenceClassificationConfig,
     "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
+    "Qwen4ExpForCausalLM": Qwen4ExpForCausalLMConfig,
+    "Qwen4ExpForConditionalGeneration": Qwen4ExpForConditionalGenerationConfig,
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,
 }

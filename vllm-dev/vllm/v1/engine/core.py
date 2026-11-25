@@ -280,8 +280,19 @@ class EngineCore:
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:
+            # Exclude groups that opt out of prefix caching (Qwen4Exp's QSA
+            # ring, one block per request with block_size=4): their small
+            # block_size would otherwise drag the global block_size below the
+            # real allocator block size and desync it from mamba.
+            participating = [
+                g.kv_cache_spec.block_size
+                for g in kv_cache_groups
+                if g.kv_cache_spec.prefix_cacheable
+            ]
             vllm_config.cache_config.block_size = min(
-                g.kv_cache_spec.block_size for g in kv_cache_groups
+                participating
+                if participating
+                else [g.kv_cache_spec.block_size for g in kv_cache_groups]
             )
 
         vllm_config.validate_block_size()

@@ -76,6 +76,8 @@ class SsdLayerwiseLoader {
   // writeback: optional int64 [L, C] CPU tensor of host addresses, 0 where an
   // SSD value is not written back; ignored for host chunks.
   // evict_events: as for LayerwiseLoader (a LayerEvictor's events()).
+  // side_dst / side_bytes: as for LayerwiseLoader; a value is then
+  // sizes[c] + side_bytes long, read and written back whole.
   std::shared_ptr<LoadTiming> start(
       const std::vector<std::string>& paths, const torch::Tensor& file_idx,
       const torch::Tensor& offsets, const std::vector<int64_t>& sizes,
@@ -83,7 +85,8 @@ class SsdLayerwiseLoader {
       std::vector<torch::Tensor> kvcaches, torch::Tensor slot_mapping,
       const GPUKVFormat gpu_kv_format, const bool timing,
       const std::optional<torch::Tensor>& writeback,
-      const std::vector<int64_t>& evict_events);
+      const std::vector<int64_t>& evict_events,
+      const std::optional<torch::Tensor>& side_dst, const int64_t side_bytes);
   void step(const int64_t layer, const bool wait);
   // Number of the latest start(); pass it to set_writeback / wait_writeback.
   int64_t generation();
@@ -138,6 +141,8 @@ class SsdLayerwiseLoader {
   std::vector<std::vector<int64_t>> src_;  // [L][C]; slot chunks: slot offset
   std::vector<std::vector<bool>> in_slot_;
   std::vector<int64_t> sizes_;
+  std::vector<std::vector<int64_t>> side_dst_;  // [L][C]; empty: no side pages
+  int64_t side_bytes_ = 0;
 
   torch::Tensor staging_[2];
   std::vector<torch::Tensor> kvcaches_;

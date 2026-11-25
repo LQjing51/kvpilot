@@ -4811,6 +4811,20 @@ RealClient::batch_locate_local_ssd(const std::vector<std::string> &keys) {
     return file_storage_->BatchLocate(keys);
 }
 
+int64_t RealClient::batch_remove_memory_replicas(
+    const std::vector<std::string> &keys) {
+    if (!client_) {
+        LOG(ERROR) << "batch_remove_memory_replicas: client not initialized";
+        return -1;
+    }
+    int64_t n = 0;
+    for (const auto &r :
+         client_->BatchEvictDiskReplica(keys, ReplicaType::MEMORY)) {
+        if (r) ++n;
+    }
+    return n;
+}
+
 int64_t RealClient::batch_offload_local(const std::vector<std::string> &keys,
                                         const std::vector<uintptr_t> &ptrs,
                                         const std::vector<size_t> &sizes) {

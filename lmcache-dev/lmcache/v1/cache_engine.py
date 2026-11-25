@@ -678,7 +678,6 @@ class LMCacheEngine:
         keys = []
         sizes = []
         tot_token_num = 0
-        kv_dtype = self.metadata.kv_dtype
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
@@ -705,9 +704,7 @@ class LMCacheEngine:
             starts.append(start)
             ends.append(end)
             keys.append(keys_multi_layer)
-            sizes.append(
-                self.gpu_connector.get_shape(num_tokens).numel() * kv_dtype.itemsize
-            )
+            sizes.append(self.gpu_connector.value_bytes(num_tokens))
             tot_token_num += num_tokens
 
             # Create KV event
@@ -1365,13 +1362,14 @@ class LMCacheEngine:
                     if paths
                     else {}
                 )
-                token_bytes = self.gpu_connector.token_bytes() if paths else 0
                 for i, (path, offset, size) in zip(need, locs, strict=True):
                     c = i // n
                     if c >= hit:
                         break
                     start, end, _ = chunk_list[c]
-                    if not opened.get(path) or size < (end - start) * token_bytes:
+                    if not opened.get(path) or size < self.gpu_connector.value_bytes(
+                        end - start
+                    ):
                         hit = c
                         break
                     ssd[i] = (path, offset)
@@ -1626,7 +1624,7 @@ class LMCacheEngine:
             return
         assert self.gpu_connector is not None
         chunk_size = self.config.chunk_size
-        nbytes = chunk_size * self.gpu_connector.token_bytes()
+        nbytes = self.gpu_connector.value_bytes(chunk_size)
         n_layers = self.num_layers
         file_idx, names_all = plan.file_idx, plan.key_strs
         sizes = [end - start for start, end, _ in chunk_list[: file_idx.shape[1]]]

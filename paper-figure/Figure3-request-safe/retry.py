@@ -13,7 +13,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from make_trace import HEAD, Fresh, line_rows
+from make_trace import HEAD, MODELS, Fresh, line_rows
 from tier_logs import results
 
 RETRY_DELAY_MS, ID_BASE = 4000, 10**6
@@ -33,8 +33,11 @@ heads = Fresh(max(h for h in ids if h >= HEAD) + 1)
 out = []
 for l, tiers in sorted(bad.items()):
     r = src[l]
+    # Rows of runs before make_trace recorded the model: Qwen3-30B-A3B.
+    model = {**MODELS["qwen3-30b"],
+             **{k: r[k] for k in ("tp", "block", "kv_layers", "drops_last") if k in r}}
     out += line_rows(l, r["input_length"], r["prefix"], tuple(tiers), fresh, heads,
-                     RETRY_DELAY_MS)
+                     model, RETRY_DELAY_MS)
 with open(run / "trace_retry.jsonl", "w") as f:
     for i, r in enumerate(out):
         f.write(json.dumps({**r, "line": ID_BASE + i}) + "\n")

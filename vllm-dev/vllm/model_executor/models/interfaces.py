@@ -827,6 +827,13 @@ class IsHybrid(Protocol):
         """
         ...
 
+    @classmethod
+    def get_mamba_state_copy_funcs(cls, mamba_types: set) -> dict:
+        """Copy functions per MambaAttentionBackendEnum; a model with one kind
+        of Mamba state uses the same ones for every type."""
+        copy_funcs = cls.get_mamba_state_copy_func()
+        return {mamba_type: copy_funcs for mamba_type in mamba_types}
+
 
 @overload
 def is_hybrid(model: object) -> TypeIs[IsHybrid]: ...

@@ -3,9 +3,9 @@
 
 Under exclusive-penalty-reqwise a prefill writes nothing below HBM. When the
 next turn's tier is known, the scheduler (vllm/v1/core/kvpilot_exclusive.py)
-sends each TP rank the same job: which prompt chunks to remove from Mooncake
-(they leave their tier; a copy on this rank's SSD is deleted and its space
-freed) and which to write to DRAM or SSD from HBM blocks it keeps pinned. A
+sends each TP rank the same job: which prompt chunks lose their DRAM copy
+(they leave DRAM; an SSD copy always stays) and which to write to DRAM or SSD
+from HBM blocks it keeps pinned. A
 rank runs its jobs in order on one background thread and reports a job id
 back through get_finished once done; the scheduler unpins the blocks and drops
 their HBM copies when every rank has.
@@ -16,7 +16,8 @@ the smallest DRAM -> SSD penalty to SSD.
 
 To DRAM:
     1. PutStart allocates a memory replica per (chunk, layer) value in this
-       rank's segment; 0 = already stored or no room (skipped).
+       rank's segment, beside an SSD copy if it has one; 0 = already in
+       memory or no room (skipped).
     2. Per layer: gather the chunks from the paged KV into a GPU staging buffer
        (token-major, the value layout), then one batched D2H copies each value
        straight into its replica (the segment is CUDA-registered); no host
@@ -29,8 +30,7 @@ DRAM tier out):
     2. All layers of up to SSD_GROUP_CHUNKS chunks are gathered on the GPU and
        copied into a pinned staging buffer of the writer's own.
     3. Each chunk's values are written to this rank's SSD as one bucket, which
-       registers their disk replicas with the master (no memory replica), so
-       a chunk leaving SSD later frees its whole bucket.
+       registers their disk replicas with the master (no memory replica).
 
 None of it runs on the forward thread or stream.
 
@@ -131,7 +131,7 @@ class Evictor:
         self._engine = engine
         self._layers = engine.num_layers
         self._chunk = engine.config.chunk_size
-        self._nbytes = self._chunk * engine.gpu_connector.token_bytes()
+        self._nbytes = engine.gpu_connector.value_bytes(self._chunk)
         self._finish = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kvpilot-evict")
 
     def prepare(self, req_id: str, evict: dict) -> Eviction:
@@ -225,7 +225,10 @@ class ExclusiveWriter:
         self._layers = engine.num_layers
         self._chunk = engine.config.chunk_size
         self._shape = gc.get_shape
-        self._nbytes = self._chunk * gc.token_bytes()
+        self._gc = gc
+        # A value: the chunk's token-major KV, then (Qwen3.8) its side page.
+        self._kv_bytes = self._chunk * gc.token_bytes()
+        self._nbytes = gc.value_bytes(self._chunk)
         self._jobs: "queue.Queue[dict]" = queue.Queue()
         self._done: set[str] = set()
         self._lock = threading.Lock()
@@ -286,13 +289,10 @@ class ExclusiveWriter:
             )
         if job["drop"]:
             drop = [s for i in job["drop"] for s in names[i]]
-            codes = backend.kvpilot_remove(drop)
-            # The master keeps an object an offload is still reading (one
-            # extra copy until it lands); the rest leave SSD here too.
-            gone = [k for k, c in zip(drop, codes) if c == 0]
-            out["drop_ok"] = len(gone)
+            # A memory replica a reader or an offload still holds stays (one
+            # extra copy until DRAM demotes it).
+            out["drop_ok"] = backend.kvpilot_remove_memory(drop)
             out["drop_values"] = len(drop)
-            out["disk_freed"] = backend.kvpilot_remove_local_disk(gone)
         if job["dram"]:
             # A DRAM group carries the exposed load its move to SSD adds (the
             # master demotes the smallest first).
@@ -301,11 +301,11 @@ class ExclusiveWriter:
         if job["ssd"]:
             self._write_ssd(backend, job["ssd"], keys, names, job["block_ids"], out)
         logger.info(
-            "KVPilot exclusive job=%s req=%s tier=%s drop=%d/%d disk_freed=%d dram=%d "
+            "KVPilot exclusive job=%s req=%s tier=%s drop=%d/%d dram=%d "
             "ssd=%d chunks written=%d values=%d skipped=%d failed=%d retries=%d "
             "no_room=%d ms=%.1f",
             job["id"], job["req"], job["tier"], out["drop_ok"], out["drop_values"],
-            out["disk_freed"], len(job["dram"]), len(job["ssd"]), out["chunks"],
+            len(job["dram"]), len(job["ssd"]), out["chunks"],
             out["values"],
             out["skipped"], out["failed"], out["retries"], out["no_room"],
             (time.perf_counter() - t0) * 1e3,
@@ -362,6 +362,8 @@ class ExclusiveWriter:
         """Copy all layers of these chunks (one vLLM block each) into the SSD
         staging buffer, value (layer l, chunk j) at index l * len + j. Returns
         the buffer's host address."""
+        if self._gc.side_caches is not None:
+            return self._stage_ssd_side(block_ids)
         n = len(block_ids) * self._chunk
         if self._ssd_host is None:
             self._ssd_host = torch.empty(
@@ -379,6 +381,42 @@ class ExclusiveWriter:
                 self._ssd_host[layer * n : (layer + 1) * n].copy_(gpu, non_blocking=True)
         self._stream.synchronize()
         return self._ssd_host.data_ptr()
+
+    def _stage_ssd_side(self, block_ids: list[int]) -> int:
+        """_stage_ssd for values that end with a side page."""
+        k = len(block_ids)
+        if self._ssd_host is None:
+            self._ssd_host = torch.empty(
+                SSD_GROUP_CHUNKS * self._layers * self._nbytes,
+                dtype=torch.uint8, pin_memory=True,
+            )
+        base = self._ssd_host.data_ptr()
+        with torch.cuda.stream(self._stream):
+            gpu = self._buffer(k * self._chunk)
+            slots = self._slots(block_ids)
+            for layer in range(self._layers):
+                lmc_ops.single_layer_kv_transfer(
+                    gpu, self._kvcaches[layer], slots,
+                    lmc_ops.TransferDirection.D2H, self._fmt, True,
+                )
+                dst = [base + (layer * k + j) * self._nbytes for j in range(k)]
+                lmc_ops.batched_memcpy_d2h(gpu, dst, [self._kv_bytes] * k)
+                self._copy_side(layer, block_ids, dst)
+        self._stream.synchronize()
+        return base
+
+    def _copy_side(self, layer: int, block_ids: list[int], dst: list[int]) -> None:
+        """Each block's side page to the end of its value at dst (0 = skip),
+        on the current stream."""
+        if self._gc.side_caches is None:
+            return
+        side = self._gc.side_bytes
+        src = self._gc.side_caches[layer].data_ptr()
+        lmc_ops.batched_memcpy_async(
+            [d + self._kv_bytes if d else 0 for d in dst],
+            [src + b * side for b in block_ids],
+            [side] * len(block_ids),
+        )
 
     def _allocate(self, backend, names: list[str], out) -> list[int]:
         """Replica addresses for `names` (0 = already stored). A value that is
@@ -422,9 +460,9 @@ class ExclusiveWriter:
                     gpu, self._kvcaches[layer], slots,
                     lmc_ops.TransferDirection.D2H, self._fmt, True,
                 )
-                lmc_ops.batched_memcpy_d2h(
-                    gpu, [row[layer] for row in rows], [self._nbytes] * len(rows)
-                )
+                dst = [row[layer] for row in rows]
+                lmc_ops.batched_memcpy_d2h(gpu, dst, [self._kv_bytes] * len(rows))
+                self._copy_side(layer, block_ids, dst)
         self._stream.synchronize()
 
     def _slots(self, block_ids: list[int]) -> torch.Tensor:

@@ -16,10 +16,13 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.kvpilot_belady import BeladyPlacement
 from vllm.v1.core.kvpilot_time_model import TimeModel
 from vllm.v1.core.kvpilot_exclusive import ExclusivePlacement
-from vllm.v1.core.kvpilot_inclusive import InclusivePlacement
+from vllm.v1.core.kvpilot_inclusive import InclusivePlacement, full_prompt_blocks
 from vllm.v1.core.kvpilot_lru import LruPlacement
+from vllm.v1.core.kvpilot_states import boundary_states
 from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
     KVCacheConfig,
+    MambaSpec,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
@@ -173,6 +176,49 @@ class KVCacheManager:
         )
         strategy = kvpilot_placement.strategy()
         logger.info("KVPilot placement=%s", strategy or "lru")
+        # KVPilot places prompt chunks: the full-attention group's blocks. A
+        # hybrid model's linear-attention groups hold per-request states.
+        attn_gids = [
+            g
+            for g, group in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(group.kv_cache_spec, FullAttentionSpec)
+        ]
+        state_gids = [
+            g
+            for g, group in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        # Scratch groups (Qwen4Exp's QSA ring) are a request's own block,
+        # freed with it; nothing to place.
+        num_scratch = sum(
+            not group.kv_cache_spec.prefix_cacheable
+            for group in kv_cache_config.kv_cache_groups
+        )
+        if (
+            len(attn_gids) != 1
+            or len(attn_gids) + len(state_gids) + num_scratch != self.num_kv_cache_groups
+        ):
+            raise ValueError(
+                f"KVPilot: needs one full-attention group and linear-attention ones, "
+                f"got {[type(g.kv_cache_spec).__name__ for g in kv_cache_config.kv_cache_groups]}"
+            )
+        self.kvpilot_attn_gid = attn_gids[0]
+        self.kvpilot_state_gids = state_gids
+        exclusive = strategy in (
+            kvpilot_placement.EXCLUSIVE,
+            kvpilot_placement.EXCLUSIVE_UNBLOCKING,
+            kvpilot_placement.EXCLUSIVE_BLOCKWISE,
+        )
+        if (state_gids or exclusive) and hash_block_size != scheduler_block_size:
+            raise ValueError(
+                f"KVPilot: hybrid and exclusive hits need block hashes per block, got "
+                f"hash block {hash_block_size}, block {scheduler_block_size}"
+            )
+        self.kvpilot_block = scheduler_block_size
+        # Request id -> its end state, from finishing to freeing.
+        self.kvpilot_end_states: dict[str, list[KVCacheBlock]] = {}
+        if strategy:
+            self.block_pool.free_block_queue.set_state_groups(state_gids)
         model = None
         if strategy in kvpilot_placement.MODEL:
             path = os.environ["KVPILOT_TIME_COEFFS_PATH"]
@@ -181,6 +227,11 @@ class KVCacheManager:
                 raise ValueError(
                     f"{path} was fitted with chunk {model.chunk}, the scheduler "
                     f"runs max_num_batched_tokens={max_num_batched_tokens}"
+                )
+            if model.align != (scheduler_block_size if state_gids else None):
+                raise ValueError(
+                    f"{path} was fitted with align {model.align}, the scheduler "
+                    f"runs block {scheduler_block_size}, hybrid={bool(state_gids)}"
                 )
         if strategy == kvpilot_placement.EXCLUSIVE:
             self.kvpilot = ExclusivePlacement(
@@ -210,8 +261,12 @@ class KVCacheManager:
                 os.environ["KVPILOT_BELADY_TRACE"],
             )
         else:
-            # LRU: only the release order, for the master's tail-first eviction.
-            self.kvpilot = LruPlacement(scheduler_block_size)
+            # LRU: only the release order, for the master's tail-first eviction;
+            # on a hybrid model the trace, if given, decides which end states
+            # it holds.
+            trace = os.environ.get("KVPILOT_BELADY_TRACE") if state_gids else None
+            logger.info("KVPilot LRU end states held by trace: %s", trace)
+            self.kvpilot = LruPlacement(self.block_pool, scheduler_block_size, trace)
         # Blocks the last failed allocate_slots() was short of.
         self.kvpilot_shortfall = 0
 
@@ -261,7 +316,24 @@ class KVCacheManager:
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
-        if not self.enable_caching or request.skip_reading_prefix_cache:
+        extra_args = (
+            request.sampling_params.extra_args or {}
+            if request.sampling_params is not None
+            else {}
+        )
+        # KVPilot: a hybrid model takes its state from HBM even when
+        # cache_use_control keeps the KV off it, if the KV may come from this
+        # host's DRAM or SSD.
+        control = extra_args.get("cache_use_control")
+        state_only = (
+            bool(self.kvpilot_state_gids)
+            and control is not None
+            and 1 not in control
+            and bool({2, 4} & set(control))
+        )
+        request.kvpilot_pending_hit = 0
+        if not self.enable_caching or (request.skip_reading_prefix_cache and not state_only):
+            request.kvpilot_state_hit = 0
             return self.empty_kv_cache_blocks, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
@@ -275,22 +347,32 @@ class KVCacheManager:
         # DRAM side is capped in LMCache's lookup). As a list it gives one span
         # per cache_use_control tier, in order from the start of the prompt, so
         # HBM can serve only a leading span.
-        extra_args = (
-            request.sampling_params.extra_args or {}
-            if request.sampling_params is not None
-            else {}
-        )
         cap = extra_args.get("cache_use_max_tokens")
         if isinstance(cap, list):
-            tiers = extra_args.get("cache_use_control") or []
+            tiers = control or []
             cap = cap[0] if tiers[:1] == [1] else 0
         if cap is not None:
             max_cache_hit_length = min(max_cache_hit_length, cap)
-        computed_blocks, num_new_computed_tokens = (
-            self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+        if self.kvpilot_state_gids:
+            if request.kvpilot_state_cap is not None:
+                max_cache_hit_length = min(max_cache_hit_length, request.kvpilot_state_cap)
+            computed_blocks, num_new_computed_tokens = self._kvpilot_hybrid_hit(
+                request, max_cache_hit_length, hbm_kv=not state_only
             )
-        )
+            if isinstance(self.kvpilot, ExclusivePlacement):
+                request.kvpilot_pending_hit = self._kvpilot_pending_hit(
+                    request, num_new_computed_tokens, request.kvpilot_state_hit
+                )
+        else:
+            computed_blocks, num_new_computed_tokens = (
+                self.coordinator.find_longest_cache_hit(
+                    request.block_hashes, max_cache_hit_length
+                )
+            )
+            if isinstance(self.kvpilot, ExclusivePlacement):
+                request.kvpilot_pending_hit = self._kvpilot_pending_hit(
+                    request, num_new_computed_tokens, max_cache_hit_length
+                )
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -301,6 +383,57 @@ class KVCacheManager:
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+
+    def _kvpilot_pending_hit(self, request: Request, hit: int, max_length: int) -> int:
+        """Exclusive placement: the end of the furthest prompt block past
+        HBM's leading run (hit) that a job is writing below (0 if none).
+        Right after a signal the middle of the previous turn already sits in
+        DRAM, its HBM copy dropped, while its tail is still on its way to
+        SSD. HBM may also hold blocks past a gap that are not on their way
+        anywhere (held ones behind a lent or demoted block): not waited for."""
+        bs = self.kvpilot_block
+        hashes = request.block_hashes
+        for i in range(max_length // bs - 1, hit // bs - 1, -1):
+            hit_blocks = self.block_pool.get_cached_block(hashes[i], [self.kvpilot_attn_gid])
+            if hit_blocks is not None and self.kvpilot.writing(hit_blocks[0].block_hash):
+                return (i + 1) * bs
+        return 0
+
+    def _kvpilot_hybrid_hit(
+        self, request: Request, max_length: int, hbm_kv: bool
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """Hybrid models, whose linear-attention states never leave HBM: the
+        state at the furthest block boundary k (within max_length) every state
+        group holds one for in HBM, and the KV of HBM's leading run of
+        attention blocks up to h <= k. h == k is a plain HBM hit; below k the
+        connector loads the KV of [h, k), its lookup capped at k
+        (request.kvpilot_state_hit). Without a state in HBM nothing is reused.
+
+        Returns the hit blocks per group, the state groups' padded with null
+        blocks to k, and h.
+        """
+        bs = self.kvpilot_block
+        hashes = request.block_hashes
+        k, states = 0, None
+        for i in range(max_length // bs - 1, -1, -1):
+            states = self.block_pool.get_cached_block(hashes[i], self.kvpilot_state_gids)
+            if states is not None:
+                k = (i + 1) * bs
+                break
+        attn: list[KVCacheBlock] = []
+        while hbm_kv and len(attn) * bs < k:
+            hit = self.block_pool.get_cached_block(hashes[len(attn)], [self.kvpilot_attn_gid])
+            if hit is None:
+                break
+            attn.append(hit[0])
+        groups: list[list[KVCacheBlock]] = [[] for _ in range(self.num_kv_cache_groups)]
+        groups[self.kvpilot_attn_gid] = attn
+        if k:
+            null = self.block_pool.null_block
+            for g, s in zip(self.kvpilot_state_gids, states, strict=True):
+                groups[g] = [null] * (k // bs - 1) + [s]
+        request.kvpilot_state_hit = k
+        return tuple(groups), len(attn) * bs
 
     def allocate_slots(
         self,
@@ -563,7 +696,31 @@ class KVCacheManager:
         )
         self.coordinator.free(request.request_id)
         if blocks is not None:
-            self.kvpilot.track(request.request_id, blocks, request.prompt_token_ids)
+            self.kvpilot.track(
+                request.request_id,
+                (blocks[self.kvpilot_attn_gid],),
+                request.prompt_token_ids,
+                self.kvpilot_end_states.pop(request.request_id, None),
+            )
+
+    def kvpilot_take_end_state(self, request: Request) -> None:
+        """Hybrid models: take a finished request's state at its prompt's last
+        full block (one reference) before vLLM drops it -- the decode side
+        gets only the running state; free() hands it to the placement."""
+        if self.kvpilot is None or not self.kvpilot_state_gids:
+            return
+        groups = self.coordinator.get_blocks(request.request_id)
+        blocks = full_prompt_blocks(
+            (groups[self.kvpilot_attn_gid],), len(request.prompt_token_ids), self.kvpilot_block
+        )
+        if not blocks:
+            return
+        states = boundary_states(
+            (groups[self.kvpilot_attn_gid], *(groups[g] for g in self.kvpilot_state_gids)),
+            blocks,
+        )
+        self.block_pool.touch(states)
+        self.kvpilot_end_states[request.request_id] = states
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

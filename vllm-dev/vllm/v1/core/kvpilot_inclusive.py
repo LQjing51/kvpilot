@@ -17,19 +17,26 @@ Both take the request's tier and times from the time model
 (kvpilot_blockwise.reqwise) when given one.
 
 Ties go in free order (HBM) and release order (master).
+
+Hybrid models: the state at the end of a head's prompt is held in HBM until
+its signal says there is no next turn, or the next turn supersedes it
+(kvpilot_states).
 """
 
 from __future__ import annotations
 
 from vllm.logger import init_logger
 from vllm.v1.core import kvpilot_blockwise, kvpilot_placement
+from vllm.v1.core.kv_cache_utils import get_block_hash
 from vllm.v1.core.kvpilot_claims import Claims
+from vllm.v1.core.kvpilot_states import StatePins
 
 logger = init_logger(__name__)
 
 
 def full_prompt_blocks(block_groups, num_prompt_tokens: int, block_size: int):
-    """The request's full blocks of prompt tokens, head first."""
+    """The request's full blocks of prompt tokens, head first. `block_groups`:
+    the full-attention group's blocks, then each state group's."""
     blocks = []
     for b in block_groups[0][: num_prompt_tokens // block_size]:
         if b.is_null or b.block_hash is None:
@@ -53,16 +60,19 @@ class InclusivePlacement:
         self._by_penalty = by_penalty
         self._connector = None
         self._claims = Claims()
+        self.states = StatePins(block_pool)
 
     def bind(self, connector) -> None:
         """The scheduler-side KV connector: names chunks, sets their classes."""
         self._connector = connector
 
-    def track(self, request_id: str, block_groups, token_ids) -> None:
-        """A request freed its blocks (just queued at the pending class)."""
+    def track(self, request_id: str, block_groups, token_ids, states=None) -> None:
+        """A request freed its blocks (just queued at the pending class).
+        `states`: the state at its prompt's end (hybrid models)."""
         blocks = full_prompt_blocks(block_groups, len(token_ids), self._block_size)
         if not blocks:
             return
+        self.states.track(blocks, states)
         lmc = self._connector.kvpilot_chunk_hashes(request_id, token_ids, len(blocks))
         if lmc is None:
             raise RuntimeError(f"KVPilot: no LMCache chunk hashes for {request_id}")
@@ -88,6 +98,8 @@ class InclusivePlacement:
             if b.block_hash == h
         ]
         moved = self._queue.rekey([b for b, _ in live], [k for _, k in live])
+        if tier is None:
+            self.states.release(get_block_hash(head.hashes[-1]))
         groups = self._connector.kvpilot_set_group_placement(head.lmc, tiers, pens)
         return {
             "tier": tier,

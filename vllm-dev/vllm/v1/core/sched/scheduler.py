@@ -853,7 +853,7 @@ class Scheduler(SchedulerInterface):
                             num_encoder_tokens,
                         ),
                         num_external_computed_tokens // self.block_size,
-                        new_computed_blocks.blocks[0],
+                        new_computed_blocks.blocks[self.kv_cache_manager.kvpilot_attn_gid],
                     )
                 new_blocks = allocate()
                 if new_blocks is None and lent:
@@ -871,7 +871,7 @@ class Scheduler(SchedulerInterface):
                         # and retry once their writes free it.
                         self.kvpilot_exclusive.demote(
                             self.kv_cache_manager.kvpilot_shortfall,
-                            new_computed_blocks.blocks[0],
+                            new_computed_blocks.blocks[self.kv_cache_manager.kvpilot_attn_gid],
                         )
                     if not request.kvpilot_block_start_ns:
                         request.kvpilot_block_start_ns = time.monotonic_ns()
@@ -2283,6 +2283,9 @@ class Scheduler(SchedulerInterface):
         if self.connector is None:
             return False, None
 
+        # KVPilot: a hybrid model's state at the prompt's end outlives the
+        # request (kvpilot_states); this drops it.
+        self.kv_cache_manager.kvpilot_take_end_state(request)
         # Free any out-of-window prefix blocks before we hand the block table to
         # the connector.
         self.kv_cache_manager.remove_skipped_blocks(

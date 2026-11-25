@@ -61,6 +61,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -897,6 +898,23 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
+        self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
+        # Qwen4Exp's PLE n-gram embedding reads the tokens before each
+        # request's first scheduled one (_ngram_model_kwargs).
+        text_config = self.model_config.hf_text_config
+        self._ngram_context_len = (
+            int(text_config.ngram_size) - 1
+            if getattr(text_config, "ple_layer_ids", None)
+            else 0
+        )
+        if self._ngram_context_len:
+            self._ngram_eos = int(text_config.eos_token_id)
+            self._ngram_context = self._make_buffer(
+                self.max_num_reqs, self._ngram_context_len, dtype=torch.int32
+            )
+            self._ngram_query_start_loc = self._make_buffer(
+                self.max_num_reqs + 1, dtype=torch.int32
+            )
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
         if self.cache_config.mamba_cache_mode == "all" and self.num_spec_tokens > 0:
             self.mamba_prev_last_scheduled_idx = self._make_buffer(
@@ -1001,6 +1019,22 @@ class GPUModelRunner(
             with_numpy=numpy,
         )
 
+    def _get_mamba_state_copy_funcs(self) -> MambaStateCopyFuncsByType:
+        if self._mamba_state_copy_funcs is None:
+            mamba_groups = mamba_utils.get_mamba_groups(self.kv_cache_config)
+            mamba_types = {spec.mamba_type for spec in mamba_groups}
+            if hasattr(self.model, "get_mamba_state_copy_funcs"):
+                copy_funcs = self.model.get_mamba_state_copy_funcs(mamba_types)
+            else:
+                # Hybrid models of 0.23 that do not subclass IsHybrid: one kind
+                # of Mamba state, as before Qwen4Exp's per-type copy funcs.
+                copy_funcs = {
+                    t: self.model.get_mamba_state_copy_func() for t in mamba_types
+                }
+            mamba_utils.validate_mamba_state_copy_funcs(mamba_groups, copy_funcs)
+            self._mamba_state_copy_funcs = copy_funcs
+        return self._mamba_state_copy_funcs
+
     def _get_mamba_bufs(self) -> mamba_utils.MambaBuffers:
         # Only reachable on the ``mamba_cache_mode == "align"`` path.
         # The postprocess sub-object is additionally gated on spec
@@ -1010,7 +1044,7 @@ class GPUModelRunner(
             self._mamba_bufs = mamba_utils.MambaBuffers.create(
                 max_num_reqs=self.max_num_reqs,
                 kv_cache_config=self.kv_cache_config,
-                copy_funcs=self.model.get_mamba_state_copy_func(),
+                copy_funcs=self._get_mamba_state_copy_funcs(),
                 make_buffer=self._make_buffer,
                 device=self.device,
                 with_postprocess_align=(
@@ -1019,8 +1053,53 @@ class GPUModelRunner(
             )
         return self._mamba_bufs
 
-    def _init_model_kwargs(self):
+    def _ngram_model_kwargs(
+        self, dummy_num_reqs: int | None = None, dummy_num_tokens: int = 0
+    ) -> dict[str, Any]:
+        """Qwen4Exp n-gram (PLE) inputs, as vLLM 0.30's Qwen4ExpModelState
+        gives them under the V2 runner: each request's query_start_loc and the
+        ngram_size - 1 tokens before its first scheduled one (EOS before the
+        prompt). A dummy batch splits its tokens evenly, context all EOS."""
+        n = self._ngram_context_len
+        if dummy_num_reqs is not None:
+            num_reqs = max(dummy_num_reqs, 1)
+            per_req, extra = divmod(dummy_num_tokens, num_reqs)
+            lens = np.full(num_reqs, per_req, dtype=np.int64)
+            if extra:
+                lens[-extra:] += 1
+            qsl = self._ngram_query_start_loc
+            qsl.np[0] = 0
+            qsl.np[1 : num_reqs + 1] = np.cumsum(lens)
+            qsl.copy_to_gpu(num_reqs + 1)
+            self._ngram_context.np[:num_reqs] = self._ngram_eos
+            self._ngram_context.copy_to_gpu(num_reqs)
+            return {
+                "query_start_loc": qsl.gpu[: num_reqs + 1],
+                "ngram_context": self._ngram_context.gpu[:num_reqs],
+            }
+        num_reqs = self.input_batch.num_reqs
+        computed = self.input_batch.num_computed_tokens_cpu[:num_reqs].astype(np.int64)
+        offsets = computed[:, None] + np.arange(-n, 0)[None, :]
+        tokens = self.input_batch.token_ids_cpu[
+            np.arange(num_reqs)[:, None], np.maximum(offsets, 0)
+        ]
+        self._ngram_context.np[:num_reqs] = np.where(
+            offsets >= 0, tokens, self._ngram_eos
+        )
+        self._ngram_context.copy_to_gpu(num_reqs)
+        return {
+            "query_start_loc": self.query_start_loc.gpu[: num_reqs + 1],
+            "ngram_context": self._ngram_context.gpu[:num_reqs],
+        }
+
+    def _init_model_kwargs(
+        self, dummy_num_reqs: int | None = None, dummy_num_tokens: int = 0
+    ):
         model_kwargs = dict[str, Any]()
+        if self._ngram_context_len:
+            model_kwargs.update(
+                self._ngram_model_kwargs(dummy_num_reqs, dummy_num_tokens)
+            )
 
         if not self.is_pooling_model:
             return model_kwargs
@@ -1527,7 +1606,7 @@ class GPUModelRunner(
                 input_batch=self.input_batch,
                 kv_cache_config=self.kv_cache_config,
                 forward_context=self.compilation_config.static_forward_context,
-                mamba_state_copy_funcs=self.model.get_mamba_state_copy_func(),
+                mamba_state_copy_funcs=self._get_mamba_state_copy_funcs(),
             )
 
             assert self.num_accepted_tokens_event is not None
@@ -4172,7 +4251,7 @@ class GPUModelRunner(
                     self.input_batch,
                     self.requests,
                     self.compilation_config.static_forward_context,
-                    self.model.get_mamba_state_copy_func(),
+                    self._get_mamba_state_copy_funcs(),
                     mamba_bufs.preprocess,
                 )
                 # preprocess_mamba resets num_accepted_tokens_cpu to 1
@@ -5825,7 +5904,7 @@ class GPUModelRunner(
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
-            model_kwargs = self._init_model_kwargs()
+            model_kwargs = self._init_model_kwargs(num_reqs, num_tokens_padded)
             if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
                 input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
 
@@ -5836,7 +5915,7 @@ class GPUModelRunner(
             elif self.enable_prompt_embeds:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
-                model_kwargs = self._init_model_kwargs()
+                model_kwargs = self._init_model_kwargs(num_reqs, num_tokens_padded)
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
@@ -7295,6 +7374,7 @@ class GPUModelRunner(
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
+        self._mamba_state_copy_funcs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)

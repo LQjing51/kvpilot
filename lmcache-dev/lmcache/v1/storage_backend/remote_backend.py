@@ -279,15 +279,10 @@ class RemoteBackend(StorageBackendInterface):
         connector does not support it."""
         return self._kvpilot_call("kvpilot_exist", keys)
 
-    def kvpilot_remove(self, keys: List[str]) -> Optional[List[int]]:
-        """Remove objects by store key (exclusive placement); per key 0 or a
-        negative error code, None if the connector does not support it."""
-        return self._kvpilot_call("kvpilot_remove", keys)
-
-    def kvpilot_remove_local_disk(self, keys: List[str]) -> int:
-        """Drop store keys from this client's SSD (exclusive placement);
-        returns how many it held."""
-        return self.connection.kvpilot_remove_local_disk(keys)
+    def kvpilot_remove_memory(self, keys: List[str]) -> int:
+        """Drop store keys' memory replicas, keeping disk ones (exclusive
+        placement); returns how many the master processed."""
+        return self.connection.kvpilot_remove_memory(keys)
 
     def kvpilot_offload_local(
         self, keys: List[str], ptrs: List[int], sizes: List[int]

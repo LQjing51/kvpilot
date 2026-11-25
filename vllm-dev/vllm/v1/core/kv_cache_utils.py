@@ -21,6 +21,7 @@ from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
@@ -426,14 +427,21 @@ class FreeKVCacheClassQueue:
     arrives without changing its place in free order. A block without KV sorts
     before every class. Exclusive placement `hold`s free blocks whose KV has no
     copy below: they sort after everything else, in penalty order, and are not
-    counted free nor handed out until written below and rekeyed. The ordering
-    lives in an indexed heap keyed by block_id (C++ when it can be built, see
+    counted free nor handed out until written below and rekeyed. A hybrid
+    model's linear-attention state block (`set_state_groups`) enters below
+    every class instead: a prefix hit needs the state at its end boundary, so
+    only the one at a prompt's last full block is worth keeping, and the
+    placement rekeys that one with its prefix. The ordering lives in an
+    indexed heap keyed by block_id (C++ when it can be built, see
     kvpilot_heap). Same interface as FreeKVCacheBlockQueue so BlockPool can use
     it as a drop-in.
     """
 
     # Above every class: held blocks sort last.
     _HELD_BASE = 1e9
+    # Below every key a placement gives (Belady's never-again is -1e9), above
+    # blocks without KV: states no prefix ends at.
+    _STATE = -2e9
     # Below every free-order seq: lent blocks are handed out first.
     _LEND_SEQ_BASE = -(1 << 62)
 
@@ -441,8 +449,13 @@ class FreeKVCacheClassQueue:
         from vllm.v1.core import kvpilot_heap, kvpilot_placement
 
         self._heap_cls = kvpilot_heap.heap_class()
-        self._pending = kvpilot_placement.pending_key(kvpilot_placement.strategy())
+        self.pending_key = kvpilot_placement.pending_key(kvpilot_placement.strategy())
+        self._state_gids: frozenset[int] = frozenset()
         self._init(blocks)
+
+    def set_state_groups(self, gids: list[int]) -> None:
+        """KV cache groups whose blocks hold linear-attention states."""
+        self._state_gids = frozenset(gids)
 
     def _init(self, blocks: list[KVCacheBlock]) -> None:
         self._blocks = blocks
@@ -487,7 +500,12 @@ class FreeKVCacheClassQueue:
             self._free_seq += 1
             b.kvp_free_seq = self._free_seq
             ids.append(b.block_id)
-            keys.append(-math.inf if b.block_hash is None else self._pending)
+            if b.block_hash is None:
+                keys.append(-math.inf)
+            elif self._state_gids and get_group_id(b.block_hash) in self._state_gids:
+                keys.append(self._STATE)
+            else:
+                keys.append(self.pending_key)
         self._heap.push_many(ids, keys)
 
     def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
@@ -798,6 +816,11 @@ def resolve_kv_cache_block_sizes(
     ):
         return scheduler_block_size, scheduler_block_size
 
+    # Groups that never serve a prefix hit (Qwen4Exp's QSA ring, one block per
+    # request) take no part in the hash granularity.
+    group_block_sizes = [
+        g.kv_cache_spec.block_size for g in groups if g.kv_cache_spec.prefix_cacheable
+    ] or group_block_sizes
     requested = cache_config.hash_block_size
     hash_block_size = (
         requested if requested is not None else math.gcd(*group_block_sizes)
@@ -1095,7 +1118,7 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
         return kv_cache_groups[0].kv_cache_spec.page_size_bytes
     if all(
         isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in kv_cache_groups
-    ):
+    ) or any(isinstance(g.kv_cache_spec, CircularBufferSpec) for g in kv_cache_groups):
         # buckets = {page_size: [[layer_names], [layer_names], ...]}
         buckets = _bucket_layers_by_page_size(kv_cache_groups)
         return sum(ps * len(slots) for ps, slots in buckets.items())
@@ -1446,8 +1469,12 @@ def get_kv_cache_config_from_groups(
     elif all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups
+    ) or any(
+        isinstance(group.kv_cache_spec, CircularBufferSpec)
+        for group in kv_cache_groups
     ):
         # DeepseekV4: UniformTypeKVCacheSpecs but multiple groups.
+        # Qwen4Exp (_get_kv_cache_groups_qsa): pages of several sizes.
         # Delegate to the DeepseekV4-specific allocator.
         num_blocks, kv_cache_tensors = _get_kv_cache_config_deepseek_v4(
             vllm_config, kv_cache_groups, available_memory
@@ -1781,6 +1808,55 @@ def _annotate_eagle_groups_deepseek_v4(
             break
 
 
+def _get_kv_cache_groups_qsa(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Qwen4Exp (QSA + GDN + PLE), backported from vLLM 0.30 without its
+    packed allocator. Groups, all with one block id space:
+
+      * main QSA KV and the indexer's compressed keys (one row per
+        compress_ratio tokens) of every QSA layer: one block id holds a page
+        of each, main KV first so the scheduler's spec is FullAttentionSpec;
+      * the indexer's raw-key rings: one block per request, no prefix hits;
+      * Mamba states (GDN, PLE short conv), as many layers per group as there
+        are QSA layers, pages padded to the main KV page by the hybrid
+        alignment so they share its tensors.
+
+    Tensors are planned per page size (_get_kv_cache_config_deepseek_v4).
+    None if the model has no QSA ring.
+    """
+    if not any(isinstance(s, CircularBufferSpec) for s in kv_cache_spec.values()):
+        return None
+    main = {n: s for n, s in kv_cache_spec.items() if type(s) is FullAttentionSpec}
+    compressed = {
+        n: s for n, s in kv_cache_spec.items() if isinstance(s, MLAAttentionSpec)
+    }
+    rings = {
+        n: s for n, s in kv_cache_spec.items() if isinstance(s, CircularBufferSpec)
+    }
+    mamba: dict[MambaSpec, list[str]] = defaultdict(list)
+    for name, spec in kv_cache_spec.items():
+        if isinstance(spec, MambaSpec):
+            mamba[spec].append(name)
+    grouped = len(main) + len(compressed) + len(rings) + sum(map(len, mamba.values()))
+    if grouped != len(kv_cache_spec) or not (
+        len(main) == len(compressed) == len(rings) > 0
+    ):
+        raise ValueError(f"Unexpected Qwen4Exp KV cache layers: {kv_cache_spec}")
+
+    attn_spec = UniformTypeKVCacheSpecs.from_specs({**main, **compressed})
+    assert attn_spec is not None, "QSA main and compressed keys must share blocks"
+    groups = [
+        KVCacheGroupSpec(list(attn_spec.kv_cache_specs), attn_spec),
+        KVCacheGroupSpec(list(rings), next(iter(rings.values()))),
+    ]
+    group_size = len(main)
+    for spec, names in mamba.items():
+        for i in range(0, len(names), group_size):
+            groups.append(KVCacheGroupSpec(names[i : i + group_size], spec))
+    return groups
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> list[KVCacheGroupSpec]:
@@ -1812,6 +1888,8 @@ def get_kv_cache_groups(
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
+    elif qsa_groups := _get_kv_cache_groups_qsa(kv_cache_spec):
+        return qsa_groups
     elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window
@@ -1952,6 +2030,26 @@ def _max_memory_usage_bytes_from_groups(
             )
             total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
         return total_max_mem_usage_bytes
+
+    if any(isinstance(g.kv_cache_spec, CircularBufferSpec) for g in kv_cache_groups):
+        # Qwen4Exp (_get_kv_cache_groups_qsa): one block id space, a block
+        # takes a page of every page-size bucket (_get_kv_cache_config_deepseek_v4).
+        buckets = _bucket_layers_by_page_size(kv_cache_groups)
+        bytes_per_block = sum(ps * len(slots) for ps, slots in buckets.items())
+
+        def group_blocks(group: KVCacheGroupSpec) -> int:
+            spec = group.kv_cache_spec
+            specs = (
+                spec.kv_cache_specs.values()
+                if isinstance(spec, UniformTypeKVCacheSpecs)
+                else [spec]
+            )
+            return max(
+                cdiv(s.max_memory_usage_bytes(vllm_config), s.page_size_bytes)
+                for s in specs
+            )
+
+        return bytes_per_block * sum(group_blocks(g) for g in kv_cache_groups)
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len

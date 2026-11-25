@@ -920,17 +920,14 @@ class MooncakestoreConnector(RemoteConnector):
         """Per key 1 if a completed replica exists, else 0 (one master RPC)."""
         return list(self.store.batch_is_exist(keys))
 
-    def kvpilot_remove(self, keys: List[str]) -> List[int]:
-        """Remove objects whatever replicas they have (exclusive placement:
-        a chunk leaving its tier). Per key 0, or a negative error code
-        (missing keys included)."""
-        return list(self.store.batch_remove(keys, True))
-
-    def kvpilot_remove_local_disk(self, keys: List[str]) -> int:
-        """Drop keys from this client's SSD and free their space once a
-        bucket has none left (exclusive placement: a chunk leaving SSD).
-        Returns how many keys this client held."""
-        return int(self.store.batch_remove_local_disk(keys))
+    def kvpilot_remove_memory(self, keys: List[str]) -> int:
+        """Drop keys' memory replicas, keeping disk ones (exclusive placement:
+        a chunk leaving DRAM). A replica a reader or an offload holds stays.
+        Returns how many keys the master processed."""
+        n = int(self.store.batch_remove_memory_replicas(keys))
+        if n < 0:
+            raise RuntimeError("Mooncake batch_remove_memory_replicas failed")
+        return n
 
     def kvpilot_offload_local(
         self, keys: List[str], ptrs: List[int], sizes: List[int]

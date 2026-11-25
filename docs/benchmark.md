@@ -30,6 +30,19 @@ placement / 观测相关的分别记在 [kv-placement.md](kv-placement.md) 和
 加载流量会改变另一边的 delay / compute。2026-11-04 的 1P1D boundary 搜索与 SWE 回放
 同时跑了约 25 分钟，4K–34K 的分界点全部作废重跑。先 `cleanforce` 上一个，再起下一个。
 
+## 成组的 Evaluation 实验，日志要拉回本地
+
+一组一组跑的 Evaluation 实验（`paper-figure/Eval-*`、`run_ab.sh` / `run_series.sh` 的多臂 A/B、request-safe 测量等
+要拿来下结论的），**每跑完一组就把日志拉回本地**，放进该实验的 `paper-figure/<实验>/raw/`，不等整批跑完。
+GPU 机器随时可能被释放，`/root` 下的东西全没：2026-11-24 Eval-EXP1 的 TraceLab 九组在 GPU 上跑完，还没拉回来
+机器就释放了，结果全丢。
+
+- 拉什么：prefill / decode 日志（gzip）、`benchmark.log`、`run.out`、master 日志里的 KVPilot 行，即
+  `paper-figure/Eval-EXP1/run_exp1.sh` 归档的那几样；大文件的处理同
+  [figure-guidelines.md](evalution/figure-guidelines.md)「`raw/`」。
+- 怎么拉（`scp` 不通）：`ssh Taiji-GPU 'cd <实验目录> && tar czf - raw/<...>' | tar xzf -`。
+- 简单测试（冒烟、正确性检查、试参数、复现 bug）不用拉，在 GPU 上看完日志即可。
+
 ## 非交互 ssh 必须自己 export PYTHONPATH
 
 **这是最容易浪费时间的一个坑。** GPU 机器上装了一份 **stock vLLM 0.23.0** 在
@@ -338,8 +351,8 @@ prelookup（lookup 时一次查好所有层副本，C++ `LayerwiseLoader` 把全
 |---|---|---|
 | `KVPILOT_SSD_OFFLOAD_PATH` | 空（关） | L4：打开 Mooncake SSD offload（master `--enable_offload`，每个 prefill 进程一个 `pid<pid>/` 子目录），并允许 prelookup 从本机 SSD 逐层加载。需要含 `SsdLayerwiseLoader` 的 c_ops 和含 `batch_locate_local_ssd` 的 Mooncake。见 [kv-placement.md](kv-placement.md)「L4」 |
 | `KVPILOT_SSD_READ_GIBPS` | 空（不限） | 每个 prefill 进程（TP rank）SSD 读带宽上限，GiB/s。每次读在同一条时间表上按此速率预约，读完不早于预约结束（没有空闲攒下的突发额度）。按「本 GPU 分到的整机 SSD 带宽」设：裸读峰值 12.8 / 8 GPU = `1.6`，1P TP2 合计 2/8 峰值。`test_loader.py bench` 实测两进程合计 3.16 GiB/s、28.9 ms/1K token（不限时 7.5–9.4）。需要重编的 c_ops |
-| `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` / `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | 开 SSD 时 `1` / `48` | 心跳本身 fork 固定成 100 ms，前者只剩 client buffer GC 的间隔；后者是 bucket 大小（Mooncake 默认 500）。凑不满的剩余 key 由 fork 在下一次没有新 key 的心跳里单独写出（见 [kv-placement.md](kv-placement.md)） |
-| `MODEL` | CFS 上的 Qwen3-30B 路径 | 默认直接用 CFS（见 [gpu-restore.md](gpu-restore.md)）。冷启动偏慢但不必先拷本地；仅 CFS 超时再改指 `/root/models/...` |
+| `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` / `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | 开 SSD 时 `1` / 全注意力层数（Qwen3-30B 48，Qwen3.6 10） | 心跳本身 fork 固定成 100 ms，前者只剩 client buffer GC 的间隔；后者是 bucket 大小（Mooncake 默认 500）。凑不满的剩余 key 由 fork 在下一次没有新 key 的心跳里单独写出（见 [kv-placement.md](kv-placement.md)） |
+| `MODEL` | CFS 上的 Qwen3-30B 路径 | 默认直接用 CFS（见 [gpu-restore.md](gpu-restore.md)）。冷启动偏慢但不必先拷本地；仅 CFS 超时再改指 `/root/models/...`。混合注意力模型（`/cfs_cloud_code/kiry/model/Qwen/Qwen3.6-35B-A3B`）自动换块大小和相关参数，见 [kv-placement.md](kv-placement.md)「混合模型」 |
 | `PREFILL_EXTRA_ARGS` | 空 | 只传给 prefill worker 的额外 vLLM 参数（按空格切分），例如 `--num-gpu-blocks-override 768` 把 HBM prefix cache 压小，用来在 `-p` 不变时制造 DRAM / SSD 命中 |
 | `PREFILL_COMPILATION_CONFIG` | 空 | 传给 prefill worker 的 `--compilation-config`。不设时 `--max-num-seqs 1` 使最大捕获尺寸为 2，prefill 全走 eager；设成 `{"cudagraph_capture_sizes":[64,128,256,512,1024]}` 后 suffix ≤ 1024 走 PIECEWISE cudagraph，token 数向上补齐到最近一档，补齐的部分真实计算。**它会改变 compute 基线**，前后两组数据不能直接比 |
 
@@ -395,6 +408,7 @@ nsys stop --session=profile-<pid>       # 逐个停，每个约几分钟（1 GB 
 | `NUM_DECODE_WORKERS` | `2` | D worker 数 |
 | `LOG_DIR` | 由 `dynamo_script.sh` 传入 | 所有日志与观测输出的落点 |
 | `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` | `1800` | 单次 execute_model 超时；长 prompt + 大量加载时容易撞默认值 |
+| `KVPILOT_NUMA_BIND` | `1` | P / D 每个 worker 用 `numactl --cpunodebind=N --preferred=N` 起在它的 GPU 所在的 NUMA 节点（按第一张卡的 PCI 设备查，一个 worker 的卡跨节点直接报错）；`0` 不绑。不绑时 TP 4 的部分 rank SSD 加载变慢，见 [pitfalls.md](pitfalls.md)「跨进程/跨机」 |
 | `TZ` | `UTC0` | 见下 |
 
 剩下几个是写死的基础设施常量，一般不用动：`DYN_LOG=info`、
@@ -410,13 +424,9 @@ worker 之间、两次跑之间的 block hash 全都对不上，跨进程的 pre
 `disagg_lmcache.sh` 里写死 `0`。后者在 worker 子进程里后设，所以**实际生效的是 `0`**，
 要改就两处一起改。
 
-模型与并行在 `disagg_lmcache.sh` 里是普通变量，不走环境变量：
-
-```bash
-MODEL="/cfs_cloud_code/kiry/model/Qwen/Qwen3-30B-A3B-Instruct-2507"
-BLOCK_SIZE=512
-GPU_MEM_UTIL=0.95
-```
+模型走环境变量 `MODEL`（默认 Qwen3-30B-A3B），块大小由模型定：`disagg_lmcache.sh` 读 config.json，普通模型
+`BLOCK_SIZE=512`，混合注意力模型（Qwen3.6-35B-A3B）1536，连同 prefix caching 等参数一起切换，见
+[kv-placement.md](kv-placement.md)「混合模型」。
 
 `--max-model-len` 没显式设，走默认推导 262,144——这同时决定了 KV 池子的硬下界 512 块
 （见上面的「压测参数怎么调」）。

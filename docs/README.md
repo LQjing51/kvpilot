@@ -83,6 +83,7 @@ kvpilot/
 | `ssd_load_check/` | SSD 逐层加载：C++ loader 的逐字节正确性检查与带宽测试（`test_loader.py`），以及同一 prompt 分别从 HBM / DRAM / SSD 加载的端到端对比（`run.sh` + `analyze.py`） |
 | `trace_order/` | 把 SWE / TraceLab 重排成跨 session 轮转（session 内保序），让复用落到 DRAM / SSD：离线三层命中模型（`tier_sim.py`）、重排（`make_order.py`，含按 KV 预算并发、结束一个补一个的 `--align budget`）、1P1D 回放（`run.sh`）、从 prefill 日志统计逐层命中（`tier_hits.py`） |
 | `trace_select/` | 从全量 SWE 挑整条 session，让 HBM safe : DRAM safe ≈ 1:2（`select_safe_mix.py`，按 request-safe 实测的经验概率估计，不需要 GPU） |
+| `hybrid_check/` | 混合模型（Qwen3.6）的正确性检查：`run_check.sh` 在 GPU 上起 1P1D，`check_state_reuse.py` 比较第二轮从 DRAM / SSD / HBM 复用时和冷算的输出，见 [kv-placement.md](kv-placement.md)「混合模型」 |
 | `h2d_bw/` | 多卡同时从 DRAM 做 H2D 时每卡的带宽（`h2d_bw.py`，每卡一个进程，pinned + `cudaMemcpyBatchAsync`，不起服务）。2026-11-11 实测单卡 57.6 GB/s；共用 PCIe host bridge 的 GPU 1/2、6/7 同时读各降到 36.6；8 卡本地 NUMA 合计 376 GB/s。结果在 `run.out` |
 
 **产出**

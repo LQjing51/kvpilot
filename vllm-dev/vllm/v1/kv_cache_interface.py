@@ -102,6 +102,10 @@ class KVCacheSpec:
     block_size: int
 
     @property
+    def prefix_cacheable(self) -> bool:
+        return True
+
+    @property
     def page_size_bytes(self) -> int:
         """
         The size of a page with `block_size` tokens in bytes.
@@ -529,6 +533,46 @@ class SlidingWindowSpec(AttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class CircularBufferSpec(AttentionSpec):
+    """One block per request holding the raw keys of the token group that
+    is still being compressed (Qwen4Exp QSA indexer, backported from vLLM
+    0.30). ``block_size`` is the ring capacity; keys only, no V."""
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * self.head_size
+            * get_dtype_size(self.dtype)
+        )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        # The ring occupies one block per request for its whole lifetime.
+        del vllm_config
+        return self.page_size_bytes
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(
+            isinstance(spec, CircularBufferSpec) for spec in kv_cache_specs.values()
+        )
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
+
+
+class KVCacheLayout(str, Enum):
+    """Per-block page layouts of vLLM 0.30's packed allocator. Only named so
+    backported Qwen4Exp backends import; 0.23 keeps one tensor per layer."""
+
+    BLNHC = "BLNHC"
+    BLHNC = "BLHNC"
+
+
+@dataclass(frozen=True, kw_only=True)
 class SlidingWindowMLASpec(SlidingWindowSpec):
     """Sliding window attention with MLA cache format."""
 
@@ -612,6 +656,9 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
+    # rank holds the full state (e.g. Qwen4Exp's replicated PLE conv state).
+    tp_replicated: bool = False
 
     @property
     def page_size_bytes(self) -> int:
@@ -641,6 +688,8 @@ class MambaSpec(KVCacheSpec):
         return all(
             isinstance(spec, MambaSpec)
             and spec.num_speculative_blocks == self.num_speculative_blocks
+            and spec.page_size_bytes == self.page_size_bytes
+            and spec.tp_replicated == self.tp_replicated
             for spec in kv_cache_specs.values()
         )
 
@@ -727,6 +776,15 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     """
 
     kv_cache_specs: dict[str, KVCacheSpec]
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
+
+    @property
+    def first_spec(self) -> KVCacheSpec:
+        """Return the first spec in the group."""
+        return next(iter(self.kv_cache_specs.values()))
 
     @property
     def page_size_bytes(self) -> int:

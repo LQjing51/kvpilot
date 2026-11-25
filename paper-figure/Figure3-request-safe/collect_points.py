@@ -20,26 +20,26 @@ LOAD = re.compile(r"KVPilot load req=(\d{8})-\S+ tokens=(\d+) .*?load=([\d.]+)ms
                   r"(?: ssd=(\d+) first=([\d.]+)ms)?")
 
 
-def loads(run):
-    """req id -> (load ms, first ms), the slower rank, last episode wins."""
+def loads(run, tp):
+    """req id -> (load ms, first ms), the slowest of its tp ranks, last episode wins."""
     per = defaultdict(list)
     for f in _prefill_logs(run):
         for line in open_log(f):
             for m in LOAD.finditer(line):
                 per[int(m[1])].append((float(m[3]), float(m[5] or 0.0)))
-    return {rid: (max(a for a, _ in v[-2:]), max(b for _, b in v[-2:])) for rid, v in per.items()}
+    return {rid: (max(a for a, _ in v[-tp:]), max(b for _, b in v[-tp:])) for rid, v in per.items()}
 
 
-def collect(datasets) -> list:
-    """Points of raw/<dataset> runs, in order."""
+def collect(datasets, raw: str = "raw") -> list:
+    """Points of <raw>/<dataset> runs, in order."""
     out = []
     for name in datasets:
-        d = HERE / "raw" / name
+        d = HERE / raw / name
         _, res, _ = dataset(d)
         n0 = len(out)
         for run in runs(d):
-            ld = loads(run)
             rows = [json.loads(x) for x in open(run / "trace.jsonl")]
+            ld = loads(run, rows[0].get("tp", 2))
             meta = defaultdict(dict)
             for i, r in enumerate(rows):
                 if r["kind"] in ("t1", "t2", "t4"):

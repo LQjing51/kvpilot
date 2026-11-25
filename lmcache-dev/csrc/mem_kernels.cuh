@@ -144,6 +144,14 @@ void batched_memcpy_h2d(const std::vector<int64_t>& src_ptrs,
 void batched_memcpy_d2h(torch::Tensor& src, const std::vector<int64_t>& dst_ptrs,
                         const std::vector<int64_t>& sizes);
 
+// KVPilot: explicit (dst, src, bytes) copies in one cudaMemcpyBatchAsync on
+// the current stream, any direction; a 0 dst skips its copy. Moves a side
+// page (Qwen3.8's indexer keys, one page per block) as a whole: unlike the KV
+// it has no token-major form to gather.
+void batched_memcpy_async(const std::vector<int64_t>& dst_ptrs,
+                          const std::vector<int64_t>& src_ptrs,
+                          const std::vector<int64_t>& sizes);
+
 // KVPilot exclusive unblocking: HBM blocks lent to a request's load still hold
 // KV whose only copy they are; it goes to its DRAM replicas before the load
 // overwrites them. start() enqueues every layer on the current stream (not the
@@ -161,10 +169,15 @@ class LayerEvictor {
   LayerEvictor& operator=(const LayerEvictor&) = delete;
   // layer_ptrs: contiguous int64 [layers, blocks] CPU tensor, the replica of
   // each block's value per layer; slot_mapping: the blocks' slots, block after
-  // block.
+  // block. side_src / side_dst: optional int64 [layers, blocks] CPU tensors,
+  // each block's side page (device) and where it goes in the value (host, 0 =
+  // skip); copied in the layer before its event.
   void start(const torch::Tensor& layer_ptrs, torch::Tensor staging0,
              torch::Tensor staging1, std::vector<torch::Tensor> kvcaches,
-             torch::Tensor slot_mapping, const GPUKVFormat gpu_kv_format);
+             torch::Tensor slot_mapping, const GPUKVFormat gpu_kv_format,
+             const std::optional<torch::Tensor>& side_src,
+             const std::optional<torch::Tensor>& side_dst,
+             const int64_t side_bytes);
   // The per-layer events, as cudaEvent_t handles.
   std::vector<int64_t> events() const;
 
@@ -198,6 +211,9 @@ struct LoadTiming {
 // across requests: a wait binds to the record preceding it, so a later request
 // re-recording an event does not move earlier waits. evict_events: a
 // LayerEvictor's events() when the load overwrites lent blocks, else empty.
+// side_dst: optional int64 [layers, chunks] CPU tensor; each value then holds
+// side_bytes more after its sizes[c] KV bytes, copied in the layer's batch
+// straight to side_dst[l][c] (device), before the layer's event.
 class LayerwiseLoader {
  public:
   LayerwiseLoader() = default;
@@ -211,7 +227,9 @@ class LayerwiseLoader {
                                     torch::Tensor slot_mapping,
                                     const GPUKVFormat gpu_kv_format,
                                     const int64_t lookahead, const bool timing,
-                                    const std::vector<int64_t>& evict_events);
+                                    const std::vector<int64_t>& evict_events,
+                                    const std::optional<torch::Tensor>& side_dst,
+                                    const int64_t side_bytes);
   void step(const int64_t layer, const bool wait);
 
  private:
@@ -221,6 +239,10 @@ class LayerwiseLoader {
   std::vector<std::vector<void*>> dsts_;
   std::vector<std::vector<const void*>> srcs_;
   std::vector<std::vector<size_t>> bytes_;
+  // Side pages per layer: device destinations and host sources.
+  std::vector<std::vector<void*>> side_dsts_;
+  std::vector<std::vector<const void*>> side_srcs_;
+  size_t side_bytes_ = 0;
   torch::Tensor staging_[2];
   std::vector<torch::Tensor> kvcaches_;
   torch::Tensor slots_;

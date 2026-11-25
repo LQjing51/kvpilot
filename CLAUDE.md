@@ -69,6 +69,7 @@ grep -c 'KVPilot placement=' dynamo-log/<name>-logs/prefill-0.log
 
 - 除非我要求，否则**不要在 GPU 机器上起服务、跑测试**。
 - **一台 GPU 机器同一时间只跑一个实验**：服务之间共用 DRAM / SSD，会互相干扰（见 docs/benchmark.md）。
+- **成组的 Evaluation 实验每跑完一组就把日志拉回本地**（`paper-figure/<实验>/raw/`）：GPU 机器随时会被释放。简单测试不用拉（见 docs/benchmark.md）。
 - 除非我要求，**不要将修改后的代码同步到 GPU 机器**。
 - 除非我要求，**不要 git commit**。改完代码、跑完实验都保持 unstaged，我说提交再提交。
 - 代码修改原则：这是实验代码，不需要保证极端情况/努棒性。只处理测试里真会出现的情况。查不到、对不上就直接报错退出，不做 fallback。保护逻辑要么有过真实事故，要么是策略语义本身要求的。

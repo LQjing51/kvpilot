@@ -186,6 +186,18 @@ class Request:
         # Waiting for HBM: from the first failed allocation to admission.
         self.kvpilot_block_start_ns: int = 0
         self.kvpilot_blocked_ns: int = 0
+        # Hybrid models: where the reused prefix ends, at the linear-attention
+        # state HBM holds (KVCacheManager.get_computed_blocks); the connector
+        # loads the KV between HBM's attention blocks and it.
+        self.kvpilot_state_hit: int | None = None
+        # Hybrid models: set by the connector when the KV below cannot reach
+        # the state HBM holds and nothing is on its way down; the state is
+        # then looked for at or before it.
+        self.kvpilot_state_cap: int | None = None
+        # Exclusive placement: the end of the furthest prompt block past
+        # HBM's leading KV run that a job is writing below; the connector
+        # waits until its lookup reaches it.
+        self.kvpilot_pending_hit: int = 0
 
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a

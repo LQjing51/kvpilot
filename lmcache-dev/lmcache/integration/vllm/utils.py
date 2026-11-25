@@ -247,7 +247,7 @@ def create_lmcache_metadata(
     use_mla = mla_enabled(model_cfg)
 
     # Construct KV shape (for memory pool)
-    num_layer = model_cfg.get_num_layers(parallel_cfg)
+    num_layer = model_cfg.get_num_layers_by_block_type(parallel_cfg, "attention")
     chunk_size = config.chunk_size
     num_kv_head = model_cfg.get_num_kv_heads(parallel_cfg)
     head_size = model_cfg.get_head_size()

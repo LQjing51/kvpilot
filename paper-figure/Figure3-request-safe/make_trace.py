@@ -9,6 +9,9 @@
     python3 make_trace.py tracelab_reqprio --stop 2267  # -> raw/tracelab_reqprio/part{0,1}/
     python3 make_trace.py swe --raw raw/ssdcap --stride 3
     python3 make_trace.py swe --start 2000 --stop 5140 --part part1
+    python3 make_trace.py swe_blockprio_k160 --model qwen3.6 --raw raw/qwen3.6 --stop 1300
+    python3 make_trace.py swe_blockprio_k160 --model qwen3.6-tp4 --raw raw/qwen3.6-tp4 --stop 1300
+    python3 make_trace.py swe_blockprio_k160 --model qwen3.8 --raw raw/qwen3.8 --stop 1300
 
 --raw puts the run under another root (one per loader configuration); --stride
 keeps every Nth kept line (prefix and seen set still follow every line), so a
@@ -19,9 +22,12 @@ source lines [start, stop) (prefixes still count every earlier line), and
 measured in pieces on separate services.
 
 Prefix = longest leading full-512 blocks already seen in an earlier line
-(infinite pool), capped so ≥1 block is still computed. Lines with prefix 0
-are skipped entirely (not replayed, not classified). Their blocks still enter
-the seen set so later lines keep the same theoretical prefix.
+(infinite pool), capped so ≥1 block is still computed, in whole vLLM blocks of
+the model (--model; a hybrid model's hit ends at a state, one per block
+boundary a prompt ends at, so warm's prompt is the prefix). Lines with prefix
+0 are skipped entirely (not replayed, not classified). Their blocks still
+enter the seen set so later lines keep the same theoretical prefix. Every row
+records the model's block and KV layers for the source checks.
 
 Only the lengths come from the trace: each line replays on fresh hash ids, so
 its warm computes and stores the whole prefix, and [1] / [2] / [4] do not
@@ -38,13 +44,30 @@ import argparse
 import json
 from pathlib import Path
 
+# Tokens per trace hash id.
 BLOCK, LINES = 512, 2000
 FRESH, HEAD = 10**9, 2 * 10**9
 PARTS = {"tracelab": 2, "swe_hbm1to2": 2, "swe_reqprio": 2, "tracelab_reqprio": 2}
-KV_BYTES = 48 * 4 * 128 * 2 * 2  # Qwen3-30B-A3B bf16 K+V per token, both TP ranks
+# TP ranks, vLLM block, KV layers, bf16 K+V bytes per token (all TP ranks;
+# Qwen3.6's 2 KV heads are replicated at TP 4), and whether the prefill side
+# computes the prompt but its last token (hybrid models under P/D: NIXL leaves
+# the last token, and its state, to the decode side).
+MODELS = {
+    "qwen3-30b": {"tp": 2, "block": 512, "kv_layers": 48, "kv_bytes": 48 * 4 * 128 * 2 * 2,
+                  "drops_last": False},
+    "qwen3.6": {"tp": 2, "block": 1536, "kv_layers": 10, "kv_bytes": 10 * 2 * 256 * 2 * 2,
+                "drops_last": True},
+    "qwen3.6-tp4": {"tp": 4, "block": 1024, "kv_layers": 10, "kv_bytes": 10 * 4 * 256 * 2 * 2,
+                    "drops_last": True},
+    # Qwen3.8-Flash-Next: 12 QSA layers, 2 KV heads (replicated at TP 4), each
+    # value carrying 64 B per token of indexer keys.
+    "qwen3.8": {"tp": 4, "block": 1024, "kv_layers": 12,
+                "kv_bytes": 12 * 4 * (256 * 2 * 2 + 64), "drops_last": True},
+}
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 TRACES = {
+    "swe_blockprio_k160": ROOT / "datasets/block-priority-trace/swe_blockprio_k160.jsonl",
     "toolagent": ROOT / "datasets/mooncake-trace/toolagent_trace.jsonl",
     "swe": ROOT / "datasets/agent-traces/swe-smith-trajectories/swe_mooncake.jsonl",
     "swe_hbm1to2": ROOT / "datasets/agent-traces/swe-smith-trajectories/swe_hbm1to2.jsonl",
@@ -55,9 +78,11 @@ TRACES = {
 }
 
 
-def row(src, kind, tier, hids, length, p, delay_ms=0):
+def row(src, kind, tier, hids, length, p, model, delay_ms=0):
     r = {"timestamp": 0, "input_length": length, "output_length": 1, "hash_ids": hids,
-         "src_line": src, "kind": kind, "tier": tier, "prefix": p}
+         "src_line": src, "kind": kind, "tier": tier, "prefix": p, "tp": model["tp"],
+         "block": model["block"], "kv_layers": model["kv_layers"],
+         "drops_last": model["drops_last"]}
     if tier:
         r["extra_body"] = {"cache_use_control": [tier], "cache_use_max_tokens": p}
     if delay_ms:
@@ -65,8 +90,11 @@ def row(src, kind, tier, hids, length, p, delay_ms=0):
     return r
 
 
-def lines(trace, stop=LINES):
+def lines(trace, model, stop=LINES):
     seen = set()
+    block = model["block"]
+    # The prefill side's hit stops a token short of what it computes.
+    last = 2 if model["drops_last"] else 1
     for src, d in enumerate(map(json.loads, open(trace))):
         if src == stop:
             return
@@ -76,7 +104,7 @@ def lines(trace, stop=LINES):
         while k < len(full) and full[k] in seen:
             k += 1
         seen.update(full)
-        yield src, ids, n, min(k, (n - 1) // BLOCK) * BLOCK
+        yield src, ids, n, max(0, min(k * BLOCK // block, (n - last) // block)) * block
 
 
 class Fresh:
@@ -88,7 +116,7 @@ class Fresh:
         return list(range(self.next - n, self.next))
 
 
-def line_rows(src, n, p, tiers, fresh, heads, delay_ms=0):
+def line_rows(src, n, p, tiers, fresh, heads, model, delay_ms=0):
     """Warm plus one test per tier, all on a new p-token prefix, each test
     with its own suffix of the same length; [4] after delay_ms.
 
@@ -98,9 +126,15 @@ def line_rows(src, n, p, tiers, fresh, heads, delay_ms=0):
     """
     pre = heads(1) + fresh(p // BLOCK - 1)
     nsuf = -(-(n - p) // BLOCK)
-    out = [row(src, "warm", 0, pre, p, p)]
+    if model["drops_last"]:
+        # One token more, so the prefill side computes the prefix and leaves
+        # its state at p.
+        out = [row(src, "warm", 0, pre + fresh(1), p + 1, p, model)]
+    else:
+        out = [row(src, "warm", 0, pre, p, p, model)]
     for t in tiers:
-        out.append(row(src, f"t{t}", t, pre + fresh(nsuf), n, p, delay_ms if t == 4 else 0))
+        out.append(row(src, f"t{t}", t, pre + fresh(nsuf), n, p, model,
+                       delay_ms if t == 4 else 0))
     return out
 
 
@@ -129,10 +163,11 @@ def split(groups, parts):
     return out + [cur]
 
 
-def main(name, raw="raw", stride=1, start=0, stop=LINES, part=None):
+def main(name, raw="raw", stride=1, start=0, stop=LINES, part=None, model="qwen3-30b"):
     out_dir = HERE / raw / name
+    m = MODELS[model]
     fresh, heads, groups, skipped, kept = Fresh(FRESH), Fresh(HEAD), [], 0, 0
-    for src, _ids, n, p in lines(TRACES[name], stop):
+    for src, _ids, n, p in lines(TRACES[name], m, stop):
         if src < start:
             continue
         if not p:
@@ -141,7 +176,7 @@ def main(name, raw="raw", stride=1, start=0, stop=LINES, part=None):
         kept += 1
         if (kept - 1) % stride:
             continue
-        groups.append(line_rows(src, n, p, (1, 2, 4), fresh, heads))
+        groups.append(line_rows(src, n, p, (1, 2, 4), fresh, heads, m))
     if part:
         parts, dirs = [groups], [out_dir / part]
     else:
@@ -158,7 +193,7 @@ def main(name, raw="raw", stride=1, start=0, stop=LINES, part=None):
         with open(d / "trace.jsonl", "w") as f:
             for r in rows:
                 f.write(json.dumps(r) + "\n")
-        tb = kv_blocks(rows) * BLOCK * KV_BYTES / 1e12
+        tb = kv_blocks(rows) * BLOCK * m["kv_bytes"] / 1e12
         print(f"{d.relative_to(HERE)}: lines {len(part)}, requests {len(rows)}, "
               f"KV written ~{tb:.1f} TB")
     print(f"{name}: lines {start}-{stop}: kept {len(groups)} of {kept} (prefix>0, stride {stride}), "
@@ -173,5 +208,6 @@ if __name__ == "__main__":
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--stop", type=int, default=LINES)
     ap.add_argument("--part", help="write <raw>/<name>/<part>/ only, unsplit")
+    ap.add_argument("--model", choices=list(MODELS), default="qwen3-30b")
     a = ap.parse_args()
-    main(a.name, a.raw, a.stride, a.start, a.stop, a.part)
+    main(a.name, a.raw, a.stride, a.start, a.stop, a.part, a.model)

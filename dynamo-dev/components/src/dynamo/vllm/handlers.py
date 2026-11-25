@@ -3301,7 +3301,11 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             encode_worker_client=encode_worker_client,
         )
         self._kvpilot = (
-            KvpilotReporter(getattr(engine, "tokenizer", None), prefill_feedback_client)
+            KvpilotReporter(
+                getattr(engine, "tokenizer", None),
+                prefill_feedback_client,
+                engine.vllm_config.cache_config.block_size,
+            )
             if prefill_feedback_client is not None
             else None
         )

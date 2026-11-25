@@ -113,6 +113,38 @@ def test_dram_then_same_tier_writes_only_new(env):
     assert b[3].block_hash is None and b[3].ref_cnt == 0
 
 
+def test_pending_hit_reaches_a_block_being_written(env):
+    """KVCacheManager._kvpilot_pending_hit: past HBM's leading run, a block
+    HBM still holds is one a job is writing down; the connector waits until
+    its lookup reaches it rather than computing it again."""
+    from types import SimpleNamespace
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    pool, excl, conn = env
+    _run(pool, excl, "a", [b"h1", b"h2", b"h3"])
+    excl.apply("a", "DRAM", _time(2.0, 9.0))
+    _done(excl, conn)
+    _run(pool, excl, "b", [b"h1", b"h2", b"h3", b"h4"])
+    excl.apply("b", "DRAM", _time(2.0, 9.0))
+    # The test pool caches by plain hash (the engine's by hash and group).
+    one = pool.cached_block_hash_to_block.get_one_block
+    pool.get_cached_block = lambda h, gids: [one(h)] if one(h) is not None else None
+    mgr = SimpleNamespace(block_pool=pool, kvpilot_block=BS, kvpilot_attn_gid=0, kvpilot=excl)
+    req = SimpleNamespace(block_hashes=[b"h1", b"h2", b"h3", b"h4", b"h5"])
+    pending = KVCacheManager._kvpilot_pending_hit
+    # h1-h3 left HBM at the signal (already in DRAM); h4 is being written.
+    assert pending(mgr, req, 0, 5 * BS - 1) == 4 * BS
+    _done(excl, conn)
+    assert pending(mgr, req, 0, 5 * BS - 1) == 0
+    # Held for HBM is in HBM but on its way nowhere: past a gap (here, a
+    # prefix match taken as 0) it is not waited for.
+    _run(pool, excl, "c", [b"g1", b"g2"])
+    excl.apply("c", "HBM", _time(8.0, 22.0))
+    assert not conn.jobs and one(b"g2") is not None
+    assert pending(mgr, SimpleNamespace(block_hashes=[b"g1", b"g2", b"g3"]), 0, 3 * BS - 1) == 0
+
+
 def test_tier_changes_move_blocks(env):
     pool, excl, conn = env
     _run(pool, excl, "a", [b"h1", b"h2"])
@@ -135,26 +167,47 @@ def test_tier_changes_move_blocks(env):
     assert job["ssd"] == [0, 1, 2, 3] and job["drop"] == []
     _done(excl, conn)
     assert all(x.block_hash is None and x.ref_cnt == 0 for x in d)
-    # Back to DRAM: removed from SSD and written to DRAM.
+    # Back to DRAM: written to DRAM; the SSD copies stay.
     _run(pool, excl, "e", [b"h1", b"h2", b"h3", b"h4", b"h5"])
     excl.apply("e", "DRAM", _time(1.0, 4.0))
     (job,) = conn.jobs
-    assert job["drop"] == [0, 1, 2, 3] and job["dram"] == [0, 1, 2, 3, 4]
+    assert job["drop"] == [] and job["dram"] == [0, 1, 2, 3, 4]
+    _done(excl, conn)
+    # SSD again: h1..h4 only lose their DRAM copy; h5 is written (its DRAM
+    # copy removed first), as is the new h6.
+    _run(pool, excl, "f", [b"h1", b"h2", b"h3", b"h4", b"h5", b"h6"])
+    excl.apply("f", "SSD", _time(1.0, 1.0))
+    (job,) = conn.jobs
+    assert job["drop"] == [0, 1, 2, 3, 4] and job["ssd"] == [4, 5] and job["dram"] == []
 
 
-def test_no_next_turn_keeps_data_below(env):
+def test_ssd_copy_stays_when_moving_up(env):
+    pool, excl, conn = env
+    _run(pool, excl, "a", [b"h1", b"h2"])
+    excl.apply("a", "SSD", _time(1.0, 1.0))
+    _done(excl, conn)
+    # HBM safe next: held in HBM, the SSD copies kept (nothing to send).
+    _run(pool, excl, "b", [b"h1", b"h2", b"h3"])
+    excl.apply("b", "HBM", _time(8.0, 22.0))
+    assert conn.jobs == []
+    # SSD safe again: h1, h2 lose their HBM copy at once; h3, h4 are written.
+    c = _run(pool, excl, "c", [b"h1", b"h2", b"h3", b"h4"])
+    excl.apply("c", "SSD", _time(1.0, 1.0))
+    (job,) = conn.jobs
+    assert job["ssd"] == [2, 3] and job["drop"] == []
+    assert c[0].block_hash is None and c[1].block_hash is None
+
+
+def test_no_next_turn_frees_hbm_without_writing(env):
     pool, excl, conn = env
     _run(pool, excl, "a", [b"h1", b"h2"])
     excl.apply("a", "SSD", _time(1.0, 1.0))
     _done(excl, conn)
     b = _run(pool, excl, "b", [b"h1", b"h2", b"h3"])
     excl.apply("b", None, None)
-    (job,) = conn.jobs
-    # Nothing is deleted: h1, h2 keep their SSD copy, h3 goes to SSD.
-    assert job["drop"] == [] and job["dram"] == [] and job["ssd"] == [2]
-    assert b[0].block_hash is None and b[1].block_hash is None
-    assert b[2].block_hash == b"h3"
-    _done(excl, conn)
+    # Nothing is written or deleted: h1, h2 keep their SSD copy, h3 (only in
+    # HBM) is just freed.
+    assert conn.jobs == []
     assert all(x.block_hash is None and x.ref_cnt == 0 for x in b)
     # The signal ended the head: another one for it means a broken run.
     with pytest.raises(RuntimeError):
@@ -166,10 +219,12 @@ def test_no_next_turn_marks_dram_copies_first_to_demote(env):
     _run(pool, excl, "a", [b"h1", b"h2"])
     excl.apply("a", "DRAM", _time(1.0, 4.0))
     _done(excl, conn)
-    _run(pool, excl, "b", [b"h1", b"h2", b"h3"])
+    b = _run(pool, excl, "b", [b"h1", b"h2", b"h3"])
     excl.apply("b", None, None)
     (job,) = conn.jobs
-    assert job["zero"] == [0, 1] and job["ssd"] == [2] and job["drop"] == []
+    # h3 is only in HBM: freed, not written.
+    assert job["zero"] == [0, 1] and job["ssd"] == [] and job["drop"] == []
+    assert b[2].block_hash is None
 
 
 def test_shared_prefix_follows_fastest_claim(env):

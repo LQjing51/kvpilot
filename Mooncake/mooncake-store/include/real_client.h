@@ -671,6 +671,14 @@ class RealClient : public PyClient {
     int64_t batch_remove_local_disk(const std::vector<std::string> &keys);
 
     /**
+     * @brief KVPilot exclusive placement: drop keys' memory replicas, keeping
+     * disk ones (a chunk leaving DRAM). A replica a reader or an offload still
+     * holds stays. See MasterService::EvictDiskReplica (ReplicaType::MEMORY).
+     * @return Number of keys the master processed, or -1 without a client.
+     */
+    int64_t batch_remove_memory_replicas(const std::vector<std::string> &keys);
+
+    /**
      * @brief KVPilot exclusive placement: write values from host memory (the
      * caller's own staging buffer, not the segment) to this client's SSD as
      * one bucket and register them with the master. See

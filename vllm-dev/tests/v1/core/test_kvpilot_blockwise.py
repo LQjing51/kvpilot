@@ -5,9 +5,10 @@ import json
 
 import pytest
 
+from vllm.v1.core import kvpilot_belady, kvpilot_heap
 from vllm.v1.core import kvpilot_blockwise as bw
-from vllm.v1.core import kvpilot_heap
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
 from vllm.v1.core.kvpilot_exclusive import ExclusivePlacement
 from vllm.v1.core.kvpilot_lru import LruPlacement
 from vllm.v1.core.kvpilot_time_model import TimeModel
@@ -46,6 +47,16 @@ def test_time_model_chunks_and_cudagraph(tmp_path):
     assert m.compute(0, 10000) == pytest.approx(
         2 * 10.0 + 0.01 * 10000 + 1e-6 * (8192 * 4096 + 1808 * (8192 + 904))
         + 1e-4 * 8192)
+
+
+def test_time_model_aligned_chunks(tmp_path):
+    """Hybrid models (align 1536): chunks end at block boundaries, one at the
+    prompt's last -- 10000 tokens run as 7680, 1536 and 784."""
+    m = _model(tmp_path, chunk=8192, capture=[1024], d_graph=5.0, b_graph=0.02, align=1536)
+    assert m.compute(0, 10000) == pytest.approx(
+        2 * 10.0 + 0.01 * (7680 + 1536) + 5.0 + 0.02 * 1024)
+    # From a hit at 9216 only the tail is left.
+    assert m.compute(9216, 784) == pytest.approx(5.0 + 0.02 * 1024)
 
 
 def test_smooth_overlap(tmp_path):
@@ -255,7 +266,7 @@ def test_shared_block_keeps_fastest_tier_and_dearest_penalty(monkeypatch, tmp_pa
 def test_lru_sends_the_release_order(monkeypatch):
     monkeypatch.setattr(kvpilot_heap, "_CLS", kvpilot_heap.PyIndexedHeap)
     pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=BS)
-    lru = LruPlacement(BS)
+    lru = LruPlacement(pool, BS)
     conn = Conn()
     lru.bind(conn)
     blocks = pool.get_new_blocks(3)
@@ -263,3 +274,75 @@ def test_lru_sends_the_release_order(monkeypatch):
         b._block_hash = b"x%d" % i
     lru.track("r", [blocks], list(range(BS * 2 + 5)))
     assert conn.orders == [[2000, 2001]]
+
+
+def test_lru_frees_the_end_state_after_its_kv(monkeypatch):
+    """Hybrid model (state group 0, attention 1): LRU holds no state; a turn's
+    end state is freed after its KV, so the queue evicts the KV first."""
+    monkeypatch.setattr(kvpilot_heap, "_CLS", kvpilot_heap.PyIndexedHeap)
+    pool = BlockPool(num_gpu_blocks=12, enable_caching=True, hash_block_size=BS)
+    lru = LruPlacement(pool, BS)
+    lru.bind(Conn())
+
+    def blocks(*hashes):
+        out = pool.get_new_blocks(len(hashes))
+        for b, hg in zip(out, hashes):
+            if hg is not None:
+                b._block_hash = make_block_hash_with_group_id(*hg)
+        return out
+
+    def free_ids():
+        return {b.block_id for b in pool.free_block_queue.get_all_free_blocks()}
+
+    # Turn 1: 2 full blocks a, b and a partial one; its states after a (mid
+    # prefill, freed then), after b (the end, taken when it finished) and the
+    # running one.
+    a, b, part = blocks((b"a", 1), (b"b", 1), None)
+    mid, end, run = blocks((b"a", 0), (b"b", 0), None)
+    pool.free_blocks([mid])
+    pool.touch([end])
+    pool.free_blocks([run, end])
+    pool.free_blocks([part, b, a])
+    assert end.block_id not in free_ids()
+    lru.track("t1", [[a, b, part]], list(range(BS * 2 + 5)), [end])
+    assert {end.block_id, mid.block_id, run.block_id} <= free_ids()
+    assert len(lru.states) == 0
+    assert end.kvp_free_seq > max(x.kvp_free_seq for x in (a, b, part))
+
+
+def test_lru_with_trace_holds_reused_end_states(tmp_path, monkeypatch):
+    """Hybrid A/B: given the trace, LRU holds a prompt's end state while a
+    later line reuses the prompt (as Belady does), and lets it go when that
+    line's prompt supersedes it."""
+    monkeypatch.setattr(kvpilot_heap, "_CLS", kvpilot_heap.PyIndexedHeap)
+    monkeypatch.setattr(kvpilot_belady, "TRACE_BLOCK", BS)
+    path = tmp_path / "trace.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in [
+        {"input_length": 2 * BS, "hash_ids": [1, 2]},
+        {"input_length": BS, "hash_ids": [7]},                 # never again
+        {"input_length": 3 * BS, "hash_ids": [1, 2, 3]},       # reuses line 0
+    ]))
+    pool = BlockPool(num_gpu_blocks=12, enable_caching=True, hash_block_size=BS)
+    lru = LruPlacement(pool, BS, str(path))
+    lru.bind(Conn())
+    rid = "{:08d}-aaaa-4bbb-8ccc-dddddddddddd".format
+
+    def blocks(*hashes):
+        out = pool.get_new_blocks(len(hashes))
+        for b, hg in zip(out, hashes):
+            b._block_hash = make_block_hash_with_group_id(*hg)
+        return out
+
+    a, b, end0 = blocks((b"a", 1), (b"b", 1), (b"b", 0))
+    pool.free_blocks([b, a])
+    lru.track(rid(0), [[a, b]], list(range(2 * BS)), [end0])
+    assert len(lru.states) == 1 and end0.ref_cnt == 1
+    (x, end1) = blocks((b"x", 1), (b"x", 0))
+    pool.free_blocks([x])
+    lru.track(rid(1), [[x]], list(range(BS)), [end1])
+    assert len(lru.states) == 1 and end1.ref_cnt == 0
+    (c, end2) = blocks((b"c", 1), (b"c", 0))
+    pool.touch([a, b])
+    pool.free_blocks([c, b, a])
+    lru.track(rid(2), [[a, b, c]], list(range(3 * BS)), [end2])
+    assert len(lru.states) == 0 and end0.ref_cnt == 0 and end2.ref_cnt == 0

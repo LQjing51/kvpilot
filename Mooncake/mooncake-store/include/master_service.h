@@ -966,10 +966,12 @@ class MasterService {
                                 const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
-    // KVPilot SSD write-back: PutStart on an object whose only complete
-    // replicas are on local disk adds PROCESSING memory replicas to it and
-    // returns just those; PutEnd completes them, PutRevoke or the PutStart
-    // timeout drops them, and the disk replica stays readable throughout.
+    // KVPilot SSD write-back (and exclusive placement writing DRAM for a
+    // chunk that keeps its SSD copy): PutStart on an object whose only
+    // complete replicas are on local disk adds PROCESSING memory replicas to
+    // it and returns just those; PutEnd completes them, PutRevoke or the
+    // PutStart timeout drops them, and the disk replica stays readable
+    // throughout.
     auto KvpAddMemoryReplicas(MetadataShardAccessorRW& shard,
                               ObjectMetadata& metadata, const UUID& client_id,
                               const std::string& key, uint64_t value_length,

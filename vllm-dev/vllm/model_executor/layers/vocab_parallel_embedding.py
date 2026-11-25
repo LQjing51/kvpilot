@@ -239,6 +239,8 @@ class VocabParallelEmbedding(PluggableLayer):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        quant_method: QuantizeMethodBase | None = None,
     ):
         super().__init__()
 
@@ -267,8 +269,8 @@ class VocabParallelEmbedding(PluggableLayer):
         )
         self.embedding_dim = embedding_dim
 
-        quant_method = None
-        if quant_config is not None:
+        # A model-specific method (Qwen4Exp's FP8 n-gram table) is preselected.
+        if quant_method is None and quant_config is not None:
             quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if quant_method is None:
             quant_method = UnquantizedEmbeddingMethod()
@@ -491,6 +493,12 @@ class VocabParallelEmbedding(PluggableLayer):
         output_parallel = self.quant_method.embedding(self, masked_input.long())
         # Mask the output embedding.
         if self.tp_size > 1:
+            if output_parallel.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                # Each vocab token has one owner, so FP8 bytes can use int8 SUM.
+                comm_output = output_parallel.view(torch.int8)
+                comm_output.masked_fill_(input_mask.unsqueeze(-1), 0)
+                output = tensor_model_parallel_all_reduce(comm_output)
+                return output.view(output_parallel.dtype)
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
         output = tensor_model_parallel_all_reduce(output_parallel)

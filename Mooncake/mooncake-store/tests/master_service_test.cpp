@@ -3527,13 +3527,9 @@ TEST_F(MasterServiceTest, KvpAddMemoryReplicaToDiskOnlyObject) {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kv_lease_ttl + 10));
 
+        // Exclusive placement adds a DRAM copy the same way when a chunk that
+        // keeps its SSD copy moves up to DRAM.
         auto put_start = service->PutStart(client_id, key, 1024, config);
-        if (excl) {
-            // An SSD hit is not written back: that would be a second copy.
-            ASSERT_FALSE(put_start.has_value());
-            EXPECT_EQ(put_start.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
-            continue;
-        }
         ASSERT_TRUE(put_start.has_value());
         ASSERT_EQ(put_start->size(), 1);
         EXPECT_TRUE((*put_start)[0].is_memory_replica());
@@ -3887,6 +3883,127 @@ TEST_F(MasterServiceTest, KvpExclusiveRespillAfterTierChange) {
         EXPECT_TRUE(on_disk->replicas[0].is_local_disk_replica());
         ASSERT_TRUE(service->Remove(key, true).has_value());
     }
+}
+
+// Puts `key` (its group SSD-tier) and offloads it: only the disk replica is
+// left, as after an exclusive SSD write.
+static void KvpPutOnDiskOnly(MasterService& service, const UUID& client_id,
+                             const std::string& key, const std::string& group,
+                             size_t value_size, const std::string& segment) {
+    ASSERT_TRUE(
+        service.SetGroupPlacement({group}, {kKvpSsd}, {0.0}).has_value());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(service.PutStart(client_id, key, value_size, config).has_value());
+    ASSERT_TRUE(service.PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    auto taken = service.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(taken.has_value());
+    ASSERT_EQ(taken->count(key), 1);
+    StorageObjectMetadata meta;
+    meta.bucket_id = 1;
+    meta.offset = 0;
+    meta.key_size = static_cast<int64_t>(key.size());
+    meta.data_size = value_size;
+    meta.transport_endpoint = segment;
+    meta.file_path = "/tmp/bucket-keep-ssd";
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(client_id, {key}, {meta}).has_value());
+    auto replicas = service.GetReplicaList(key);
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1);
+    ASSERT_TRUE(replicas->replicas[0].is_local_disk_replica());
+}
+
+TEST_F(MasterServiceTest, KvpExclusiveDropsDramCopyKeepsSsd) {
+    // Exclusive placement keeps a chunk's SSD copy when it moves up to DRAM,
+    // and drops only the DRAM copy when it leaves DRAM again.
+    auto service = MakeKvpService(
+        "exclusive-penalty-reqwise",
+        MasterServiceConfig::builder().set_enable_offload(true).build());
+    const UUID client_id = generate_uuid();
+    constexpr size_t value_size = 1024 * 1024;
+    auto segment =
+        MakeSegment("keep_ssd_segment", 0x500000000, 16 * value_size);
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service->ReMountSegment({segment}, client_id).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(client_id, true).has_value());
+    const std::string key = "m@2@0@ee01@bfloat16@0";
+    KvpPutOnDiskOnly(*service, client_id, key, "ee01", value_size,
+                     segment.name);
+
+    // Moves up to DRAM: a memory replica is added beside the disk one, and
+    // not queued for offload.
+    ASSERT_TRUE(
+        service->SetGroupPlacement({"ee01"}, {kKvpDram}, {5.0}).has_value());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put = service->PutStart(client_id, key, value_size, config);
+    ASSERT_TRUE(put.has_value());
+    ASSERT_EQ(put->size(), 1);
+    EXPECT_TRUE((*put)[0].is_memory_replica());
+    ASSERT_TRUE(service->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    auto queued = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(queued.has_value());
+    EXPECT_EQ(queued->count(key), 0);
+    auto both = service->GetReplicaList(key);  // pins the memory replica
+    ASSERT_TRUE(both.has_value());
+    ASSERT_EQ(both->replicas.size(), 2);
+
+    // Leaving DRAM while a reader holds it: the memory replica stays.
+    auto res = service->BatchEvictDiskReplica(client_id, {key},
+                                              ReplicaType::MEMORY);
+    ASSERT_EQ(res.size(), 1);
+    ASSERT_TRUE(res[0].has_value());
+    ASSERT_TRUE(service->BatchUnpinMemoryReplicas({key}).has_value());
+    auto pinned = service->GetReplicaList(key);
+    ASSERT_TRUE(pinned.has_value());
+    EXPECT_EQ(pinned->replicas.size(), 2);
+    ASSERT_TRUE(service->BatchUnpinMemoryReplicas({key}).has_value());
+
+    // Unpinned: only the memory replica goes.
+    res = service->BatchEvictDiskReplica(client_id, {key}, ReplicaType::MEMORY);
+    ASSERT_TRUE(res[0].has_value());
+    auto left = service->GetReplicaList(key);
+    ASSERT_TRUE(left.has_value());
+    ASSERT_EQ(left->replicas.size(), 1);
+    EXPECT_TRUE(left->replicas[0].is_local_disk_replica());
+}
+
+TEST_F(MasterServiceTest, KvpExclusiveDemotionDropsDramCopyOfSsdChunk) {
+    // Under memory pressure a DRAM-tier object that also has an SSD copy
+    // loses its memory replica without being written again. Watermark 0, as
+    // in KvpExclusiveSpillInsteadOfEvict.
+    auto service = MakeKvpService("exclusive-penalty-reqwise",
+                                  MasterServiceConfig::builder()
+                                      .set_enable_offload(true)
+                                      .set_eviction_high_watermark_ratio(0.0)
+                                      .build());
+    const UUID client_id = generate_uuid();
+    constexpr size_t value_size = 1024 * 1024;
+    auto segment =
+        MakeSegment("demote_ssd_segment", 0x600000000, 16 * value_size);
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service->ReMountSegment({segment}, client_id).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(client_id, true).has_value());
+    const std::string key = "m@2@0@ff01@bfloat16@0";
+    KvpPutOnDiskOnly(*service, client_id, key, "ff01", value_size,
+                     segment.name);
+    ASSERT_TRUE(
+        service->SetGroupPlacement({"ff01"}, {kKvpDram}, {5.0}).has_value());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(
+        service->PutStart(client_id, key, value_size, config).has_value());
+    ASSERT_TRUE(service->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    auto offload = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(offload.has_value());
+    EXPECT_EQ(offload->count(key), 0);
+    auto replicas = service->GetReplicaList(key);
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1);
+    EXPECT_TRUE(replicas->replicas[0].is_local_disk_replica());
 }
 
 TEST_F(MasterServiceTest, BatchReplicaClearAllSegments) {

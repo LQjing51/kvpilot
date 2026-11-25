@@ -597,6 +597,18 @@ def normalize_kv_and_discover_format(
             kv_layout = "NHD"
         logger.info("vLLM KV cache layout: %s", kv_layout)
         is_hnd = kv_layout == "HND"
+        if (
+            is_hnd
+            and list_depth == 1
+            and tensor_dim == 5
+            and probe.shape[3] == 1 < probe.shape[2]
+        ):
+            # One KV head per rank (Qwen3.6 at TP 2): HND and NHD are the same
+            # memory, and is_contiguous ignores the size-1 head dim, so the
+            # tensor kept vLLM's logical NHD order. Read as HND it would be
+            # 64 heads of 1-token blocks.
+            is_hnd = False
+            logger.info("Single KV head per rank: reading the HND cache as NHD")
         if list_depth == 0:
             # vllm cross layer
             detected_format = lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS

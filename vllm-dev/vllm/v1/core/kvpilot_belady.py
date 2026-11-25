@@ -20,23 +20,31 @@ from __future__ import annotations
 import json
 
 from vllm.v1.core.kvpilot_inclusive import full_prompt_blocks
+from vllm.v1.core.kvpilot_states import StatePins
 from vllm.v1.core.kvpilot_signal import trace_line
 
 # Above every trace line.
 FAR = 1e9
+# Tokens per trace hash id (mooncake_trace_replay.py builds prompts this way).
+TRACE_BLOCK = 512
 
 
 def next_uses(path: str, block_size: int) -> list[list[int | None]]:
-    """For every trace line, each full block's next using line (None: never)."""
+    """For every trace line, each full block's next using line (None: never).
+    A block is `block_size // TRACE_BLOCK` hash ids; it is named by the chain
+    up to its last one."""
+    if block_size % TRACE_BLOCK:
+        raise ValueError(f"KVPilot Belady: block {block_size} is not whole trace hashes")
+    per = block_size // TRACE_BLOCK
     chains = []
     with open(path) as f:
         for line in f:
             r = json.loads(line)
-            chain, out = None, []
-            for h in r["hash_ids"][: r["input_length"] // block_size]:
+            chain, links = None, []
+            for h in r["hash_ids"][: r["input_length"] // TRACE_BLOCK]:
                 chain = hash((chain, h))
-                out.append(chain)
-            chains.append(out)
+                links.append(chain)
+            chains.append(links[per - 1 :: per][: r["input_length"] // block_size])
     nxt: list[list[int | None]] = [[] for _ in chains]
     last: dict[int, int] = {}
     for i in range(len(chains) - 1, -1, -1):
@@ -52,16 +60,21 @@ class BeladyPlacement:
         self._block_size = block_size
         self._next = next_uses(trace_path, block_size)
         self._connector = None
+        self.states = StatePins(block_pool)
 
     def bind(self, connector) -> None:
         """The scheduler-side KV connector: names chunks, sets their order."""
         self._connector = connector
 
-    def track(self, request_id: str, block_groups, token_ids) -> None:
-        """A request freed its blocks: key them by their next use."""
+    def track(self, request_id: str, block_groups, token_ids, states=None) -> None:
+        """A request freed its blocks: key them by their next use. `states`:
+        the state at its prompt's end (hybrid models, kvpilot_states)."""
         blocks = full_prompt_blocks(block_groups, len(token_ids), self._block_size)
+        if not blocks:
+            return
         line = trace_line(request_id)
-        if not blocks or line is None:
+        if line is None:
+            self.states.track(blocks, states, hold=False)
             return
         uses = self._next[line]
         if len(uses) < len(blocks):
@@ -75,6 +88,9 @@ class BeladyPlacement:
             raise RuntimeError(f"KVPilot: no LMCache chunk hashes for {request_id}")
         self._connector.kvpilot_group_order(lmc)
         self._queue.rekey(blocks, [-FAR if u is None else -float(u) for u in uses])
+        # A hybrid model's state at the prompt's end serves the next prompt
+        # holding the last block.
+        self.states.track(blocks, states, hold=uses[-1] is not None)
         self._connector.kvpilot_set_group_placement(
             lmc, [None] * len(uses), [0.0 if u is None else FAR - u for u in uses]
         )

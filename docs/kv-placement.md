@@ -12,7 +12,7 @@
 | `belady` | 同 LRU | 下次被用到最晚的块先走（不再用到的最先），下次用到的行号从回放的 trace 离线算 | 同样按下次用到的行号，整组删内存副本 | 同 LRU |
 | `inclusive-safe-reqwise` | 同 LRU | 按下一轮的 safe tier 分档：没 hash 的空块最先，没有下一轮 1 < SSD 2 < DRAM 3 < HBM 4 = 判据未到 4；档内按释放顺序（FIFO） | 同样分档（判据未到算 HBM），档内按最后释放它的请求（旧的先），整组删内存副本 | 同 LRU |
 | `inclusive-penalty-reqwise` | 同 LRU | 按请求的 HBM → DRAM penalty 从小到大：没有下一轮 0，判据未到排最后；同值按释放顺序 | 按请求的 DRAM → SSD penalty 从小到大（没收到判据的算 ∞），整组删内存副本 | 同 LRU |
-| `exclusive-penalty-reqwise` | write-back + direct move：每块只存一份，放在下一轮需要的那一层 | 判据未到的块 pin 住、不进空闲队列；留在 HBM 的块排在空闲队列最后，新请求放不下时按 penalty 写到 DRAM 再复用 | 只放判据 DRAM 的组；不删数据，超水位时按 penalty 下沉到 SSD | 不 load-through（会多一份） |
+| `exclusive-penalty-reqwise` | write-back + direct move：HBM / DRAM 里每块只存一份，放在下一轮需要的那一层；SSD 副本写过就留着（块提到上层也不删）；没有下一轮不写 | 判据未到的块 pin 住、不进空闲队列；留在 HBM 的块排在空闲队列最后，新请求放不下时按 penalty 写到 DRAM 再复用 | 只放判据 DRAM 的组；超水位时按 penalty 下沉，已有 SSD 副本的只删内存副本，其余写到 SSD | 不 load-through（会多一份） |
 | `exclusive-penalty-reqwise-unblocking` | 同 exclusive | 同 exclusive，但新请求不等下沉：空闲块（含一个 prefill chunk 的预留，每次判据和分配后在后台补）不够时，从 held 块里借给要加载的 prefix，旧 KV 在这次加载里先写到 DRAM | 同 exclusive（水位 0.9 留的约 218K token 空闲够借块写回） | 同 exclusive |
 | `exclusive-penalty-blockwise-unblocking` | 同 exclusive，但按块放：一轮的 prompt 头部 HBM、中间 DRAM、尾部 SSD，块数由时间模型定 | 同 unblocking，按块 penalty（下沉一层使下一轮 TTFT 期望增加多少），每个请求只能踢它最后一个 HBM 块 | 同 exclusive，组 penalty 换成按块的 | 同 exclusive |
 
@@ -67,6 +67,7 @@ HBM → DRAM → SSD 连续读，不会出现 DRAM 中间夹着 SSD 的情况。
 | | `kvpilot_inclusive.py` | 两个 inclusive：判据到达后 rekey HBM 空闲队列（档位或 penalty）、设 Mooncake 组档位和 penalty |
 | | `kvpilot_exclusive.py` | exclusive：pin、判据到达后发 job、准入失败时下沉；unblocking 的预留（`reserve`）和借块（`lend`）；blockwise 的按块放置、HBM 尾块候选（`_plan_held` / `_commit_held`） |
 | | `kvpilot_time_model.py` | 时间模型：prefix 拆在三层时的 prefill 时间（在线预测、blockwise、拟合脚本共用这一份） |
+| | `kvpilot_states.py` | 混合模型：每个 session 最新一轮结尾的线性注意力状态留在 HBM（`StatePins`），见下文「混合模型」 |
 | | `kvpilot_blockwise.py` | 由时间模型和 suffix 分布定层和 penalty：按块（`place`、`hbm_penalty` / `dram_penalties`），按请求（`reqwise`） |
 | | `kvpilot_lru.py` | LRU：不放置，只把释放顺序发给 master |
 | | `kvpilot_signal.py` | D 侧判据：查表 / 在线预测、请求 id 解析 |
@@ -104,7 +105,8 @@ decode 结束    dynamo kvpilot.py KvpilotReporter.report → kvpilot_signal 查
      exclusive: 发 job，见下文
 ```
 
-- 只管**整块**的 prompt 块（block 512 = LMCache chunk）：prompt 不足 512 token 的请求 P 不 track，D 也不回传。
+- 只管**整块**的 prompt 块（block = LMCache chunk，512；混合模型 1536，见下文「混合模型」）：prompt 不足一块的请求
+  P 不 track，D 也不回传。
 - 回放保证同一 session 的下一轮在上一轮返回后才发（`mooncake_trace_replay.py` 总是这样），所以判据一定在释放之后、
   下一轮之前到达。到达时找不到等判据的 head 就直接报错。
 - NIXL 预热请求（`discover_dynamo_workers.py`）的 id 第一段是 `ffffffff`，判据 tier 为 None。其余请求 id 第一段
@@ -168,16 +170,25 @@ reuse-probability 类淘汰（LRU 等）要逼近的上界 Belady MIN：和 LRU 
 
 ## exclusive-penalty-reqwise
 
-每个 block 只存一份，放在下一轮需要的那一层（tier 和 penalty 由时间模型算，见上文「判据」）：
+HBM / DRAM 里每个 block 只存一份，放在下一轮需要的那一层（tier 和 penalty 由时间模型算，见上文「判据」）。SSD
+副本写过就一直留着：块提到 DRAM / HBM 时不删，再回到 SSD 时不用重写（SSD 不缺空间）。
 
 | 事件 | 动作 |
 |---|---|
 | prefill 结束 | 什么都不往下写（LMCache 跳过 save），块 pin 在 HBM、移出空闲队列，等判据 |
-| 判据 HBM | 留在 HBM；之前某轮留在 DRAM / SSD 的副本删掉；块回到空闲队列，作为 held 块排在最后（见下） |
-| 判据 DRAM / SSD | 不在该层的块从 HBM 写过去（在另一下层的先删），写完删 HBM 副本；已在该层的直接删 HBM 副本 |
-| 没有下一轮 | 下层已有副本的留着（DRAM 副本的组 penalty 置 0，DRAM 满时最先下沉），没有的写到 SSD；删 HBM 副本 |
+| 判据 HBM | 留在 HBM；之前某轮留在 DRAM 的副本删掉（SSD 副本留着）；块回到空闲队列，作为 held 块排在最后（见下） |
+| 判据 DRAM | 不在 DRAM 的块从 HBM 写过去（有 SSD 副本也照写，SSD 副本留着），写完删 HBM 副本；已在 DRAM 的直接删 HBM 副本 |
+| 判据 SSD | 有 SSD 副本的块删掉 DRAM / HBM 副本，不写；没有的从 HBM 写到 SSD（DRAM 副本先删），写完删 HBM 副本 |
+| 没有下一轮 | 什么都不写。DRAM 副本留着（组 penalty 置 0，DRAM 满时最先下沉），HBM 副本直接释放 |
 
-复用后整段 prompt 都在 HBM（加载进来的 + 新算的），新判据按上表处理：同层只写新增的块，换层就整段写到新层、删旧层。
+复用后整段 prompt 都在 HBM（加载进来的 + 新算的），新判据按上表处理：同层只写新增的块；换层时 DRAM 和 HBM 之间
+整段搬，回到 SSD 的块只有没写过 SSD 的要写。2026-11-25 之前换层会删 SSD 副本、没有下一轮会把只在 HBM 的块写到
+SSD：Eval-EXP1 的 SWE 上 Qwen3-30B blockwise 写 SSD 22294 块，一半是离开 SSD 后又写回来的，比 write-through
+（16201 块）还多；req unblocking 写 SSD 的块 37% 是没有下一轮时写的。这些写和别的请求的 SSD 读抢盘，撞上的混合
+请求每条慢 30–38 ms（`paper-figure/Eval-EXP1/README.md`）。改后验证（2026-11-25）：vLLM `test_kvpilot_exclusive.py`、
+Mooncake `KvpExclusive*` 单测、`check_excl_writer.py` 都过；Qwen3-30B blockwise 冒烟（Eval-EXP1 SWE trace 前 600 条）
+601 次判据写 DRAM 7728 块、SSD 4751 块、删 DRAM 副本 2627 块、没有下一轮直接释放 251 块，594 个 job 无 skipped /
+failed / no_room，留着 SSD 副本的块写 DRAM 全部分到了内存副本。
 
 - **direct move**：判据一到就写，写完就从 HBM 删，把空闲块留给后面的请求，而不是等被淘汰时才写。写都在后台：job
   经 connector metadata 带给每个 TP rank，worker 的 `ExclusiveWriter` 在后台线程和独立 stream 上做。写的块被 job
@@ -186,8 +197,8 @@ reuse-probability 类淘汰（LRU 等）要逼近的上界 Belady MIN：和 LRU 
   下文「Mooncake master」的 HBM→DRAM 写）。写 SSD
   则用 writer 自己的 pinned 暂存区（每次最多 8 个 chunk 的全部层，Qwen3-30B-A3B TP2 下每 rank 192 MiB）：从 HBM
   gather 进来，每个 chunk 写成一个 bucket（`batch_offload_local`），写完 master 直接登记磁盘副本，不建内存副本。
-  去 SSD 的数据如果先放进 DRAM 中转，会占着 DRAM、把同样多的 DRAM 层数据挤到 SSD；一个 chunk 一个 bucket，换层删除
-  时整个 bucket 就能释放。代价是写盘在 writer 线程里同步完成，job 里有 SSD 写时完成得更慢，块 pin 得更久。
+  去 SSD 的数据如果先放进 DRAM 中转，会占着 DRAM、把同样多的 DRAM 层数据挤到 SSD。代价是写盘在 writer 线程里同步
+  完成，job 里有 SSD 写时完成得更慢，块 pin 得更久。
 - **一个空闲队列**：分配器复用和下沉都操作 `FreeKVCacheClassQueue`。判据未到（pending）、正被请求使用、正被写到
   下层的块都不在队列里，所以 pending 的块不会被淘汰。队列里依次是：空块（−∞）、没被追踪的块（可直接覆盖）、
   held 块（判据已到、要留在 HBM 的块，是这份 KV 唯一的副本，按 HBM → DRAM penalty 从小到大排在最后）。held 块
@@ -203,17 +214,33 @@ reuse-probability 类淘汰（LRU 等）要逼近的上界 Belady MIN：和 LRU 
   exclusive 实验 HBM 都没满过，不受影响。
 - **写到一半下一轮来了**：一个块正被写到下层时，同 session 的下一轮命中它、释放后重新认领（pending）。写完时它
   保持 pin，不删 HBM 副本，等新判据到了按上表处理（它在下层已经有一份）。
+- **下一轮等还在写的尾段**（2026-11-25）：判据一到，下层已有的中段马上删 HBM 副本，尾段排队写下层。下一轮在写完前
+  来时，HBM 的前缀匹配停在中段之前，LMCache 接着读到中段为止，尾段 HBM 里有、下层还没有，以前只能重算：Eval-EXP1
+  SWE 上 Qwen3-30B blockwise 56 条（2%）平均重算 6318 token，每条比 belady 慢 863 ms，把其余请求快的 18 ms 抵光。
+  现在 `KVCacheManager._kvpilot_pending_hit` 找出 HBM 前缀之后、有 job 正在往下写的最远一块（`ExclusivePlacement.writing`，
+  按 job 的 `stored` 计数），记到 `request.kvpilot_pending_hit`；adapter 的 lookup 没够到它就和混合模型一样先不调度、
+  下一步再查，最多 30 s 报错。第一版只看「HBM 前缀之后 HBM 里还有」，req unblocking 第 2354 条等满 30 s 报错：held 块
+  前面的块被借走或下沉后，held 块隔着缺口留在 HBM，它不会被写下去，等不到。
+  日志 `KVPilot exclusive wait req=... KV ends at ..., HBM holds a block at ...` / `KVPilot exclusive waited req=... ms`。
+  混合模型本来就靠 `kvpilot_state_hit` 等（见「混合模型（Qwen3.6-35B-A3B）」的「命中」），没有重算过。单测
+  `test_pending_hit_reaches_a_block_being_written`。修后 Qwen3-30B blockwise（2800 条）等了 51 次，中位 109 ms、最长
+  1.2 s，重算的请求从 56 条降到 5 条，TTFT 321.8 → 309.4 ms，从和 belady 打平变成快 11.8 ± 4.0 ms。
+- **没人需要的 held 块 penalty 是 0**（2026-11-25）：`_hbm_penalty` / `_dram_penalty` 是需要它在更快层的 head 的最大
+  penalty；SWE 各 session 共用开头的 system prompt 块，它的 HBM head 被替换后可能一个这样的 head 都没有，reqwise 分支
+  原来对空序列取 `max` 直接抛异常，P 挂掉（Eval-EXP1 SWE Qwen3-30B req unblocking 第 1222 条，`lend` 里）。现在按定义取 0
+  （挪走它不暴露任何加载），blockwise 分支本来就是这样。
 - **DRAM 满（master 下沉）**：master 不删只有内存副本的对象。超过淘汰水位时按组 penalty 从小到大（没收到过判据算 ∞）
-  把对象 offload 到 SSD，组改成 SSD，落盘后删内存副本。worker 写 DRAM 遇到没空间就一直等着重试，所以 DRAM 也满时，
-  HBM 的下沉要等 DRAM 先下沉到 SSD 才能完成。
+  下沉：已有 SSD 副本的直接删内存副本，其余 offload 到 SSD、落盘后删内存副本；组都改成 SSD。worker 写 DRAM 遇到没
+  空间就一直等着重试，所以 DRAM 也满时，HBM 的下沉要等 DRAM 先腾出来才能完成。
   - 在途的 offload 计入本轮目标；在途已经够了就跳过全表扫描。扫一遍 50 万个对象要轮流拿所有 shard 锁，耗时秒级，
     会饿死 client 的 offload RPC（2026-11-13 x3 卡死）。在途上限 8192 个 value（约 4 GiB）。
   - 在途 offload 超过 120 s 没回报就当作丢了：放掉 pin，对象下一轮重新下沉。client 遇到磁盘索引里已有的 key、或
     一个 bucket 查询失败时，既不写也不通知 master；上游的超时清理只在全表扫描里跑，扫描被跳过就永远不清，这些任务
     pin 住的内存副本占满 DRAM 后整个服务卡死（2026-11-13 x4：在途 10 万个、DRAM 100%、P 停在第 4315 条）。
-- **离开 SSD 就删**：换层时 worker 先 `Remove` master 上的对象，再 `batch_remove_local_disk` 删本机 bucket 索引里的
-  key、释放空间（一个 bucket 的 key 删光就删掉 bucket 文件）。这个 key 以后再回到 SSD 时重新 offload 一遍。正在
-  offload 的对象 master 拒绝 `Remove`，会多留一份，直到它的组下次换层。
+- **离开 DRAM 只删内存副本**：job 的 `drop` 是要删 DRAM 副本的块，worker 调 `batch_remove_memory_replicas`（master
+  `EvictDiskReplica` 的 `ReplicaType::MEMORY`，复用 `BatchEvictDiskReplica` RPC），只删完成且 `refcnt == 0` 的内存
+  副本，磁盘副本留着。读者或在途 offload pin 着的内存副本不删，多留一份，直到 DRAM 下沉把它删掉。SSD 副本 placement
+  不再删（之前换层时 `Remove` 对象、再删本机 bucket）。
 - **LMCache lookup 要知道 HBM 已覆盖多少**：prelookup 要求从第 0 个 chunk 起每个 chunk 在 DRAM 或 SSD 有副本
   （write-through 下天然成立）。单副本下 HBM 里的块下层没有，所以 exclusive 时 adapter 把 vLLM 的 HBM 命中长度放进
   request_configs（`lmcache.kvpilot.hbm_tokens`，不进 cache key），`_lookup_views` 对 HBM 覆盖的 chunk 不找副本。
@@ -221,9 +248,12 @@ reuse-probability 类淘汰（LRU 等）要逼近的上界 Belady MIN：和 LRU 
   connector 是裸 NixlConnector，没有 `kvpilot_chunk_hashes`，scheduler 就关掉 placement，decode 日志一行
   `KVPilot placement off: connector has no LMCache`。以前 decode 也 pin 块、永远等不到判据，KV 漏满、请求卡在
   Waiting（2026-11-13 toolagent 第 170 条）。
-- 日志：P `KVPilot exclusive heads=... jobs_in_flight=... pinned=... held=... demoting=... lower DRAM/SSD=... free=... stats={...}`
-  （随判据打，最多 30 s 一行）；每个 job 每个 rank 一行
-  `KVPilot exclusive job=... drop=ok/总数 disk_freed=N dram=N ssd=N chunks written=... skipped=... retries=... no_room=...`；
+- 日志：P `KVPilot exclusive heads=... jobs_in_flight=... pinned=... held=... demoting=... lower DRAM/SSD=... ssd_copies=... free=... stats={...}`
+  （随判据打，最多 30 s 一行；`stats` 里 `hbm_freed_no_next` 是没有下一轮直接释放的块）；每个判据一行
+  `KVPilot placement applied ... {'tier', 'blocks', 'write_dram', 'write_ssd', 'drop', 'hbm_released', 'hbm_freed', 'job'}`；
+  每个 job 每个 rank 一行
+  `KVPilot exclusive job=... drop=ok/总数 dram=N ssd=N chunks written=... skipped=... retries=... no_room=...`
+  （`chunks written` 是 DRAM 和 SSD 加起来的块数，SSD 写量看 `write_ssd`）；
   master `[KVPILOT-EXCL] offloaded=... memory_replicas_dropped=... spilled=...`。
 
 ## exclusive-penalty-reqwise-unblocking
@@ -380,6 +410,162 @@ HBM，接着 d 块 DRAM，尾部 x 块 SSD（`kvpilot_blockwise.py`，时间模�
 - 两边还差着别的：exclusive 用的是 D 回传的实测 tier，blockwise 用时间模型；rf1 没有请求内从尾部往前踢。按块和按请求
   的单独差别要用新代码（tier 也来自时间模型）重跑 exclusive 才能分开。
 
+## 混合模型（Qwen3.6-35B-A3B）
+
+图解见飞书「混合注意力」（`Gb5fdK0g5oznNXxJRoUcia8mnxe`）。**线性注意力状态从不卸载，只从 HBM 命中**；KV 照旧跨
+HBM / DRAM / SSD 放置、逐层加载，五个策略都是这样（2026-11-23 定的方案一）。
+
+正确性（2026-11-23 通过，TP2 和 TP4）：`utils/hybrid_check/run_check.sh` 起 1P1D（LRU、SSD offload；`TP_SIZE`、
+`SEEDS` 可设），`check_state_reuse.py` 让同一 prompt 的 KV 分别从 HBM / DRAM / SSD 复用、状态从 HBM；prefill 日志核对
+来源（`hit=` HBM KV，`dram=` 外部加载）。判据是 **DRAM / SSD 复用和 HBM 命中的输出逐字一致**。和冷算（[3]）比只是
+参考：TP4 下 4 个种子里有 2 个，HBM 命中（vLLM 原生前缀缓存，不经过 LMCache）和冷算在几十个字符后分叉，DRAM 复用
+和 HBM 命中则始终相同。冷算分几步算到边界、复用从缓存的状态接着算，数值不逐位相同，argmax 近似并列时会翻；冷算重跑
+两次是一样的。
+
+**模型与显存**：40 层里 10 层全注意力（L3、L7、…、L39，2 个 KV 头 × 256 维），30 层 Gated DeltaNet。vLLM 的混合
+KV 缓存管理把层分成 4 组：1 个注意力组、3 个线性注意力组（各 10 层）。10 个张量各由连续 4 层共用，一个块号在 10 个张量里
+各占一页，同一时刻只属于一个组。页大小统一，一页要装下一层在一个 rank 上的一份状态（TP2：fp32 SSM 1 MiB + conv
+24 KiB），所以块从 512 被抬到 1536 token。TP4 时状态按头切成一半（512 KiB + 12 KiB），KV 只有 2 个头、每 rank 仍是
+1 个（复制），块变成 1024；每 rank 每 token 的 KV 不变（10 KiB），计算却分到 4 张卡上，加载占 prefill 的比例更大。
+
+**启动**：`MODEL=/cfs_cloud_code/kiry/model/Qwen/Qwen3.6-35B-A3B`。`disagg_lmcache.sh` 读 config.json 的
+`layer_types`，有 `linear_attention` 就：
+
+- 块取装得下一层状态的最小 512 倍数（按 config 和 `TP_SIZE` 算：TP2 1536，TP4 1024），`LMCACHE_CHUNK_SIZE` 跟着变；
+- prefill 加 `--enable-prefix-caching`：混合模型默认关前缀缓存，打开后是 mamba align 模式（Qwen3.5 / 3.6 不支持 all 模式）；
+- 两边 `--language-model-only`，不再 `--disable-hybrid-kv-cache-manager`；
+- `VLLM_SSM_CONV_STATE_LAYOUT=DS`（NIXL 传状态要求）；
+- `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` 默认等于全注意力层数（10）。
+
+回放的 `--vocab-size` 从 config 读（248320）。
+
+**对齐模式的 checkpoint**：调度器把每步 prefill 切在块边界上。第 T 个 token 之后的状态写在这一步的最后一块（第
+(T−1)//1536 块），按这块的 hash 缓存；下一步开始前拷到新的最后一块，旧块两步后释放（仍按 hash 缓存）。所以一轮 prompt
+只在每步的结尾留 checkpoint，其中最后一个完整块的边界一定有；本地命中只能停在有 checkpoint 的边界上。
+
+**命中**（`KVCacheManager._kvpilot_hybrid_hit`，所有策略含 LRU）：从右往左找 3 个线性注意力组在 HBM 里都有状态的
+最远块边界 k（不超过 prompt − 1），再从头数注意力块在 HBM 里连续的长度 h（不超过 k）。h = k 是普通的 HBM 命中；h < k
+时 [0, h) 的 KV 用 HBM，[h, k) 由 LMCache 加载（adapter 把 lookup 封顶在 k，`request.kvpilot_state_hit`），状态用
+HBM 里 k 处那块（vLLM 在前向前拷进当前块）。LMCache 找不到 [h, k) 的全部 KV 时请求先不调度、下一步再查（connector
+返回 None），最多 30 s 后报错：exclusive 下上一轮最后几块可能还在被写往下层（写完前 pin 在 HBM，但 HBM 的前缀匹配在
+前面第一个不在 HBM 的块就停），同 session 的下一轮紧跟着来时接不上状态（2026-11-24 Eval-EXP1 Qwen3.8 第 670 条，
+当时直接报错、P 挂掉）。等待时要清掉 lookup client 按请求缓存的结果（`clear_lookup_status`），否则下一步拿到的
+还是旧的命中数：第一版没清，写出 6 ms 后就完成了，仍等满 30 s 报错。等的时间算在这条请求的 TTFT 里；日志
+`KVPilot hybrid wait req=...` / `waited req=... ms`（SWE 3000 条里 3 次，9–260 ms）。只有缺口里有 job 正在往下写
+（exclusive，`request.kvpilot_pending_hit` 超过 KV 的末端）才等；否则下层是真丢了，不等：adapter 把
+`request.kvpilot_state_cap` 设成 KV 的末端、下一步再查，vLLM 只在它之前找状态，后面重算，日志
+`KVPilot hybrid cap req=...`。2026-11-25 Eval-EXP1 TraceLab Qwen3.8 LRU 第 298 条：Mooncake 丢了 TP0 的一块
+inclusive 副本（另三个 rank 都在），等满 30 s 报错、P 挂掉，之后改成这样。HBM 没有状态就什么都不复用。vLLM 现有的分配代码
+（注意力组 h 块、线性注意力组 k 块的命中）不用改就能分对块。`cache_use_control` 不含 1 但含 2 / 4 时只禁 HBM 的 KV，
+状态照样从 HBM；连 2 / 4 也不含（[3]）则不复用，即冷算。
+
+**LMCache**：只搬注意力组，10 层 KV 照旧逐层存取，`num_layers` = 10（`get_num_layers_by_block_type(..., "attention")`）。
+connector 实现 `SupportsHMA`，`request_finished_all_groups` 只交注意力组的块；adapter 只登记注意力层的 KV，按层号排序。
+**单 KV 头的 HND 缓存要按 NHD 读**（`gpu_connector/utils.py`）：TP2 每 rank 只有 1 个 KV 头，vLLM 的 KV 张量
+`(块, 2, 64, 1, 256)` 是逻辑 NHD 顺序，`is_contiguous` 忽略长度 1 的头那一维，所以不会被重排；照 vLLM 给的 HND 提示读，
+会读成 64 个头、每块 1 个 token，slot s 落在第 s 个 kernel 块。2026-11-23 之前这样存取的 KV 全放错了位置，slot
+超过 83,640 时非法访问（「GPU 上的现象」见 [pitfalls.md](pitfalls.md)）。
+**存数据用的 GPU buffer 按 `max_model_len` 开**（`gpu_connectors.py` `max_buffer_tokens`，adapter 设）：上游按一层
+整个 HBM 缓存的 token 数开，不在 vLLM 的显存预算里，Qwen3.6 TP4 是 6.75 GiB，第几个请求时就 CUDA OOM。prefill 侧
+`--max-num-seqs 1`，一次只存一条 prompt。
+
+**状态留在 HBM**（`kvpilot_states.StatePins`）：知道 session 还有下一轮的策略，持有它最新一轮 prompt 结尾的状态
+（每个线性注意力组 1 块；引用计数，不在空闲队列里），直到下一轮释放时取代它（新 prompt 包含这个边界），或判据说
+没有下一轮：
+
+- 取：请求结束时 vLLM 在把块表交给 connector 前会释放除运行中状态以外的状态块（D 侧只要运行中的那块），所以
+  `scheduler._connector_finished` 先调 `KVCacheManager.kvpilot_take_end_state` 拿一个引用，释放（`free()`）时交给策略。
+- belady：这个 prompt 以后还会被用到才持有。inclusive / exclusive：持有到判据为「没有下一轮」或被取代。持有的状态不算
+  空闲块：每个活跃 session 3 块（每 rank 45 MiB）。
+- LRU：A/B 里和 belady 一样，这个 prompt 以后还会被用到才持有（`run_ab.sh` 在混合模型上把回放的 trace 经
+  `KVPILOT_BELADY_TRACE` 交给 LRU，P 启动日志 `KVPilot LRU end states held by trace: <路径>`），所以五个策略留下的
+  状态相同，只差 KV 放在哪一层。没给 trace（request-safe 测量）就不持有，结尾状态在这个请求的 KV 之后释放，按释放
+  顺序淘汰时 KV 先走、状态后走。2026-11-23 晚之前 A/B 里的 LRU 也不持有：压力一大就把状态逐出、整段重算，模拟中
+  TTFT 是其余策略的 4–8 倍，那是状态保留的差别，不算放置收益。更早 LRU 持有到被取代，request-safe 测量里每个测试
+  都是死胡同，状态越积越多，约 670 行后 HBM 被占满、请求分不到块。
+- 没被持有的状态（prefill 中途、被取代的、预热请求的）释放后在按键排序的空闲队列里排在最前（`_STATE` = −2e9，
+  只在没 hash 的块之后）；LRU 用上游队列，按释放顺序。
+- exclusive / blockwise 只搬 KV（后台写、借块写出、直写 SSD 都不变），HBM 留前缀头部、其余放 DRAM / SSD 也能命中。
+
+**P 只算 prompt 的前 N−1 个 token**：P/D 下 NIXL 把线性注意力模型的最后一个 token 留给 D
+（`_truncate_mamba_request_for_prefill`），所以一轮留下的块和状态到 (N−1) 向下取整到 1536 的边界为止。判据表的
+`next_suffix` 按这个算（`add_next_suffix.py --drops-last`）；request-safe 的 warm 请求发 p + 1 个 token，状态才落在 p。
+
+**时间模型**：prefill 的切步按对齐模式（`kvpilot_time_model.compute_features(align=1536)`：非最后一步向下取整到
+1536 的倍数，并在最后一个完整块边界切一刀，10,000 token 冷算是 7680 + 1536 + 784）。系数由
+`paper-figure/Figure3-request-safe` 用同一套 request-safe 测法在 Qwen3.6 上测（`make_trace.py --model qwen3.6`，prefix
+按 1536 对齐），`fit_times2.py --block 1536 --align` 拟合，文件里带 `align`，P 启动时核对。
+
+**块大小**：D 侧阈值和在线预测按 engine 的块大小；Belady 的 `next_uses` 每 1536 token 取 3 个 trace hash id；判据表
+`signal_<trace>_b<块>.json`，tier 和三档时间按**这个模型自己**的：新 trace 用时间模型算（`make_model_table.py <trace>
+<系数> <输出> --block <块> --drops-last`，和 Qwen3-30B 的 k160 表同一做法，不用 request-safe 实测）；k160 的两张是
+request-safe 实测（`make_req_table.py <trace> raw/qwen3.6/<ds> ...`，TP4 用 `raw/qwen3.6-tp4/<ds>`，再
+`add_next_suffix.py --block <块> --drops-last`）。k160 上 TP4 时间模型算的 tier 与实测一致 84%，不一致的主要是实测
+DRAM、模型 HBM（123 / 1102 行），即模型偏保守。2026-11-23 之前的 `_b1536` 表只重算了 next_suffix，tier 和时间
+沿用了 Qwen3-30B 的（Qwen3-30B 下一轮多为 DRAM，Qwen3.6 多为 SSD），没用它跑过 A/B。`run_ab.sh` 看 `MODEL` 是混合模型就按 `TP_SIZE` 和是不是 FP8 权重换判据表和系数（TP2：`_b1536`、
+`fit_times2_qwen3.6_k160.json`；TP4：`_b1024`、`fit_times2_qwen3.6-tp4_k160.json`；FP8 TP2：`_q36f8`、
+`fit_times2_qwen3.6-fp8_k160.json`，开专家并行测的；Qwen3.8：`_q38`、`fit_times2_qwen3.8-ep_k160.json`）。模拟器（`datasets/block-priority-trace/sim_placement.py --model`）按 `PROFILES`
+里每个模型的块、HBM 块数、每块字节数和时间模型模拟；混合模型的状态每个 3 块、只在 HBM，持有规则同上。prefill 之外
+的开销默认用 Qwen3-30B 拟合的那套（exclusive 的接纳前开销每千命中 token 少约 0.4 ms），Qwen3.6 FP8 和 Qwen3.8 用各自
+实测的 `pre`（和放置无关）；exclusive 不 write-through、prefill 比时间模型快的部分是 `excl_save`。两项都是 2026-11-25
+从 Eval-EXP1 第二轮 SWE 的实测拟合的，之前的模拟高估了混合模型上 exclusive 的收益（见 `paper-figure/Eval-EXP1/README.md`）。
+`search_trace_models.py` 在同一条候选 trace 上把几个模型都模拟一遍。
+
+**Qwen3.6 TP2 上放置几乎没有收益**（2026-11-23，模拟器 + 时间模型）：每 rank 每 token 的 KV 只有 10 KiB，H20 上
+prefill 又不比 Qwen3-30B 短，按层加载基本被计算盖住。swe_full 的复用轮次，prefix 全从 SSD 比全在 HBM 平均只慢
+7.3%（Qwen3-30B 是 48%），全从 DRAM 只慢 0.5%；状态也卸载（约 31 MiB/rank，相当于 3.1K token 的 KV）只到 8.9%，块
+缩到 576 也只到 9.8%。默认容量下 30 条候选 trace 里，belady / incp / exclu / exclb 彼此相差不超过约 3%；压力再大时
+LRU 丢状态整段重算，TTFT 是其余四个的 4–8 倍，但那四个仍然一样。所以改测 TP4（计算减半、加载不变）。
+
+**TP4**（2026-11-23）：request-safe 已完成，4420 个请求、3315 次来源检查全部通过；TP4 时间模型和
+`signal_swe_blockprio_k160_b1024.json` 已在本地产出。k160 实测上限：prefix 全从 SSD 比全在 HBM 平均慢 72%（TP2 是
+8.4%），全从 DRAM 只慢 0.6%；每 rank 计算降到 TP2 的约 0.7 倍，SSD 每 1K token 3.37 ms，是 TP2 的两倍（4 个 rank
+共用 SSD）。但默认 HBM 6912 块（708 万 token）装得下整条 k160，五个策略模拟几乎相同；要 LRU 读 SSD 得让活跃 prompt
+超过 DRAM（944 万 token），所以 A/B 改用各模型共用的 `sweblock512`（`swe_blockprio_k512.jsonl`，见
+[block-priority-trace README](../datasets/block-priority-trace/README.md) 末节），尚无真机结果。详见
+[Figure3 README](../paper-figure/Figure3-request-safe/README.md)「Qwen3.6 TP4」。
+
+### Qwen3.8-Flash-Next（TP 4）
+
+模型从 vLLM 0.30（PR #53896 合入点）移植到 0.23（`vllm/models/qwen4_exp/`，V1 runner，无 MTP），只带跑它缺的部分。
+48 层：36 层 Gated DeltaNet，12 层 QSA（稀疏注意力：indexer 4 个头 × 128 维、1 个 key 头，每 4 个 token 压成一个
+key，打分后选 2048 个 token；主注意力 24 个 Q 头、2 个 KV 头 × 256，TP4 下每 rank 1 个，复制）；第 2 层有 PLE
+（3-gram 哈希嵌入加短卷积，TP 间复制）；512 个专家 top-10，FP8 权重（每 rank 44.4 GiB）。块 1024。
+
+**缓存与放置**（每 rank）：
+
+| 缓存 | 页 | 放置 |
+|---|---|---|
+| QSA 主 KV（12 层） | 每块 1 MiB | 和其他模型的 KV 一样跨 HBM / DRAM / SSD |
+| indexer 压缩 key（12 层，每 4 token 一行 128 维） | 每块 64 KiB，与主 KV 同一块号 | 作为「侧页」附在同层主 KV 的 value 后面，一起存取 |
+| indexer raw-key 环形缓冲（12 层，4 行） | 每请求 1 块，1 KiB | 不参与前缀缓存；块边界上它是空的（1024 是 4 的倍数），命中用不到 |
+| GDN 状态（3 组 × 12 层）、PLE 短卷积状态（1 层） | 补齐到 1 MiB，与主 KV 共用张量 | 只在 HBM，同 Qwen3.6；每个 session 持有 4 块 |
+
+- **LMCache 侧页**：每层的 value = 该 chunk 的 token-major KV（1024 × 1 KiB）+ 该块的压缩 key 页（64 KiB）。
+  chunk = 块，所以一个 chunk 正好一个块号，侧页在显存里连续。存储时主 KV 照旧 gather + D2H，侧页从压缩 key 张量的
+  块页直接拷进副本（`batched_memcpy_async`）；DRAM / SSD 两个 C++ loader 在每层那一批 `cudaMemcpyBatchAsync` 里
+  顺带把侧页直接写回块页，在这层的 event 之前；有借块时侧页排在等待写出事件之后（否则会先覆盖还没写出的旧页）。
+  exclusive 的写出（`ExclusiveWriter`）和借块写出（`LayerEvictor`）同样带侧页。`value_bytes()` 替代各处的
+  `chunk × token_bytes`。adapter 按层号把主 KV 和压缩 key 配对（`set_side_caches`）。
+- **逐层 hook**：QSA 是自定义 op，0.23 的 `maybe_transfer_kv_layer` 挂在它调用的内部函数上（op 本身的 schema 要从
+  它模块里的字符串注解推断，不能套别的模块的装饰器）。
+- **NIXL（P→D）**：0.23 的 NIXL 要求各张量页大小相同。Qwen3.8 有 1 MiB / 64 KiB / 1 KiB 三种，加了只在它身上生效的
+  分支（`worker.py` 的 `_is_qsa`）：按张量注册各自的页长；主 KV 组读主 KV 和压缩 key 的 region，环形缓冲组只读环形
+  缓冲的 region；GDN 用原有的三段读，只读主 KV 那 12 个 region；PLE 读整页状态。只支持 P、D 同为 TP 4。上游 0.30
+  的这部分改动叠在 0.30 重构过的 NIXL 和打包分配上，不能直接 cherry-pick。
+- **调度**：同 Qwen3.6（P 少算最后一个 token、状态从 HBM 命中、`_kvpilot_hybrid_hit`），状态组是 3 个 GDN 组加 PLE 组，
+  环形缓冲组算作 scratch。异步调度自动关闭（PLE 的 n-gram 上下文，见 [pitfalls.md](pitfalls.md)）。开专家并行
+  （2026-11-25 起；之前不开，见 [pitfalls.md](pitfalls.md)「FP8 模型开专家并行」），时间模型 `fit_times2_qwen3.8-ep_k160.json`。
+
+**正确性**（2026-11-24，`utils/hybrid_check/run_check.sh`，`ROOT=/root/q38 TP_SIZE=4 MODEL=<Qwen3.8> SEEDS="0 1"`）：
+DRAM / SSD 复用与 HBM 命中的输出逐字一致（两个种子全部）；P 日志核对来源（`dram=6144`、SSD 的 `ssd_values=72` =
+12 层 × 6 chunk）。和冷算有分叉，现象同 Qwen3.6（argmax 近似并列）。单机还用 needle（6.7K token 前埋的数字，冷算
+和前缀命中都答对）和「prompt + 输出整体 prefill，看每个生成位置的 argmax」检查过 decode 路径（`tools/kvpilot/qwen38_smoke.py`）。
+
+**request-safe 与时间模型**：见 [Figure3 README](../paper-figure/Figure3-request-safe/README.md)「Qwen3.8」。prefill
+很慢（每千 token 约 85 ms，Qwen3.6 TP4 的数倍：0.23 上没有融合 kernel），加载大多被盖住：prefix 全从 SSD 只比
+全在 HBM 慢 12%。
+
 ## Mooncake master
 
 - 组 = LMCache key（`model@ws@worker@chunk_hash@dtype@layer`）的 chunk-hash 字段，即一个 chunk 的所有层、所有 TP
@@ -392,11 +578,11 @@ HBM，接着 d 块 DRAM，尾部 x 块 SSD（`kvpilot_blockwise.py`，时间模�
   - LRU：释放顺序
   - inclusive-safe：(组 tier, 释放顺序)
   - inclusive-penalty：(组 penalty, 释放顺序)，没收到判据的算 ∞；删内存副本
-  - exclusive：(组 penalty, 释放顺序)；只挑只有内存副本、没在 offload 的对象，下沉而不删
+  - exclusive：(组 penalty, 释放顺序)；挑没在 offload 的对象，已有磁盘副本的删内存副本，其余下沉（offload）
 - **读保护用 refcnt pin**：`GetReplicaList` pin 住内存副本，client 拷完 / 零拷贝用完后 `BatchUnpinMemoryReplicas`，
   `refcnt > 0` 的不淘汰。lease 照发，只管 `Remove` 和 client 拷贝的软超时，淘汰不看它；soft pin 也不看。
   `ExistKey` / `GetReplicaList` 刷新组的访问时间。
-- **PutStart**：只剩磁盘副本的对象（SSD 命中 load-through）追加一个内存副本；exclusive 下照上游拒绝。**PutEnd**：
+- **PutStart**：只剩磁盘副本的对象追加一个内存副本（SSD 命中 load-through；exclusive 下是留着 SSD 副本的块写 DRAM）。**PutEnd**：
   没有磁盘副本的才进 offload 队列，exclusive 下只有 SSD 组进。exclusive 判据为 SSD 的块由 worker 直写 SSD、不走
   PutEnd，所以 exclusive 下进 offload 队列的只有 DRAM 满时的下沉。
 - **HBM→DRAM 写（所有策略）**：layerwise store（LRU / inclusive 的 write-through）和 exclusive 写 DRAM 都是：先
@@ -410,7 +596,8 @@ HBM，接着 d 块 DRAM，尾部 x 块 SSD（`kvpilot_blockwise.py`，时间模�
 - 日志 `[KVPILOT-EVICT] used_ratio=... objects=... mem_objects=... candidates=... target=... evicted=... freed_bytes=...
   spilled=... offloading=... scans_skipped=... offloads_expired=...`；启动一行 `KVPilot placement=<策略|lru>`。
 - 单测 `tests/master_service_test.cpp`：`KvpAddMemoryReplicaToDiskOnlyObject`、`KvpExclusivePlacement`、
-  `KvpExclusiveSpillInsteadOfEvict`、`KvpExclusiveRespillAfterTierChange`、`KvpEvictionTakesRequestTailFirst`、`KvpInclusivePenaltyDropsSmallestPenaltyTail`。上游测 lease / soft pin 淘汰顺序的用例
+  `KvpExclusiveSpillInsteadOfEvict`、`KvpExclusiveRespillAfterTierChange`、`KvpExclusiveDropsDramCopyKeepsSsd`、
+  `KvpExclusiveDemotionDropsDramCopyOfSsdChunk`、`KvpEvictionTakesRequestTailFirst`、`KvpInclusivePenaltyDropsSmallestPenaltyTail`。上游测 lease / soft pin 淘汰顺序的用例
   （`EvictObject`、`TryEvictLeasedObject`、`SoftPin*`、`HardPinWithSoftPinEvictionOrder` 等）描述的是已删掉的淘汰，
   预期会失败。
 
@@ -466,7 +653,8 @@ TTFT 不含排队。各臂只差 `KVPILOT_PLACEMENT`；判据默认查判据表 
   | `next_time` | 下一轮实测的 prefill e2e [t1, t2, t4]（ms，prefix 整段从 HBM / DRAM / SSD 读） | 判据的 `time` |
   | `next_suffix` | 下一轮的 suffix（token，`add_next_suffix.py` 加的；没有下一轮为 null） | 判据的 `suffix`（blockwise） |
 
-  SWE 的两张由 `make_req_table.py` 从 request-safe 实测生成；toolagent 没有实测，`toolagent_prep.py` 按前缀推出
+  SWE 的两张由 `make_req_table.py` 从 request-safe 实测生成；block-priority 的 trace 用时间模型算
+  （`gen_trace_capacity.py`、`make_model_table.py`，`own_tier` 是上一轮给它算的 tier）；toolagent 没有实测，`toolagent_prep.py` 按前缀推出
   session（后一个请求包含前一个请求的全部整块就是它的下一轮），分档和 t1 / t2 / t4 用 `gen_trace.py` 的 Estimator
   （SWE request-safe 实测的近邻）估计。TraceLab（`tlreq`）没有判据表：当时在 GPU 上由 request-safe 日志生成的旧表
   只有分档、没有 t1 / t2 / t4，日志没拉回本机、机器已释放；要用得重跑 TraceLab 的 request-safe

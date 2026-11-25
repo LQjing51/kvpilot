@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import math
 import os
+import re
+import time
 
 # Third Party
 from vllm.config import (
@@ -21,6 +23,13 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    FullAttentionSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.request import RequestStatus
 from vllm.version import __version__ as VLLM_VERSION
 import torch
@@ -59,6 +68,9 @@ if TYPE_CHECKING:
     from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 
 logger = init_logger(__name__)
+
+# Hybrid: longest a request waits for its KV to reach the state HBM holds.
+STATE_WAIT_S = 30.0
 
 
 @dataclass
@@ -161,6 +173,7 @@ class RequestTracker:
         num_tokens_to_compute: int,
         lmcache_cached_tokens: int,
         skip_save: bool,
+        attn_gid: int = 0,
     ) -> "RequestTracker":
         """Create the request tracker from a new request.
 
@@ -174,6 +187,7 @@ class RequestTracker:
                 cached in LMCache.
             request_priority (int): the priority of the request
             skip_save (bool): whether the request cache should be saved
+            attn_gid: the KV cache group of the full-attention layers.
         """
         # vLLM 0.9.0 update: request.block_ids changed from list[int] to
         # tuple[list[int]]
@@ -184,15 +198,9 @@ class RequestTracker:
         if not isinstance(new_request.block_ids[0], list):
             unfolded_block_ids = new_request.block_ids.copy()
         else:
-            # According to the vLLM code
-            # (https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/
-            # sched/scheduler.py#L943),
-            # only one KVCacheGroup is supported in connector for now.
-
-            # TODO: Please support multiple KVCacheGroup in connector.
-            # NOTE: Also, `update` method in RequestTracker should be
-            # updated accordingly.
-            unfolded_block_ids = new_request.block_ids[0].copy()
+            # One list per KV cache group: LMCache moves the full-attention
+            # group's KV; a hybrid model's states stay in HBM.
+            unfolded_block_ids = new_request.block_ids[attn_gid].copy()
 
         # NOTE: Initialized in `update_state_after_alloc`
         disagg_spec = tmp_disagg_tracker.pop(new_request.req_id, None)
@@ -223,6 +231,7 @@ class RequestTracker:
         lmcache_cached_tokens: int = 0,
         vllm_cached_tokens: int = 0,
         all_token_ids: Optional[list[int]] = None,
+        attn_gid: int = 0,
     ) -> None:
         """Update the request tracker when a running request is
         scheduled again
@@ -231,6 +240,7 @@ class RequestTracker:
         is only used for preempted requests
         all_token_ids: the full token list from the vLLM request, used to
         restore token_ids for preempted requests to ensure chunk keys match
+        attn_gid: as in from_new_request
         """
 
         if new_block_ids is None:
@@ -241,7 +251,7 @@ class RequestTracker:
         elif len(new_block_ids) == 0:
             new_block_ids = []
         elif isinstance(new_block_ids, tuple):
-            new_block_ids = new_block_ids[0]
+            new_block_ids = new_block_ids[attn_gid]
         elif isinstance(new_block_ids, list):
             # If input is a list, flatten it to handle potential nesting.
             # This also correctly processes already-flat lists.
@@ -580,6 +590,13 @@ class LMCacheConnectorV1Impl:
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
+            if self.use_layerwise and not self.enable_blending:
+                # The prefill side runs one sequence at a time (--max-num-seqs
+                # 1): a store holds one prompt.
+                assert self.lmcache_engine is not None
+                self.lmcache_engine.gpu_connector.max_buffer_tokens = (
+                    vllm_config.model_config.max_model_len
+                )
 
             if self.enable_blending:
                 assert self.lmcache_engine is not None
@@ -615,8 +632,62 @@ class LMCacheConnectorV1Impl:
             "skip_last_n_tokens", 0
         )
 
-        self.num_layers = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
+        # LMCache moves the full-attention group's KV. A hybrid model's
+        # linear-attention states never leave HBM: vLLM's prefix cache keeps
+        # one at each prompt's last block boundary (mamba "align" mode), and a
+        # hit ends where HBM holds one (KVCacheManager.get_computed_blocks).
+        # Qwen3.8: the KV group also holds each QSA layer's indexer keys (one
+        # page per block, carried with the layer's KV); its indexer's raw-key
+        # ring, one block per request and empty at a block boundary, stays in
+        # HBM like the states.
+        groups = self._parent._kv_cache_config.kv_cache_groups
+
+        def qsa_kv(spec) -> bool:
+            return isinstance(spec, UniformTypeKVCacheSpecs) and all(
+                isinstance(s, FullAttentionSpec) for s in spec.kv_cache_specs.values()
+            )
+
+        attn = [
+            g for g, grp in enumerate(groups)
+            if isinstance(grp.kv_cache_spec, FullAttentionSpec) or qsa_kv(grp.kv_cache_spec)
+        ]
+        mamba = [
+            g for g, grp in enumerate(groups) if isinstance(grp.kv_cache_spec, MambaSpec)
+        ]
+        rings = [
+            g for g, grp in enumerate(groups)
+            if isinstance(grp.kv_cache_spec, CircularBufferSpec)
+        ]
+        if len(attn) != 1 or len(attn) + len(mamba) + len(rings) != len(groups):
+            raise ValueError(
+                "LMCache: KV cache groups must be one full-attention group plus "
+                f"linear-attention ones, got {[type(g.kv_cache_spec).__name__ for g in groups]}"
+            )
+        for g in mamba:
+            if groups[g].kv_cache_spec.mamba_cache_mode != "align":
+                raise ValueError(
+                    "LMCache: hybrid models need prefix caching (mamba align mode), "
+                    f"got {groups[g].kv_cache_spec.mamba_cache_mode}"
+                )
+        self.attn_gid = attn[0]
+        self.hybrid = bool(mamba)
+        self._state_layers = {
+            name for g in mamba + rings for name in groups[g].layer_names
+        }
+        attn_spec = groups[self.attn_gid].kv_cache_spec
+        self._side_layers = (
+            {n for n, s in attn_spec.kv_cache_specs.items() if isinstance(s, MLAAttentionSpec)}
+            if qsa_kv(attn_spec)
+            else set()
+        )
+        self._kv_block_size = attn_spec.block_size
+        if self._side_layers and config.chunk_size != self._kv_block_size:
+            raise ValueError(
+                f"LMCache: side pages need chunk_size {config.chunk_size} == "
+                f"block size {self._kv_block_size}"
+            )
+        self.num_layers = vllm_config.model_config.get_num_layers_by_block_type(
+            vllm_config.parallel_config, "attention"
         )
         self.current_layer = 0
 
@@ -624,6 +695,8 @@ class LMCacheConnectorV1Impl:
         # Exclusive placement: a prefill writes nothing below HBM; the
         # scheduler sends deferred writes once the next turn's tier is known.
         self._kvx_enabled = kvpilot_placement.exclusive()
+        # Hybrid: request id -> when its KV was first found short of its HBM state.
+        self._state_waits: dict[str, float] = {}
         self.force_skip_save = self.force_skip_save or self._kvx_enabled
         self._kvx_outbox: list[dict] = []
         self._kvx_writer: Optional[kvpilot_exclusive.ExclusiveWriter] = None
@@ -866,8 +939,38 @@ class LMCacheConnectorV1Impl:
         # TODO(chunxiaozheng): `_init_kv_caches_from_forward_context` is
         #  not called, we should consider removing it.
         assert len(self.kv_caches) == 0 and len(kv_caches) > 0
-        self.kv_caches = kv_caches
+        if not self.hybrid:
+            self.kv_caches = kv_caches
+            self._manager.post_init()
+            return
+
+        # Hybrid models: vLLM registers the layers group by group; LMCache's
+        # layerwise hooks come from the full-attention layers in model order.
+        def index(name: str) -> int:
+            return int(re.search(r"layers\.(\d+)\.", name).group(1))
+
+        attn = sorted(
+            (n for n in kv_caches if n not in self._state_layers | self._side_layers),
+            key=index,
+        )
+        if len(attn) != self.num_layers:
+            raise ValueError(f"LMCache: {len(attn)} KV layers, expected {self.num_layers}")
+        self.kv_caches = {n: kv_caches[n] for n in attn}
+        if self._side_layers:
+            side = sorted(self._side_layers, key=index)
+            if [index(n) for n in side] != [index(n) for n in attn]:
+                raise ValueError(f"LMCache: side caches {side} do not match KV layers {attn}")
+            assert self.lmcache_engine is not None
+            self.lmcache_engine.gpu_connector.set_side_caches(
+                [kv_caches[n] for n in side], self._kv_block_size
+            )
         self._manager.post_init()
+        logger.info(
+            "Hybrid model: %d KV layers (%s side pages); linear-attention states "
+            "stay in HBM",
+            len(attn),
+            f"{self.lmcache_engine.gpu_connector.side_bytes} B" if self._side_layers else "no",
+        )
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
@@ -984,6 +1087,7 @@ class LMCacheConnectorV1Impl:
                         token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        slot_mapping_cpu=request.slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
                         request_configs=request.request_configs,
@@ -1228,6 +1332,7 @@ class LMCacheConnectorV1Impl:
                     mask=store_mask,
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping,
+                    slot_mapping_cpu=request.slot_mapping,
                     offset=skip_leading_tokens,
                     sync=is_first,
                     req_id=request.req_id,
@@ -1568,6 +1673,19 @@ class LMCacheConnectorV1Impl:
                     request_configs[kvpilot_cache_use.MAX_TOKENS_KEY] = cache_use_max
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
+            if self.hybrid:
+                # The hit has to end at the state vLLM found in HBM.
+                if not isinstance(cache_use_max, (int, type(None))):
+                    raise NotImplementedError(
+                        "LMCache: per-tier cache_use_max_tokens on a hybrid model"
+                    )
+                cap = request.kvpilot_state_hit
+                request_configs = {
+                    **(request_configs or {}),
+                    kvpilot_cache_use.MAX_TOKENS_KEY: (
+                        cap if cache_use_max is None else min(cap, cache_use_max)
+                    ),
+                }
 
             num_external_hit_tokens = self.lookup_client.lookup(
                 token_ids,
@@ -1584,6 +1702,52 @@ class LMCacheConnectorV1Impl:
                 num_computed_tokens,
             )
             return None
+
+        # Hybrid: vLLM already took the HBM state past what HBM's KV covers.
+        # Other models under exclusive placement: HBM still holds a block past
+        # its prefix match (KVCacheManager._kvpilot_pending_hit). Either way the
+        # previous turn's last blocks may still be on their way down (a job
+        # writing them; HBM's prefix match stops before them): the request
+        # waits for them, scheduled again next step, instead of computing
+        # them again. Its TTFT includes the wait.
+        kind = "hybrid" if self.hybrid else "exclusive"
+        wait_to = request.kvpilot_state_hit if self.hybrid else request.kvpilot_pending_hit
+        if num_computed_tokens < wait_to and num_external_hit_tokens < wait_to:
+            if self.hybrid and request.kvpilot_pending_hit <= num_external_hit_tokens:
+                # Nothing on its way down fills the gap: the KV past the hit
+                # is gone below (2026-11-25: Mooncake lost one TP rank's copy
+                # of an inclusive block). vLLM looks again with the state
+                # capped at what the KV reaches; the rest is computed.
+                logger.warning(
+                    "KVPilot hybrid cap req=%s: KV ends at %d, state in HBM at %d, "
+                    "nothing being written", req_id, num_external_hit_tokens, wait_to,
+                )
+                request.kvpilot_state_cap = num_external_hit_tokens
+                self._state_waits.pop(req_id, None)
+                self.lookup_client.clear_lookup_status(req_id)
+                return None
+            now = time.monotonic()
+            first = self._state_waits.setdefault(req_id, now)
+            if now == first:
+                logger.info(
+                    "KVPilot %s wait req=%s: KV ends at %d, %s at %d", kind,
+                    req_id, num_external_hit_tokens,
+                    "state in HBM" if self.hybrid else "HBM holds a block", wait_to,
+                )
+            if now - first < STATE_WAIT_S:
+                # Look again next step, not at this result.
+                self.lookup_client.clear_lookup_status(req_id)
+                return None
+            raise RuntimeError(
+                f"LMCache: {req_id}'s KV ends at {num_external_hit_tokens}, "
+                f"{kind} wait for {wait_to} after {STATE_WAIT_S:g} s"
+            )
+        first = self._state_waits.pop(req_id, None)
+        if first is not None:
+            logger.info(
+                "KVPilot %s waited req=%s %.1f ms", kind, req_id,
+                (time.monotonic() - first) * 1e3,
+            )
 
         # When prompt length is divisible by the block size and all
         # blocks are cached, we need to recompute the last token.
@@ -1769,6 +1933,7 @@ class LMCacheConnectorV1Impl:
                 num_tokens_to_compute,
                 lmcache_cached_tokens,
                 skip_save,
+                attn_gid=self.attn_gid,
             )
             self._request_trackers[request.req_id] = request_tracker
 
@@ -1950,6 +2115,7 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_tokens=lmcache_cached_tokens,
                 vllm_cached_tokens=vllm_cached_tokens,
                 all_token_ids=all_token_ids,
+                attn_gid=self.attn_gid,
             )
 
             req_meta = ReqMeta.from_request_tracker(

@@ -23,11 +23,14 @@ What is modeled (vllm/v1/core/kvpilot_*.py, the Mooncake master):
     ones to DRAM when a request is short (excl: the request waits; exclu /
     exclb: lent for its loaded prefix when that covers the shortfall, and the
     reserve refilled after each request).
-  * DRAM holds dram_blocks (the 0.9 watermark); above it the master removes
-    (inclusive; SSD keeps a copy) or spills to SSD (exclusive) a tenth of it,
-    lowest (class, penalty, release order, -position) first, so a request
-    leaves from its tail. Inclusive writes every full prompt block to DRAM and
-    SSD (write-through, SSD hits loaded through).
+  * DRAM holds dram_blocks (WATERMARK); above it the master removes
+    (inclusive; SSD keeps a copy) or spills to SSD (exclusive; a block that
+    kept its SSD copy is only removed) a tenth of it, lowest (class, penalty,
+    release order, -position) first, so a request leaves from its tail.
+    Inclusive writes every full prompt block to DRAM and SSD (write-through,
+    SSD hits loaded through). Exclusive keeps one copy in HBM or DRAM; an SSD
+    copy stays when a block moves up, and a turn with no next turn writes
+    nothing.
   * A clock follows the replay (-p 1, released at the first token): a request
     starts when the previous one's first token is out (send, any wait for HBM,
     prefill, decode-side KV pull, one decode step) and not before its
@@ -74,33 +77,82 @@ for _pkg in ("vllm", "vllm.v1", "vllm.v1.core"):
 tm = _load("vllm.v1.core.kvpilot_time_model", CORE / "kvpilot_time_model.py")
 bw = _load("vllm.v1.core.kvpilot_blockwise", CORE / "kvpilot_blockwise.py")
 
+# Tokens per trace hash id.
 BLOCK = 512
+# DRAM fill at which the master starts removing, as configured. In the
+# Eval-EXP1 round-2 runs it evicted at used_ratio 0.81-0.84 (median), yet LRU's
+# DRAM hits match these runs better at 0.9 (the master's order is not modeled).
+WATERMARK = 0.9
 COEFFS = ROOT / "paper-figure/Figure3-request-safe/fit_times2_swe.json"
+# Per model, 1P1D at TP 2 unless named (default service settings, GPU_MEM_UTIL 0.9):
+#   block      vLLM block = LMCache chunk, tokens
+#   hbm        prefill KV pool, blocks
+#   block_gib  one block on one TP rank in Mooncake DRAM, GiB
+#   kv_layers  layers whose KV goes below HBM
+#   hybrid     linear-attention states (Qwen3.6, Qwen3.8): never offloaded,
+#              `states` blocks each in HBM (one per state group); a hit ends at
+#              one (vllm/v1/core/kvpilot_states.py), and the prefill side
+#              computes the prompt but its last token
+#   excl_save  exclusive prefill below the time model (fitted under inclusive's
+#              write-through): ms, ms per 1K tokens computed, per 1K prefix;
+#              measured minus model of the Eval-EXP1 SWE runs, exclusive less
+#              inclusive arms
+#   job        exclusive writer job: ms, ms per DRAM block, per SSD block
+PROFILES = {
+    "qwen3-30b": {"block": 512, "coeffs": COEFFS, "hbm": 2361, "block_gib": 24 / 1024,
+                  "kv_layers": 48, "hybrid": False, "excl_save": (0.0, 1.6, 0.0),
+                  "job": (0.0, 1.6, 21.4)},
+    "qwen3.6": {"block": 1536, "hbm": 3485, "block_gib": 15 / 1024, "kv_layers": 10,
+                "hybrid": True, "states": 3,
+                "coeffs": ROOT / "paper-figure/Figure3-request-safe/fit_times2_qwen3.6_k160.json"},
+    # 1P1D at TP 4: the 2 KV heads are replicated, a rank's KV per token stays.
+    "qwen3.6-tp4": {"block": 1024, "hbm": 6912, "block_gib": 10 / 1024, "kv_layers": 10,
+                    "hybrid": True, "states": 3,
+                    "coeffs": ROOT / "paper-figure/Figure3-request-safe/fit_times2_qwen3.6-tp4_k160.json"},
+    # Qwen3.6 FP8 weights at TP 2: KV (BF16) and states as the BF16 TP 2 profile.
+    # pre: send -> prefill admission as default_cost's, fitted on the
+    # Eval-EXP1 round-2 SWE runs (lru / belady / exclb alike).
+    "qwen3.6-fp8": {"block": 1536, "hbm": 3485, "block_gib": 15 / 1024, "kv_layers": 10,
+                    "hybrid": True, "states": 3, "pre": (5.0, 0.27, 0.27, 0.27, 0.27),
+                    "excl_save": (0.65, 0.83, 0.08), "job": (1.0, 0.61, 10.5),
+                    "coeffs": ROOT / "paper-figure/Figure3-request-safe/fit_times2_qwen3.6-fp8_k160.json"},
+    # Qwen3.8-Flash-Next at TP 4: 12 QSA layers whose values also carry the
+    # indexer keys (64 KiB per block); states of 3 GDN groups and the PLE
+    # short conv.
+    "qwen3.8": {"block": 1024, "hbm": 3071, "block_gib": 12 * 1.0625 / 1024, "kv_layers": 12,
+                "hybrid": True, "states": 4, "pre": (5.1, 0.37, 0.37, 0.37, 0.37),
+                "excl_save": (0.0, 1.6, 0.0), "job": (0.0, 0.55, 13.3),
+                "coeffs": ROOT / "paper-figure/Figure3-request-safe/fit_times2_qwen3.8-ep_k160.json"},
+}
 STRATEGIES = ("lru", "belady", "incl", "incp", "excl", "exclu", "exclb")
 CLASS = {None: 1, "SSD": 2, "DRAM": 3, "HBM": 4}
 RANK = {"HBM": 0, "DRAM": 1, "SSD": 2}
 FAR = 1e9
 PENDING = 1e8
-# The master's kKvpExclMaxInflight values (one per layer and TP rank) as blocks.
-SPILL_BLOCKS = 8192 // (48 * 2)
 INF = float("inf")
 
 
-def load_trace(path: str, table_path: str | None) -> list[dict]:
+def load_trace(path: str, table_path: str | None, prof: dict = PROFILES["qwen3-30b"]) -> list[dict]:
     table = json.load(open(table_path)) if table_path else {}
     rows = [json.loads(line) for line in open(path)]
-    return make_reqs(rows, [table.get(str(i), {}).get("next_suffix") for i in range(len(rows))])
+    return make_reqs(rows, [table.get(str(i), {}).get("next_suffix") for i in range(len(rows))],
+                     prof)
 
 
-def make_reqs(rows, next_suffix) -> list[dict]:
-    """Trace rows in replay order and each one's oracle next suffix."""
+def make_reqs(rows, next_suffix, prof: dict = PROFILES["qwen3-30b"]) -> list[dict]:
+    """Trace rows in replay order and each one's oracle next suffix. A request's
+    chains name its full blocks of computed prompt (the prefill side's; a
+    hybrid model's leaves out the last token) by their prefix."""
+    per, block = prof["block"] // BLOCK, prof["block"]
     reqs = []
     for i, (r, s) in enumerate(zip(rows, next_suffix)):
-        chain, chains = None, []
-        for h in r["hash_ids"][: r["input_length"] // BLOCK]:
+        ncomp = r["input_length"] - prof["hybrid"]
+        chain, links = None, []
+        for h in r["hash_ids"][: ncomp // BLOCK]:
             chain = hash((chain, int(h)))
-            chains.append(chain)
-        reqs.append({"i": i, "sid": r["session_id"], "n": r["input_length"],
+            links.append(chain)
+        chains = links[per - 1 :: per][: ncomp // block]
+        reqs.append({"i": i, "sid": r["session_id"], "n": r["input_length"], "ncomp": ncomp,
                      "out": r["output_length"], "chains": chains, "next_suffix": s})
     last: dict[int, int] = {}
     for q in reversed(reqs):
@@ -126,8 +178,18 @@ class Head:
 
 
 class Sim:
-    def __init__(self, strat, reqs, model, hbm_blocks, dram_blocks, reserve, cost):
+    def __init__(self, strat, reqs, model, hbm_blocks, dram_blocks, reserve, cost,
+                 prof: dict = PROFILES["qwen3-30b"]):
         self.s, self.reqs, self.M = strat, reqs, model
+        self.B = prof["block"]
+        self.hybrid = prof["hybrid"]
+        self.state_blocks = prof.get("states", 0)
+        # Hybrid: the state at a turn's end, by its last chain: "held" (out of
+        # the free queue, with holders), "busy" (a running request's hit) or,
+        # under LRU, "cached" in the free queue. Not held elsewhere means gone
+        # (it sorts first in the class queue).
+        self.sts: dict[int, str] = {}
+        self.sholders: dict[int, int] = {}
         self.excl = strat in ("excl", "exclu", "exclb")
         self.blockwise = strat == "exclb"
         self.lend_ok = strat in ("exclu", "exclb")
@@ -142,6 +204,8 @@ class Sim:
         self.dram: dict[int, tuple] = {}
         self.dheap: list = []
         self.ssd: set[int] = set()
+        # Blocks an exclusive job is writing to SSD -> its end (ms).
+        self.ssd_pending: dict[int, float] = {}
         self.order: dict[int, tuple[int, int]] = {}
         self.seq = itertools.count()
         self.ord = itertools.count()
@@ -149,7 +213,8 @@ class Sim:
         self.claim: dict[int, set[int]] = defaultdict(set)
         self.sess: dict[str, int] = {}
         self.pending: list = []  # (arrival ms, head id)
-        # Exclusive writes below, one job at a time: (end ms, seq, blocks).
+        # Exclusive writes below, one job at a time: (end ms, seq, blocks,
+        # those bound for SSD).
         self.writing: list = []
         self.writer_free = 0.0
         self.stats = defaultdict(int)
@@ -225,12 +290,52 @@ class Sim:
         self.hkey.pop(c, None)
 
     def hfree(self):
-        return self.Hcap - len(self.hbm)
+        return self.Hcap - len(self.hbm) - self.state_blocks * len(self.sts)
+
+    # ---- hybrid states -------------------------------------------------------
+
+    def state_hold(self, c):
+        """Hold the state ending chain c (one more holder)."""
+        if self.sts.get(c) == "held":
+            self.sholders[c] += 1
+            return
+        if c not in self.sts and self.hfree() < self.state_blocks:
+            if self.excl:
+                self.stats["overcommit"] += 1
+            else:
+                self.evict_cached(self.state_blocks)
+        self.sts[c] = "held"
+        self.sholders[c] = 1
+
+    def state_let_go(self, c):
+        """The state ending chain c is not held (any more): LRU queues it, the
+        others drop it (first in their queue)."""
+        if self.sts.get(c) == "held":
+            self.sholders[c] -= 1
+            if self.sholders[c]:
+                return
+            del self.sholders[c]
+        if self.s == "lru":
+            if c not in self.sts and self.hfree() < self.state_blocks:
+                self.evict_cached(self.state_blocks)
+            self.sts[c] = "cached"
+            key = (0.0, next(self.seq))
+            self.hkey[("S", c)] = key
+            heapq.heappush(self.hheap, (key, ("S", c)))
+        else:
+            self.sts.pop(c, None)
 
     def evict_cached(self, n):
         out = 0
         while out < n and self.hheap:
             key, c = heapq.heappop(self.hheap)
+            if isinstance(c, tuple):
+                # An LRU-queued state (keys carry unique seqs: no ties).
+                if self.sts.get(c[1]) == "cached" and self.hkey.get(c) == key:
+                    del self.sts[c[1]]
+                    del self.hkey[c]
+                    out += self.state_blocks
+                continue
             if self.hbm.get(c) != "cached" or self.hkey.get(c) != key:
                 continue
             self.hdrop(c)
@@ -274,8 +379,9 @@ class Sim:
                 heapq.heappush(cands, (self.tail_key(g), next(self.seq), g.hid))
         return out
 
-    def write_job(self, n_dram, n_ssd, blocks, at):
-        """The serial writer writes blocks below; they leave HBM when done."""
+    def write_job(self, n_dram, n_ssd, blocks, at, to_ssd=()):
+        """The serial writer writes blocks below; they leave HBM when done,
+        and those bound for SSD are on SSD only then."""
         c = self.cost
         start = max(at, self.writer_free)
         end = (start + c["job_ms"] + c["job_ms_per_dram"] * n_dram
@@ -284,12 +390,17 @@ class Sim:
         for b in blocks:
             self.hbm[b] = "writing"
             self.hkey.pop(b, None)
-        heapq.heappush(self.writing, (end, next(self.seq), blocks))
+        heapq.heappush(self.writing, (end, next(self.seq), blocks, to_ssd))
+        for b in to_ssd:
+            self.ssd_pending[b] = end
         return end
 
     def settle(self, t):
         while self.writing and self.writing[0][0] <= t:
-            _, _, blocks = heapq.heappop(self.writing)
+            _, _, blocks, to_ssd = heapq.heappop(self.writing)
+            self.ssd.update(to_ssd)
+            for b in to_ssd:
+                self.ssd_pending.pop(b, None)
             for b in blocks:
                 if self.hbm.get(b) == "writing":
                     self.hdrop(b)
@@ -327,8 +438,6 @@ class Sim:
         key = self.dkey(c, rank)
         self.dram[c] = key
         heapq.heappush(self.dheap, (key, c))
-        if self.excl:
-            self.ssd.discard(c)
 
     def drank(self, c):
         """The master's rank of a DRAM block for the inclusive placements."""
@@ -349,12 +458,9 @@ class Sim:
         over = len(self.dram) - self.Dcap
         if over <= 0:
             return
-        # Inclusive: the master drops a tenth of DRAM at once. Exclusive: it
-        # spills rounds of its in-flight cap until DRAM is under the watermark.
-        if self.excl:
-            target = -(-over // SPILL_BLOCKS) * SPILL_BLOCKS
-        else:
-            target = over + len(self.dram) // 10
+        # The master drops (inclusive) or spills / drops (exclusive) a tenth
+        # of DRAM at once.
+        target = over + len(self.dram) // 10
         out = 0
         while out < target and self.dheap:
             key, c = heapq.heappop(self.dheap)
@@ -362,8 +468,8 @@ class Sim:
                 continue
             del self.dram[c]
             if self.excl:
+                self.stats["dropped_on_ssd" if c in self.ssd else "spilled"] += 1
                 self.ssd.add(c)
-                self.stats["spilled"] += 1
             out += 1
 
     # ---- signals ------------------------------------------------------------
@@ -403,6 +509,8 @@ class Sim:
                     self.dput(c, self.drank(c))
         if tier is None:
             self.drop_head(hid)
+            if self.hybrid and g.blocks:
+                self.state_let_go(g.blocks[-1])
 
     def rekey_hbm(self, c):
         _, seq = self.hkey[c]
@@ -421,28 +529,32 @@ class Sim:
             if self.pending_claim(c):
                 continue
             want = self.required(c)
-            lower = "DRAM" if c in self.dram else "SSD" if c in self.ssd else None
             if want == "HBM":
                 self.dram.pop(c, None)
-                self.ssd.discard(c)
                 key = (self.hbm_pen(c), next(self.seq)) if not self.blockwise else (0.0, next(self.seq))
                 self.hset(c, "held", key)
                 continue
-            if lower is not None and (want is None or lower == want):
-                self.hdrop(c)
-                if want is None and lower == "DRAM":
+            if want is None:
+                # No next turn: nothing written; a DRAM copy demotes first.
+                if c in self.dram:
                     self.dput(c, 0.0)
+                self.hdrop(c)
                 continue
-            self.dram.pop(c, None)
-            self.ssd.discard(c)
-            if (want or "SSD") == "DRAM":
+            if (want == "DRAM" and c in self.dram) or (want == "SSD" and c in self.ssd):
+                if want == "SSD":
+                    self.dram.pop(c, None)
+                self.hdrop(c)
+                continue
+            if want == "DRAM":
                 self.dput(c, self.dram_pen(c))
                 down_dram.append(c)
             else:
-                self.ssd.add(c)
+                self.dram.pop(c, None)
                 down_ssd.append(c)
         if down_dram or down_ssd:
-            self.write_job(len(down_dram), len(down_ssd), down_dram + down_ssd, at)
+            self.stats["write_dram"] += len(down_dram)
+            self.stats["write_ssd"] += len(down_ssd)
+            self.write_job(len(down_dram), len(down_ssd), down_dram + down_ssd, at, down_ssd)
         self.denforce()
 
     # ---- a request ----------------------------------------------------------
@@ -455,26 +567,36 @@ class Sim:
         # previous round ends; the prefill side admits it after the frontend
         # and lookup (pre) once the previous prefill is done (queue).
         sent = max(self.now, self.ready.get(q["sid"], 0.0))
-        self.deliver(sent)
+        # The signal of the session's previous round (its end + signal_ms)
+        # reaches the prefill side before this request's lookup does.
+        self.deliver(sent + cost["signal_ms"])
         self.settle(sent)
+        B = self.B
         F = len(chains)
-        cap = min(F, (n - 1) // BLOCK)
+        cap = min(F, (q["ncomp"] - 1) // B)
         H = 0
         while H < cap and chains[H] in self.hbm:
             H += 1
-        P, Dn, Xn = H, 0, 0
-        while P < cap:
-            c = chains[P]
-            if c in self.dram:
-                Dn += 1
-            elif c in self.ssd:
-                Xn += 1
-            else:
-                break
+        P = H
+        # A block still being written to SSD is not there yet: the prefill
+        # waits for the write (lmcache "KVPilot hybrid / exclusive wait").
+        while P < cap and (chains[P] in self.dram or chains[P] in self.ssd
+                           or chains[P] in self.ssd_pending):
             P += 1
+        if self.hybrid:
+            # The hit ends at a state in HBM; HBM's KV past it is no use.
+            while P and chains[P - 1] not in self.sts:
+                P -= 1
+            H = min(H, P)
+            if P and self.sts[chains[P - 1]] == "cached":
+                self.sts[chains[P - 1]] = "busy"
+        wait_until = max((self.ssd_pending[c] for c in chains[H:P]
+                          if c in self.ssd_pending and c not in self.dram), default=0.0)
+        Dn = sum(1 for c in chains[H:P] if c in self.dram)
+        Xn = P - H - Dn
         a, b_new, b_hbm, b_dram, b_ssd = cost["pre"]["excl" if self.excl else "incl"]
-        pre = a + (b_new * (n - P * BLOCK) + (b_hbm * H + b_dram * Dn + b_ssd * Xn) * BLOCK) / 1000
-        start = max(sent + pre, self.p_free)
+        pre = a + (b_new * (n - P * B) + (b_hbm * H + b_dram * Dn + b_ssd * Xn) * B) / 1000
+        start = max(sent + pre, self.p_free, wait_until)
         queue = start - sent - pre
         self.deliver(start)
         self.settle(start)
@@ -482,7 +604,8 @@ class Sim:
         for c in chains[:H]:
             if self.hbm.get(c) == "cached":
                 self.hbm[c] = "busy"
-        need = -(-n // BLOCK) - H
+        # Plus the running state (hybrid).
+        need = -(-q["ncomp"] // B) - H + self.state_blocks
         blocked = extra = 0.0
         short = need - self.hfree()
         if short > 0:
@@ -528,8 +651,11 @@ class Sim:
                     self.deliver(t)
                     self.settle(t)
                 blocked = t - start
-        p = P * BLOCK
-        e2e = self.M.e2e(p, n - p, Dn * BLOCK, Xn * BLOCK) + extra
+        p = P * B
+        e2e = self.M.e2e(p, n - p, Dn * B, Xn * B) + extra
+        if self.excl:
+            a, b_new, b_pre = cost["excl_save"]
+            e2e -= a + (b_new * (n - p) + b_pre * p) / 1000
         done = start + blocked + e2e
         self.p_free = done
         first = done + cost["pull_ms"] + cost["pull_ms_per_ktok"] * n / 1000 + cost["tpot"]
@@ -575,6 +701,7 @@ class Sim:
                 self.dput(c, self.drank(c))
                 self.ssd.add(c)
             self.denforce()
+            self.release_states(q, full)
             return
         self.track(q, full, arrival)
         for c in full:
@@ -584,6 +711,23 @@ class Sim:
             self.hkey.pop(c, None)
             if c in self.dram:
                 self.dput(c, self.dram[c][0])
+        self.release_states(q, full)
+
+    def release_states(self, q, full):
+        """Hybrid: the request supersedes the states inside its prompt and
+        leaves its own at its end, held while a next turn comes
+        (kvpilot_states): LRU and Belady while the trace reuses the prompt
+        (run_ab.sh gives LRU the trace), the others until their signal."""
+        if not self.hybrid or not full:
+            return
+        for c in full[:-1]:
+            if c in self.sts:
+                self.state_let_go(c)
+        end = full[-1]
+        if self.s in ("lru", "belady") and q["next_use"][len(full) - 1] is None:
+            self.state_let_go(end)
+        else:
+            self.state_hold(end)
 
     def run(self):
         if self.s == "belady":
@@ -630,22 +774,30 @@ def summary(name, recs, skip):
             + "/".join(f"{t / allt * 100:4.1f}" for t in tot) + "%")
 
 
-def default_cost(tpot):
+def default_cost(tpot, prof: dict = PROFILES["qwen3-30b"]):
     """Request timing outside the prefill, fitted on the 2026-11-22 sweblock
-    (HBM 600: lru / incp / exclu) and sweblock160 (HBM 2361: all five) runs."""
+    (HBM 600: lru / incp / exclu) and sweblock160 (HBM 2361: all five) runs
+    of Qwen3-30B-A3B; another model's decode-side pull scales with its KV
+    bytes per token (Qwen3.6 not measured yet)."""
+    ref = PROFILES["qwen3-30b"]
+    kv_ratio = (prof["block_gib"] / prof["block"]) / (ref["block_gib"] / ref["block"])
     return {
         # Client send -> prefill admission (frontend, lookup): ms, then ms per
         # 1K tokens computed / hit in HBM / DRAM / SSD. Inclusive hits cost
-        # ~0.4 ms per 1K tokens more in HBM and DRAM, at both HBM sizes.
-        "pre": {"incl": (6.18, 0.975, 1.264, 1.43, 1.114),
-                "excl": (6.75, 0.927, 0.862, 0.987, 1.103)},
+        # ~0.4 ms per 1K tokens more in HBM and DRAM, at both HBM sizes. A
+        # profile's own "pre" is the same for both.
+        "pre": ({"incl": prof["pre"], "excl": prof["pre"]} if "pre" in prof else
+                {"incl": (6.18, 0.975, 1.264, 1.43, 1.114),
+                 "excl": (6.75, 0.927, 0.862, 0.987, 1.103)}),
         # Prefill done -> client first token: decode-side KV pull, one step.
-        "pull_ms": 52.9, "pull_ms_per_ktok": 0.97, "tpot": tpot,
+        "pull_ms": 52.9, "pull_ms_per_ktok": 0.97 * kv_ratio, "tpot": tpot,
         # First token -> the replay's next send.
         "dispatch_ms": 0.6, "signal_ms": 5.0,
-        # Exclusive writer jobs (exclu run, TP0 job lines) and a lend's copy.
-        "job_ms": 4.9, "job_ms_per_dram": 1.0, "job_ms_per_ssd": 25.0,
+        # Exclusive writer jobs (TP0 job lines; a profile's own "job" from its
+        # Eval-EXP1 round-2 exclb run) and a lend's copy.
+        **dict(zip(("job_ms", "job_ms_per_dram", "job_ms_per_ssd"), prof.get("job", (4.9, 1.0, 25.0)))),
         "lend_ms": 3.0, "lend_ms_per_block": 0.15,
+        "excl_save": prof.get("excl_save", (0.0, 0.0, 0.0)),
     }
 
 
@@ -669,10 +821,10 @@ def main():
     ap.add_argument("--trace", default=str(HERE / "swe_blockprio.jsonl"))
     ap.add_argument("--table", help="default: utils/placement_ab/signal_<trace>.json")
     ap.add_argument("--strategies", default=",".join(STRATEGIES))
-    ap.add_argument("--hbm-blocks", type=int, default=2361)
+    ap.add_argument("--model", choices=list(PROFILES), default="qwen3-30b")
+    ap.add_argument("--hbm-blocks", type=int, help="default: the model's at GPU_MEM_UTIL 0.9")
     ap.add_argument("--dram-gib", type=float, default=100.0, help="per TP rank")
-    ap.add_argument("--block-gib", type=float, default=24 / 1024, help="one block per TP rank")
-    ap.add_argument("--watermark", type=float, default=0.9)
+    ap.add_argument("--watermark", type=float, default=WATERMARK)
     ap.add_argument("--tpot", type=float, default=14.0,
                     help="decode ms per token (sweblock runs: 12.5 lru, 17.5 incp, 14.7 exclu)")
     ap.add_argument("--reserve", type=int, default=16)
@@ -680,16 +832,19 @@ def main():
     ap.add_argument("--logs", nargs="*", default=[], help="strategy=<log dir> to compare")
     a = ap.parse_args()
 
-    table = a.table or str(ROOT / f"utils/placement_ab/signal_{Path(a.trace).stem}.json")
-    reqs = load_trace(a.trace, table)
-    M = tm.TimeModel.load(str(COEFFS), BLOCK)
-    dram_blocks = int(a.watermark * a.dram_gib / a.block_gib)
-    cost = default_cost(a.tpot)
-    print(f"{Path(a.trace).name}: {len(reqs)} requests; HBM {a.hbm_blocks} blocks, DRAM "
-          f"{dram_blocks} blocks, tpot {a.tpot} ms; steady from line {a.skip}")
+    prof = PROFILES[a.model]
+    hbm_blocks = a.hbm_blocks or prof["hbm"]
+    suffix = f"_b{prof['block']}" if prof["hybrid"] else ""
+    table = a.table or str(ROOT / f"utils/placement_ab/signal_{Path(a.trace).stem}{suffix}.json")
+    reqs = load_trace(a.trace, table, prof)
+    M = tm.TimeModel.load(str(prof["coeffs"]), prof["block"])
+    dram_blocks = int(a.watermark * a.dram_gib / prof["block_gib"])
+    cost = default_cost(a.tpot, prof)
+    print(f"{Path(a.trace).name} on {a.model}: {len(reqs)} requests; HBM {hbm_blocks} blocks, DRAM "
+          f"{dram_blocks} blocks of {prof['block']} tokens, tpot {a.tpot} ms; steady from line {a.skip}")
     sims = {}
     for s in a.strategies.split(","):
-        sim = Sim(s, reqs, M, a.hbm_blocks, dram_blocks, a.reserve, cost)
+        sim = Sim(s, reqs, M, hbm_blocks, dram_blocks, a.reserve, cost, prof)
         sims[s] = sim.run()
         print("sim  " + summary(s, sims[s], a.skip) + "  "
               + " ".join(f"{k}={v}" for k, v in sorted(sim.stats.items())
@@ -702,8 +857,9 @@ def main():
     for spec in a.logs:
         s, d = spec.split("=", 1)
         meas = measured(d)
-        real[s] = [{"i": i, "hbm": r["hit"] // BLOCK, "dram": r["dram"] // BLOCK,
-                    "ssd": r["ssd"] // BLOCK, "e2e": r["e2e"], "blocked": r["blocked"],
+        B = prof["block"]
+        real[s] = [{"i": i, "hbm": r["hit"] // B, "dram": r["dram"] // B,
+                    "ssd": r["ssd"] // B, "e2e": r["e2e"], "blocked": r["blocked"],
                     "ttft": r["ttft"]} for i, r in sorted(meas.items()) if r["ttft"] is not None]
         print("real " + summary(s, real[s], a.skip))
         if s in sims:

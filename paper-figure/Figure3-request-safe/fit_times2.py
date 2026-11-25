@@ -4,6 +4,8 @@ DRAM [2], SSD [4], and the loaders' load / first-layer times.
 
     python3 fit_times2.py --out fit_times2_swe.json
     python3 fit_times2.py --points points.json   # reuse collect_points.py output
+    python3 fit_times2.py --raw raw/qwen3.6 --datasets swe_blockprio_k160 \
+        --block 1536 --align --out fit_times2_qwen3.6_k160.json
 
 Steps, each on its own measurement:
   compute      relative least squares on the [1] e2e
@@ -37,7 +39,6 @@ _spec = importlib.util.spec_from_file_location(
 tm = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(tm)
 
-BLOCK = 512
 # The runs' scheduler: max_num_batched_tokens and prefill cudagraph sizes.
 CHUNK = 8192
 CAPTURE = [64, 128, 256, 512, 1024]
@@ -45,9 +46,9 @@ THRESH = 0.05
 DATASETS = ("swe", "swe_reqprio", "swe_hbm1to2")
 
 
-def fit(pts: list) -> dict:
+def fit(pts: list, block: int, align: int | None) -> dict:
     pts = [x for x in pts if x["s"] <= CHUNK]
-    X = np.array([np.add(*tm.compute_features(x["p"], x["s"], CHUNK, CAPTURE))
+    X = np.array([np.add(*tm.compute_features(x["p"], x["s"], CHUNK, CAPTURE, align))
                   for x in pts])
     y = np.array([x["t1"] for x in pts])
     comp = np.linalg.lstsq(X / y[:, None], np.ones(len(y)), rcond=None)[0]
@@ -59,6 +60,7 @@ def fit(pts: list) -> dict:
     g_dram, h_dram = np.polyfit(p, col("f2"), 1)
     g_ssd, h_ssd = np.polyfit(p, col("f4"), 1)
     k = {"version": tm.VERSION, "chunk": CHUNK, "capture": CAPTURE, "thresh": THRESH,
+         **({"align": align} if align else {}),
          **dict(zip(tm.COMPUTE, map(float, comp))),
          "c_dram": c_dram, "f_dram": f_dram, "c_ssd": c_ssd, "f_ssd": f_ssd,
          "g_dram": g_dram, "h_dram": h_dram, "g_ssd": g_ssd, "h_ssd": h_ssd,
@@ -66,7 +68,7 @@ def fit(pts: list) -> dict:
     k = {a: (float(b) if isinstance(b, np.floating) else b) for a, b in k.items()}
 
     def resid(v):
-        m = tm.TimeModel({**k, "k": v[0], "F": v[1], "omega": v[2], "w0": v[3]}, BLOCK)
+        m = tm.TimeModel({**k, "k": v[0], "F": v[1], "omega": v[2], "w0": v[3]}, block)
         r = []
         for x in pts[::2]:
             r.append(m.e2e(x["p"], x["s"], x["p"], 0) / x["t2"] - 1)
@@ -81,8 +83,8 @@ def fit(pts: list) -> dict:
     return k
 
 
-def report(k: dict, pts: list, names) -> None:
-    m = tm.TimeModel(k, BLOCK)
+def report(k: dict, pts: list, names, block: int) -> None:
+    m = tm.TimeModel(k, block)
     fmt = lambda e: (f"{np.median(np.abs(e))*100:4.1f}% / "  # noqa: E731
                      f"{np.percentile(np.abs(e), 90)*100:5.1f}% / {np.median(e)*100:+5.1f}%")
     print(f"{'':24s} |err| p50 / p90 / bias")
@@ -108,18 +110,25 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--datasets", nargs="+", default=list(DATASETS))
     ap.add_argument("--points", help="collect_points.py output instead of the raw logs")
+    ap.add_argument("--raw", default="raw")
+    ap.add_argument("--block", type=int, default=512, help="the runs' vLLM block")
+    ap.add_argument("--align", action="store_true",
+                    help="hybrid model: prefill chunks aligned to the block (mamba align)")
     ap.add_argument("--out", default="fit_times2_swe.json")
     args = ap.parse_args()
-    pts = json.loads(Path(args.points).read_text()) if args.points else collect(args.datasets)
+    align = args.block if args.align else None
+    pts = (json.loads(Path(args.points).read_text()) if args.points
+           else collect(args.datasets, args.raw))
     pts = [x for x in pts if x["ds"] in args.datasets]
 
-    held = fit([x for x in pts if x["ds"] == args.datasets[0]])
-    print(f"== held out: fit on {args.datasets[0]} only ==")
-    report(held, pts, args.datasets[1:])
+    if len(args.datasets) > 1:
+        held = fit([x for x in pts if x["ds"] == args.datasets[0]], args.block, align)
+        print(f"== held out: fit on {args.datasets[0]} only ==")
+        report(held, pts, args.datasets[1:], args.block)
 
-    k = fit(pts)
+    k = fit(pts, args.block, align)
     print(f"\n== fit on {' '.join(args.datasets)} ==")
-    report(k, pts, args.datasets)
+    report(k, pts, args.datasets, args.block)
     print("compute " + "  ".join(f"{a}={k[a]:.4g}" for a in tm.COMPUTE))
     print(f"load    DRAM {k['c_dram']*1024:.3f} ms/1K + {k['f_dram']:.2f}   "
           f"SSD {k['c_ssd']*1024:.3f} ms/1K + {k['f_ssd']:.2f}")
